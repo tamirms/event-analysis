@@ -91,6 +91,19 @@ RocksDB uses `BatchedMultiGetCF` with sorted input, `SetVerifyChecksums(false)`,
 | PackfileParallelReadIndices | 37,763 | 18.5KB / 80 |
 | RocksDBParallelReadIndices | 216,805 | 5.9KB / 160 |
 
+## Cold Cache Scattered Read (1,000 indices on distinct blocks, includes open)
+
+Each iteration drops page cache (via `posix_fadvise FADV_DONTNEED`), then times open + 1,000 scattered reads + close. All 1,000 indices land on different blocks, forcing 1,000 separate disk I/Os.
+
+| Benchmark | NVMe (ms) | EBS (ms) |
+|-----------|-----------|----------|
+| ColdPackfileReadIndices | 16 | 256 |
+| ColdRocksDBReadIndices | 173 | 852 |
+
+Packfile is **10.7x faster on NVMe** and **3.3x faster on EBS**. The NVMe advantage is dramatic: packfile's 8 parallel pread goroutines saturate NVMe's parallel I/O capability (16ms for 1,000 block reads = ~62,500 IOPS effective), while RocksDB's sequential reads can't exploit NVMe parallelism.
+
+NVMe vs EBS: Packfile benefits 16x from NVMe (16ms vs 256ms) while RocksDB benefits 4.9x (173ms vs 852ms).
+
 ## Open Latency
 
 | Benchmark | ns/op | Allocs |

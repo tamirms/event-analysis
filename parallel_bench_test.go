@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -1114,5 +1115,150 @@ func BenchmarkRocksDBWriteParallel4(b *testing.B) {
 
 func BenchmarkRocksDBWriteParallel8(b *testing.B) {
 	benchRocksDBWrite(b, 8)
+}
+
+// --- Cold cache scattered read benchmarks ---
+
+// dropFileCache evicts a file's pages from the kernel page cache via posix_fadvise.
+func dropFileCache(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return unix.Fadvise(int(f.Fd()), 0, fi.Size(), unix.FADV_DONTNEED)
+}
+
+// dropDirCache evicts all files in a directory from the page cache.
+func dropDirCache(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if err := dropFileCache(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// coldScatteredIndices generates n indices, each on a different block of blockSize events.
+func coldScatteredIndices(rng *rand.Rand, n, totalEvents, blockSize int) []int {
+	totalBlocks := totalEvents / blockSize
+	blocks := rng.Perm(totalBlocks)[:n]
+	sort.Ints(blocks)
+	indices := make([]int, n)
+	for i, blk := range blocks {
+		indices[i] = blk*blockSize + rng.Intn(blockSize)
+	}
+	return indices
+}
+
+// coldFixtureDir returns the fixture directory for cold cache benchmarks.
+// Set COLD_FIXTURES_DIR to override (e.g., /tmp/ebs-fixtures for EBS testing).
+func coldFixtureDir() string {
+	if d := os.Getenv("COLD_FIXTURES_DIR"); d != "" {
+		return d
+	}
+	return fixtureDir
+}
+
+func BenchmarkColdPackfileReadIndices(b *testing.B) {
+	setupBenchData(b)
+
+	const numReads = 1000
+	const blockSize = 128
+
+	esPath := filepath.Join(coldFixtureDir(), "bench.events")
+	if _, err := os.Stat(esPath); err != nil {
+		b.Fatalf("fixture not found: %s (set COLD_FIXTURES_DIR for alternate location)", esPath)
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	indices := coldScatteredIndices(rng, numReads, totalEvents, blockSize)
+
+	for range b.N {
+		b.StopTimer()
+		if err := dropFileCache(esPath); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		er, err := eventstore.Open(esPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for ev, err := range er.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
+		}
+		er.Close()
+	}
+}
+
+func BenchmarkColdRocksDBReadIndices(b *testing.B) {
+	setupBenchData(b)
+
+	const numReads = 1000
+	const blockSize = 128
+
+	rdbPath := filepath.Join(coldFixtureDir(), "rocks.db")
+	if _, err := os.Stat(rdbPath); err != nil {
+		b.Fatalf("fixture not found: %s (set COLD_FIXTURES_DIR for alternate location)", rdbPath)
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	indices := coldScatteredIndices(rng, numReads, totalEvents, blockSize)
+
+	keys := make([][]byte, numReads)
+	for i, idx := range indices {
+		k := make([]byte, 4)
+		binary.BigEndian.PutUint32(k, uint32(idx))
+		keys[i] = k
+	}
+
+	for range b.N {
+		b.StopTimer()
+		if err := dropDirCache(rdbPath); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		opts := grocksdb.NewDefaultOptions()
+		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+		bbto.SetNoBlockCache(true)
+		opts.SetBlockBasedTableFactory(bbto)
+		db, err := grocksdb.OpenDbForReadOnly(opts, rdbPath, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		ro := grocksdb.NewDefaultReadOptions()
+		ro.SetVerifyChecksums(false)
+		ro.SetFillCache(false)
+		cf := db.GetDefaultColumnFamily()
+
+		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, v := range vals {
+			_ = v.Data()
+		}
+		vals.Destroy()
+		ro.Destroy()
+		db.Close()
+		opts.Destroy()
+	}
 }
 
