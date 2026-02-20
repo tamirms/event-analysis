@@ -728,16 +728,58 @@ func BenchmarkSSTReadIndices(b *testing.B) {
 	}
 }
 
+// rocksDBParallelMultiGet splits keys across goroutines for parallel I/O,
+// matching packfile ReadIndices' internal goroutine parallelism.
+func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, keys [][]byte, concurrency int) {
+	b.Helper()
+	if concurrency <= 1 || len(keys) < concurrency {
+		ro := grocksdb.NewDefaultReadOptions()
+		ro.SetVerifyChecksums(false)
+		ro.SetFillCache(false)
+		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, v := range vals {
+			_ = v.Data()
+		}
+		vals.Destroy()
+		ro.Destroy()
+		return
+	}
+	var wg sync.WaitGroup
+	perWorker := (len(keys) + concurrency - 1) / concurrency
+	for i := range concurrency {
+		lo := i * perWorker
+		hi := min(lo+perWorker, len(keys))
+		if lo >= len(keys) {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ro := grocksdb.NewDefaultReadOptions()
+			ro.SetVerifyChecksums(false)
+			ro.SetFillCache(false)
+			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys[lo:hi]...)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for _, v := range vals {
+				_ = v.Data()
+			}
+			vals.Destroy()
+			ro.Destroy()
+		}()
+	}
+	wg.Wait()
+}
+
 func BenchmarkRocksDBReadIndices(b *testing.B) {
 	setupBenchData(b)
 
 	db := openRocksDB(b)
 	defer db.Close()
-
-	ro := grocksdb.NewDefaultReadOptions()
-	ro.SetVerifyChecksums(false)
-	ro.SetFillCache(false)
-	defer ro.Destroy()
 
 	cf := db.GetDefaultColumnFamily()
 
@@ -753,14 +795,7 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 			binary.BigEndian.PutUint32(k, uint32(idx))
 			keys[i] = k
 		}
-		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
-		if err != nil {
-			b.Fatal(err)
-		}
-		for _, v := range vals {
-			_ = v.Data()
-		}
-		vals.Destroy()
+		rocksDBParallelMultiGet(b, db, cf, keys, 8)
 	}
 }
 
@@ -801,10 +836,6 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		db := openRocksDB(b)
 		defer db.Close()
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-		ro.SetFillCache(false)
-		defer ro.Destroy()
 
 		cf := db.GetDefaultColumnFamily()
 
@@ -817,14 +848,7 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 				binary.BigEndian.PutUint32(k, uint32(idx))
 				keys[i] = k
 			}
-			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
-			if err != nil {
-				b.Fatal(err)
-			}
-			for _, v := range vals {
-				_ = v.Data()
-			}
-			vals.Destroy()
+			rocksDBParallelMultiGet(b, db, cf, keys, 8)
 		}
 	})
 }
@@ -1214,16 +1238,9 @@ func BenchmarkColdPackfileReadIndices32(b *testing.B)  { benchColdPackfileReadIn
 func BenchmarkColdPackfileReadIndices64(b *testing.B)  { benchColdPackfileReadIndices(b, 64) }
 func BenchmarkColdPackfileReadIndices128(b *testing.B) { benchColdPackfileReadIndices(b, 128) }
 
-type rocksIOMode int
-
-const (
-	rocksBuffered rocksIOMode = iota
-	rocksDirect               // O_DIRECT
-)
-
 // openOptimizedRocksDB opens a RocksDB with all applicable optimizations for
 // scattered point reads: skipped stats/size checks, no block cache.
-func openOptimizedRocksDB(path string, ioMode rocksIOMode) (*grocksdb.DB, *grocksdb.Options, error) {
+func openOptimizedRocksDB(path string) (*grocksdb.DB, *grocksdb.Options, error) {
 	opts := grocksdb.NewDefaultOptions()
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	bbto.SetNoBlockCache(true)
@@ -1233,9 +1250,6 @@ func openOptimizedRocksDB(path string, ioMode rocksIOMode) (*grocksdb.DB, *grock
 	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
 	opts.SetMaxFileOpeningThreads(1)
 	opts.SetDisableAutoCompactions(true)
-	if ioMode == rocksDirect {
-		opts.SetUseDirectReads(true)
-	}
 	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
 	if err != nil {
 		opts.Destroy()
@@ -1244,7 +1258,7 @@ func openOptimizedRocksDB(path string, ioMode rocksIOMode) (*grocksdb.DB, *grock
 	return db, opts, nil
 }
 
-func benchColdRocksDBReadIndices(b *testing.B, concurrency int, ioMode rocksIOMode, asyncIO bool) {
+func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	const numReads = 1000
@@ -1265,16 +1279,6 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int, ioMode rocksIOMo
 		keys[i] = k
 	}
 
-	makeReadOpts := func() *grocksdb.ReadOptions {
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-		ro.SetFillCache(false)
-		if asyncIO {
-			ro.SetAsyncIO(true)
-		}
-		return ro
-	}
-
 	for range b.N {
 		b.StopTimer()
 		if err := dropDirCache(rdbPath); err != nil {
@@ -1282,70 +1286,21 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int, ioMode rocksIOMo
 		}
 		b.StartTimer()
 
-		db, dbOpts, err := openOptimizedRocksDB(rdbPath, ioMode)
+		db, dbOpts, err := openOptimizedRocksDB(rdbPath)
 		if err != nil {
 			b.Fatal(err)
 		}
 		cf := db.GetDefaultColumnFamily()
 
-		if concurrency <= 1 {
-			ro := makeReadOpts()
-			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
-			if err != nil {
-				b.Fatal(err)
-			}
-			for _, v := range vals {
-				_ = v.Data()
-			}
-			vals.Destroy()
-			ro.Destroy()
-		} else {
-			var wg sync.WaitGroup
-			perWorker := (numReads + concurrency - 1) / concurrency
-			for i := range concurrency {
-				lo := i * perWorker
-				hi := min(lo+perWorker, numReads)
-				if lo >= numReads {
-					break
-				}
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					ro := makeReadOpts()
-					vals, err := db.BatchedMultiGetCF(ro, cf, true, keys[lo:hi]...)
-					if err != nil {
-						b.Fatal(err)
-					}
-					for _, v := range vals {
-						_ = v.Data()
-					}
-					vals.Destroy()
-					ro.Destroy()
-				}()
-			}
-			wg.Wait()
-		}
+		rocksDBParallelMultiGet(b, db, cf, keys, concurrency)
 
 		db.Close()
 		dbOpts.Destroy()
 	}
 }
 
-// Serial buffered (baseline).
-func BenchmarkColdRocksDBReadIndices(b *testing.B) {
-	benchColdRocksDBReadIndices(b, 1, rocksBuffered, false)
-}
-
-// Parallel buffered variants (Go-side parallelism with pread).
-func BenchmarkColdRocksDBReadIndices8(b *testing.B) {
-	benchColdRocksDBReadIndices(b, 8, rocksBuffered, false)
-}
-
-func BenchmarkColdRocksDBReadIndices32(b *testing.B) {
-	benchColdRocksDBReadIndices(b, 32, rocksBuffered, false)
-}
-
-func BenchmarkColdRocksDBReadIndices64(b *testing.B) {
-	benchColdRocksDBReadIndices(b, 64, rocksBuffered, false)
-}
+func BenchmarkColdRocksDBReadIndices(b *testing.B)   { benchColdRocksDBReadIndices(b, 1) }
+func BenchmarkColdRocksDBReadIndices8(b *testing.B)  { benchColdRocksDBReadIndices(b, 8) }
+func BenchmarkColdRocksDBReadIndices32(b *testing.B) { benchColdRocksDBReadIndices(b, 32) }
+func BenchmarkColdRocksDBReadIndices64(b *testing.B) { benchColdRocksDBReadIndices(b, 64) }
 
