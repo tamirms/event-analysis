@@ -38,7 +38,33 @@ func setupBenchData(b *testing.B) {
 }
 
 func doSetup() error {
-	// Load events.
+	if err := ensureFixtureDir(); err != nil {
+		return fmt.Errorf("fixture dir: %w", err)
+	}
+
+	eventstorePath = filepath.Join(fixtureDir, "bench.events")
+	sstPath = filepath.Join(fixtureDir, "bench.sst")
+	rocksDBPath = filepath.Join(fixtureDir, "rocks.db")
+
+	// Use cached fixtures if available and not stale.
+	if benchFixturesExist() && !fixturesStale() {
+		meta, err := loadMeta()
+		if err != nil {
+			return fmt.Errorf("load meta: %w", err)
+		}
+		totalEvents = meta.TotalEvents
+		totalRawBytes = meta.TotalRawBytes
+		fmt.Printf("bench setup: using cached fixtures (%d events, %s total raw bytes)\n",
+			totalEvents, fmtKB(float64(totalRawBytes)))
+		return nil
+	}
+
+	// Clean stale fixture files before regenerating.
+	os.Remove(eventstorePath)
+	os.Remove(sstPath)
+	os.RemoveAll(rocksDBPath)
+
+	// Load events from source.
 	if err := loadAllEvents(); err != nil {
 		return fmt.Errorf("load events: %w", err)
 	}
@@ -51,13 +77,7 @@ func doSetup() error {
 	fmt.Printf("bench setup: avg event size=%dB, SST/RocksDB block size=%s\n",
 		avgEventSize, fmtKB(float64(sstBlockSize)))
 
-	dir, err := os.MkdirTemp("", "parallel_bench")
-	if err != nil {
-		return err
-	}
-
 	// Write eventstore (packfile with event-level access).
-	eventstorePath = filepath.Join(dir, "bench.events")
 	ew, err := eventstore.Create(eventstorePath, eventstore.DefaultBlockSize)
 	if err != nil {
 		return err
@@ -72,7 +92,6 @@ func doSetup() error {
 	}
 
 	// Write SSTable: individual events as KV pairs with zstd block compression.
-	sstPath = filepath.Join(dir, "bench.sst")
 	sf, err := vfs.Default.Create(sstPath)
 	if err != nil {
 		return err
@@ -96,8 +115,7 @@ func doSetup() error {
 	}
 
 	// Write RocksDB: individual events via SSTFileWriter.
-	rocksDBPath = filepath.Join(dir, "rocks.db")
-	sstFilePath := filepath.Join(dir, "rocks_ingest.sst")
+	sstFilePath := filepath.Join(fixtureDir, "rocks_ingest.sst")
 
 	sstWriteOpts := grocksdb.NewDefaultOptions()
 	sstWriteOpts.SetCompression(grocksdb.ZSTDCompression)
@@ -144,6 +162,7 @@ func doSetup() error {
 	ingestOpts.Destroy()
 	rdb.Close()
 	dbOpts.Destroy()
+	os.Remove(sstFilePath) // clean up intermediate file
 
 	// Report sizes.
 	esInfo, _ := os.Stat(eventstorePath)
@@ -151,6 +170,15 @@ func doSetup() error {
 	rocksSize := dirSize(rocksDBPath)
 	fmt.Printf("bench setup: eventstore %s, sstable %s, rocksdb %s\n",
 		fmtKB(float64(esInfo.Size())), fmtKB(float64(sstInfo.Size())), fmtKB(float64(rocksSize)))
+
+	// Save metadata for cache validation.
+	meta, err := buildMeta()
+	if err != nil {
+		return fmt.Errorf("build meta: %w", err)
+	}
+	if err := saveMeta(meta); err != nil {
+		return fmt.Errorf("save meta: %w", err)
+	}
 
 	return nil
 }

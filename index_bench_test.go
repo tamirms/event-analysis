@@ -37,44 +37,27 @@ func ensureTestData(t *testing.T) {
 }
 
 func generateTestData() error {
-	reader, err := NewChunkReader("006016.index", "006016.data")
-	if err != nil {
-		return fmt.Errorf("open chunk: %w", err)
+	// Use loadAllEvents (from sstable_bench_test.go) to avoid re-parsing source.
+	sstOnce.Do(func() { sstDataErr = loadAllEvents() })
+	if sstDataErr != nil {
+		return fmt.Errorf("load events: %w", sstDataErr)
 	}
-	defer reader.Close()
 
-	numLedgers := reader.NumLedgers()
-	fmt.Printf("generating test data from %d ledgers...\n", numLedgers)
+	fmt.Printf("generating index test data from %d events...\n", len(allEvents))
 
-	flat := make([]byte, 0, 512*1024)
-	var eventBuf []IngestEvent
-	eventCount := 0
-	var compBuf []byte
-	totalEvents := 0
 	const batchSize = 128
+	var flat []byte
+	var compBuf []byte
+	eventCount := 0
 
-	for i := 0; i < numLedgers; i++ {
-		if i > 0 && i%2000 == 0 {
-			fmt.Printf("  ledger %d/%d, events=%d, blocks=%d\n", i, numLedgers, totalEvents, len(recordSizes))
-		}
-		ledgerBytes, err := reader.ReadLedger(i)
-		if err != nil {
-			continue
-		}
-		eventBuf, err = ExtractEvents(ledgerBytes, eventBuf)
-		if err != nil {
-			continue
-		}
-		for idx := range eventBuf {
-			flat = AppendBinaryEvent(flat, &eventBuf[idx])
-			eventCount++
-			totalEvents++
-			if eventCount == batchSize {
-				compBuf = zstdEncoder.EncodeAll(flat, compBuf[:0])
-				recordSizes = append(recordSizes, uint32(len(compBuf)))
-				flat = flat[:0]
-				eventCount = 0
-			}
+	for _, ev := range allEvents {
+		flat = append(flat, ev...)
+		eventCount++
+		if eventCount == batchSize {
+			compBuf = zstdEncoder.EncodeAll(flat, compBuf[:0])
+			recordSizes = append(recordSizes, uint32(len(compBuf)))
+			flat = flat[:0]
+			eventCount = 0
 		}
 	}
 	if eventCount > 0 {
@@ -82,7 +65,7 @@ func generateTestData() error {
 		recordSizes = append(recordSizes, uint32(len(compBuf)))
 	}
 
-	fmt.Printf("  total events: %d, total blocks: %d\n", totalEvents, len(recordSizes))
+	fmt.Printf("  total events: %d, total blocks: %d\n", len(allEvents), len(recordSizes))
 
 	// 1x
 	offsets1x = make([]int64, len(recordSizes)+1)

@@ -1,0 +1,94 @@
+# Event Analysis - Development Guide
+
+## Project Overview
+
+Benchmarking and analysis tool for event storage formats: custom packfile/eventstore vs Pebble SSTable vs RocksDB. Uses real Stellar ledger data (~8.7M events from 1.7GB source files).
+
+## Prerequisites
+
+### Go
+- Go 1.26+ (specified in go.mod)
+
+### RocksDB (required for benchmarks)
+
+The `grocksdb v1.10.7` Go binding requires RocksDB headers and shared library at build time. The system `librocksdb-dev` package (Ubuntu 24.04) provides RocksDB 8.9.1 which is **incompatible** — the API changed between 8.x versions.
+
+**Build RocksDB 10.9.1 from source:**
+
+```bash
+cd /tmp
+git clone --depth 1 --branch v10.9.1 https://github.com/facebook/rocksdb.git
+cd rocksdb
+USE_ZSTD=1 USE_LZ4=1 USE_SNAPPY=1 USE_BZ2=1 PREFIX=$HOME/.local make install-shared -j$(nproc)
+```
+
+**Required system compression dev libraries (install via apt):**
+```bash
+sudo apt-get install -y libsnappy-dev liblz4-dev libzstd-dev libbz2-dev
+```
+
+**CGO flags for every `go test` / `go build` command:**
+```bash
+export CGO_CFLAGS="-I$HOME/.local/include"
+export CGO_LDFLAGS="-L$HOME/.local/lib"
+export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+```
+
+## Running Tests
+
+Subpackage tests (fast, no RocksDB needed):
+```bash
+go test ./eventstore/... ./packfile/... ./recordcodec/...
+```
+
+Root package tests (need RocksDB + CGO flags, ~15 min total):
+```bash
+go test -v -count=1 -timeout 30m github.com/tamir/events-analysis
+```
+
+`TestSSTableCompression` alone takes ~9 min. Run it separately if needed:
+```bash
+go test -v -count=1 -run TestSSTableCompression -timeout 30m github.com/tamir/events-analysis
+```
+
+## Running Benchmarks
+
+```bash
+go test -v -count=1 -bench=. -benchmem -run='^$' -timeout 30m github.com/tamir/events-analysis
+```
+
+### Fixture Caching
+
+Benchmark fixtures (eventstore, SSTable, RocksDB files ~1.3GB total) are cached in `testdata/fixtures/`. First run generates them (~3-4 min); subsequent runs load from cache (~3s).
+
+- Fixtures are invalidated automatically when source data files (`006016.data`, `006016.index`) change (mtime comparison).
+- Force regeneration: `FORCE_REGEN=1 go test -bench=...`
+- Fixture metadata is in `testdata/fixtures/meta.json`.
+
+## Storage Layout (AWS)
+
+This machine has three drives:
+- `/` (root, 50GB EBS gp3) — OS + working directory (~149 MB/s write)
+- `/mnt/xvdf` (100GB EBS) — secondary storage
+- `/mnt/nvme` (1.7TB NVMe instance store) — fast local SSD
+
+Benchmark fixtures are symlinked to NVMe for faster I/O:
+```
+testdata/fixtures/ -> /mnt/nvme/fixtures/
+```
+
+Note: NVMe instance storage is **ephemeral** — data is lost on instance stop/terminate. Fixtures can be regenerated with `FORCE_REGEN=1`.
+
+If the NVMe drive is not mounted after a reboot:
+```bash
+sudo mkfs.ext4 /dev/nvme2n1  # only if not already formatted
+sudo mkdir -p /mnt/nvme
+sudo mount /dev/nvme2n1 /mnt/nvme
+sudo chown tamir:staff /mnt/nvme
+mkdir -p /mnt/nvme/fixtures
+```
+
+## Source Data
+
+- `006016.index` + `006016.data` (~1.7GB) — raw Stellar ledger data with ~10K ledgers / ~8.7M events
+- Not checked into git (listed in `.gitignore`)
