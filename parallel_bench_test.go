@@ -78,7 +78,7 @@ func doSetup() error {
 		avgEventSize, fmtKB(float64(sstBlockSize)))
 
 	// Write eventstore (packfile with event-level access).
-	ew, err := eventstore.Create(eventstorePath, eventstore.DefaultBlockSize)
+	ew, err := eventstore.Create(eventstorePath, eventstore.WriterOptions{})
 	if err != nil {
 		return err
 	}
@@ -870,7 +870,7 @@ func ensureAllEvents(b *testing.B) {
 	}
 }
 
-func BenchmarkPackfileWrite(b *testing.B) {
+func benchPackfileWrite(b *testing.B, concurrency int) {
 	ensureAllEvents(b)
 
 	b.SetBytes(int64(totalRawBytes))
@@ -878,7 +878,7 @@ func BenchmarkPackfileWrite(b *testing.B) {
 
 	for range b.N {
 		p := filepath.Join(b.TempDir(), "bench.events")
-		ew, err := eventstore.Create(p, eventstore.DefaultBlockSize)
+		ew, err := eventstore.Create(p, eventstore.WriterOptions{Concurrency: concurrency})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -891,6 +891,18 @@ func BenchmarkPackfileWrite(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkPackfileWrite(b *testing.B) {
+	benchPackfileWrite(b, 0)
+}
+
+func BenchmarkPackfileWriteParallel4(b *testing.B) {
+	benchPackfileWrite(b, 4)
+}
+
+func BenchmarkPackfileWriteParallel8(b *testing.B) {
+	benchPackfileWrite(b, 8)
 }
 
 func BenchmarkSSTWrite(b *testing.B) {

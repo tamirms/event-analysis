@@ -26,7 +26,7 @@ func makeEvents(n int, rng *rand.Rand) [][]byte {
 func writeTestStore(t *testing.T, events [][]byte, blockSize int) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.events")
-	w, err := Create(path, blockSize)
+	w, err := Create(path, WriterOptions{BlockSize: blockSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,13 +440,64 @@ func TestSmallBlockSize(t *testing.T) {
 
 func TestCreateInvalidBlockSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.events")
-	_, err := Create(path, 0)
+	_, err := Create(path, WriterOptions{BlockSize: -1})
 	if err == nil {
-		t.Fatal("expected error for blockSize 0")
+		t.Fatal("expected error for negative blockSize")
 	}
-	_, err = Create(path, -1)
-	if err == nil {
-		t.Fatal("expected error for blockSize -1")
+}
+
+func TestParallelCompressionRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(70))
+	events := makeEvents(500, rng)
+
+	// Write with serial compression.
+	serialPath := filepath.Join(t.TempDir(), "serial.events")
+	sw, err := Create(serialPath, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := sw.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sw.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write with parallel compression.
+	parallelPath := filepath.Join(t.TempDir(), "parallel.events")
+	pw, err := Create(parallelPath, WriterOptions{Concurrency: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := pw.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pw.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify parallel output reads back correctly.
+	r, err := Open(parallelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if r.EventCount() != 500 {
+		t.Fatalf("EventCount = %d, want 500", r.EventCount())
+	}
+	for i, want := range events {
+		got, err := r.ReadEvent(i)
+		if err != nil {
+			t.Fatalf("ReadEvent(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadEvent(%d): data mismatch", i)
+		}
 	}
 }
 
