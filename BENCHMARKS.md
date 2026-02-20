@@ -28,11 +28,13 @@ Notes:
 
 | Benchmark | Peak Delta |
 |-----------|-----------|
-| PackfileWrite (serial) | ~0 MB (single ~27KB block in flight) |
-| PackfileWrite (8 goroutines) | 11 MB (batch of 256 blocks) |
-| RocksDBWrite (8 threads) | 0.2 MB (C-side compression buffers) |
+| PackfileWrite (serial) | 76 MB |
+| PackfileWrite (8 goroutines) | 100 MB (+24 MB over serial) |
+| RocksDBWrite (8 threads) | 35 MB |
 
-Measured via `RssAnon` from `/proc/self/status` with `GODEBUG=madvdontneed=1`, sampling every 5ms. Each benchmark runs in a separate process. Delta is taken against a baseline after `runtime.GC()` with allEvents already resident.
+The 76 MB packfile baseline is the zstd encoder's internal buffer pool (klauspost/compress retains window/match buffers). Parallel compression adds ~24 MB for the batch of 256 blocks. RocksDB is leanest at 35 MB (C-side buffers + Go CGO overhead).
+
+Measured via `RssAnon` from `/proc/self/status` with `GODEBUG=madvdontneed=1` and `GOGC=1` (minimizes GC headroom to capture actual working set). Each benchmark runs in a separate process.
 
 ## Sequential Read
 
