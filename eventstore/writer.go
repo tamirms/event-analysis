@@ -11,13 +11,15 @@ import (
 
 const DefaultBlockSize = 128
 
-// batchSize is the number of blocks accumulated before a parallel flush.
-const batchSize = 256
-
 // WriterOptions configures how the eventstore is written.
 type WriterOptions struct {
 	BlockSize   int // events per block; 0 defaults to DefaultBlockSize (128)
 	Concurrency int // compression goroutines; 0 or 1 = serial
+}
+
+type blockResult struct {
+	blockID    uint32
+	compressed []byte
 }
 
 type Writer struct {
@@ -29,9 +31,12 @@ type Writer struct {
 	closed bool     // set by Finish or Abort
 	err    error    // sticky — once set, all subsequent ops fail
 
-	// Parallel compression state.
+	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
-	pending     [][]byte // uncompressed blocks awaiting batch flush
+	nextBlockID uint32
+	workCh      chan blockResult  // blockID + uncompressed → compress workers
+	resultCh    chan blockResult  // blockID + compressed → writer goroutine
+	writerDone  chan error        // writer signals completion (buffered, size 1)
 }
 
 // Create starts writing a new eventstore at path.
@@ -46,11 +51,67 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{
+	w := &Writer{
 		pw:          pw,
 		blockN:      opts.BlockSize,
 		concurrency: opts.Concurrency,
-	}, nil
+	}
+	if w.concurrency > 1 {
+		w.workCh = make(chan blockResult, w.concurrency)
+		w.resultCh = make(chan blockResult, w.concurrency)
+		w.writerDone = make(chan error, 1)
+
+		var compressWg sync.WaitGroup
+		for range w.concurrency {
+			compressWg.Add(1)
+			go func() {
+				defer compressWg.Done()
+				w.compressWorker()
+			}()
+		}
+		// Close resultCh when all compressors finish, signaling the writer to drain and exit.
+		go func() {
+			compressWg.Wait()
+			close(w.resultCh)
+		}()
+		go w.runWriter()
+	}
+	return w, nil
+}
+
+// compressWorker reads uncompressed blocks from workCh and sends compressed
+// results to resultCh, preserving the blockID for reordering.
+func (w *Writer) compressWorker() {
+	for work := range w.workCh {
+		work.compressed = recordcodec.Encode(work.compressed)
+		w.resultCh <- work
+	}
+}
+
+// runWriter receives compressed blocks and writes them in blockID order
+// using a reorder buffer.
+func (w *Writer) runWriter() {
+	defer close(w.writerDone)
+
+	pending := make(map[uint32][]byte)
+	nextBlockID := uint32(0)
+
+	for result := range w.resultCh {
+		pending[result.blockID] = result.compressed
+
+		// Drain all consecutive ready blocks in order.
+		for data, ok := pending[nextBlockID]; ok; data, ok = pending[nextBlockID] {
+			delete(pending, nextBlockID)
+			if err := w.pw.Append(data); err != nil {
+				w.writerDone <- err
+				// Drain remaining results so compressors don't block.
+				for range w.resultCh {
+				}
+				return
+			}
+			nextBlockID++
+		}
+	}
 }
 
 // Append adds a single event. Flushes a block when blockN events accumulate.
@@ -94,51 +155,14 @@ func (w *Writer) flush() error {
 		return w.pw.Append(compressed)
 	}
 
-	w.pending = append(w.pending, block)
-	if len(w.pending) >= batchSize {
-		return w.flushBatch()
-	}
+	// Send to streaming compress pipeline.
+	w.workCh <- blockResult{blockID: w.nextBlockID, compressed: block}
+	w.nextBlockID++
 	return nil
 }
 
-// flushBatch compresses all pending blocks in parallel, then writes them sequentially.
-func (w *Writer) flushBatch() error {
-	n := len(w.pending)
-	if n == 0 {
-		return nil
-	}
-
-	compressed := make([][]byte, n)
-	var wg sync.WaitGroup
-	perWorker := (n + w.concurrency - 1) / w.concurrency
-
-	for i := range w.concurrency {
-		lo := i * perWorker
-		hi := min(lo+perWorker, n)
-		if lo >= n {
-			break
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := lo; j < hi; j++ {
-				compressed[j] = recordcodec.Encode(w.pending[j])
-			}
-		}()
-	}
-	wg.Wait()
-
-	for i, c := range compressed {
-		if err := w.pw.Append(c); err != nil {
-			return err
-		}
-		w.pending[i] = nil // allow GC
-	}
-	w.pending = w.pending[:0]
-	return nil
-}
-
-// Finish flushes any partial batch, writes metadata, and finalizes the packfile.
+// Finish flushes any partial block, drains the pipeline, writes metadata,
+// and finalizes the packfile.
 func (w *Writer) Finish() error {
 	if w.err != nil {
 		return w.err
@@ -146,14 +170,19 @@ func (w *Writer) Finish() error {
 	if w.closed {
 		return errors.New("eventstore: writer is closed")
 	}
+	// Flush any partial block.
 	if len(w.sizes) > 0 {
 		if err := w.flush(); err != nil {
 			w.err = err
 			return err
 		}
 	}
-	if len(w.pending) > 0 {
-		if err := w.flushBatch(); err != nil {
+
+	// Drain the streaming pipeline.
+	if w.workCh != nil {
+		close(w.workCh)        // signal compress workers to stop
+		err := <-w.writerDone  // wait for writer to finish
+		if err != nil {
 			w.err = err
 			return err
 		}
@@ -180,5 +209,9 @@ func (w *Writer) Abort() error {
 		return nil
 	}
 	w.closed = true
+	if w.workCh != nil {
+		close(w.workCh)
+		<-w.writerDone
+	}
 	return w.pw.Abort()
 }

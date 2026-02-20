@@ -1228,6 +1228,18 @@ func BenchmarkPackfileWriteParallel8(b *testing.B) {
 	benchPackfileWrite(b, 8)
 }
 
+func BenchmarkPackfileWriteParallel16(b *testing.B) {
+	benchPackfileWrite(b, 16)
+}
+
+func BenchmarkPackfileWriteParallel24(b *testing.B) {
+	benchPackfileWrite(b, 24)
+}
+
+func BenchmarkPackfileWriteParallel32(b *testing.B) {
+	benchPackfileWrite(b, 32)
+}
+
 func BenchmarkSSTWrite(b *testing.B) {
 	ensureAllEvents(b)
 

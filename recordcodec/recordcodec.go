@@ -31,6 +31,8 @@ func NewDecoder() *zstd.Decoder {
 }
 
 // Encode compresses with zstd (content checksums enabled).
+// Safe for concurrent use — the encoder has an internal pool of states
+// sized to GOMAXPROCS.
 func Encode(data []byte) []byte {
 	return encoder.EncodeAll(data, nil)
 }

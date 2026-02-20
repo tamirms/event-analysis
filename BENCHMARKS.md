@@ -14,31 +14,34 @@ All three formats use **zstd level 3** compression with ~27.6KB block size (128 
 
 | Benchmark | EBS (MB/s) | EBS (s) | NVMe (MB/s) | NVMe (s) |
 |-----------|-----------|---------|-------------|----------|
-| PackfileWrite | 136 | 14.2 | 162 | 11.9 |
-| PackfileWrite (4 goroutines) | 321 | 6.0 | 499 | 3.9 |
-| **PackfileWrite (8 goroutines)** | **423** | **4.6** | **814** | **2.4** |
+| PackfileWrite | 137 | 14.1 | 162 | 11.9 |
+| PackfileWrite (4 goroutines) | 394 | 4.9 | 726 | 2.7 |
+| PackfileWrite (8 goroutines) | 539 | 3.6 | 1,387 | 1.4 |
+| PackfileWrite (16 goroutines) | 591 | 3.3 | 2,016 | 1.0 |
+| **PackfileWrite (24 goroutines)** | **591** | **3.3** | **2,122** | **0.9** |
+| PackfileWrite (32 goroutines) | 590 | 3.3 | 2,050 | 0.9 |
 | SSTWrite | 47 | 40.8 | 47 | 40.8 |
 | RocksDBWrite | 40 | 48.0 | 46 | 42.4 |
 | RocksDBWrite (4 threads) | 96 | 20.1 | 133 | 14.5 |
 | RocksDBWrite (8 threads) | 143 | 13.6 | 239 | 8.1 |
 
 Notes:
-- **Packfile with 8 goroutines on NVMe (814 MB/s) is 3.4x faster than RocksDB's best (239 MB/s).**
-- Parallel packfile uses batched compression: 256 blocks are compressed across N goroutines, then written sequentially.
+- **Packfile with 24 goroutines on NVMe (2,122 MB/s) is 8.9x faster than RocksDB's best (239 MB/s).**
+- Parallel packfile uses streaming compression: each full block is sent to one of N compress goroutines via a buffered channel. A dedicated writer goroutine receives compressed blocks and uses a reorder buffer to emit them in original order.
 - Pebble SSTable is fully CPU-bound (no NVMe benefit, 47 MB/s on both).
-- NVMe benefit scales with parallelism: packfile serial +20%, packfile 8-goroutine +93%, RocksDB 8-thread +67%.
+- **EBS plateaus at ~591 MB/s (c=16+)** due to EBS bandwidth limits. **NVMe plateaus at ~2.1 GB/s (c=16-24)** where the serial main goroutine (block building at 3.4 GB/s) becomes the bottleneck.
 
 ### Write Peak Memory (RssAnon delta, excluding page cache)
 
 | Benchmark | Peak Delta |
 |-----------|-----------|
-| PackfileWrite (serial) | 76 MB |
-| PackfileWrite (8 goroutines) | 100 MB (+24 MB over serial) |
+| PackfileWrite (serial) | 75 MB |
+| PackfileWrite (8 goroutines) | 94 MB (+19 MB over serial) |
 | RocksDBWrite (8 threads) | 35 MB |
 
-The 76 MB packfile baseline is the zstd encoder's internal buffer pool (klauspost/compress retains window/match buffers). Parallel compression adds ~24 MB for the batch of 256 blocks. RocksDB is leanest at 35 MB (C-side buffers + Go CGO overhead).
+The 75 MB packfile baseline is the zstd encoder's internal buffer pool (klauspost/compress retains window/match buffers). Streaming compression adds ~19 MB for in-flight blocks across compress workers. RocksDB is leanest at 35 MB (C-side buffers + Go CGO overhead).
 
-Measured via `RssAnon` from `/proc/self/status` with `GODEBUG=madvdontneed=1` and `GOGC=1` (minimizes GC headroom to capture actual working set). Each benchmark runs in a separate process.
+Measured via `RssAnon` from `/proc/self/status` with `GOGC=1` (minimizes GC headroom to capture actual working set). Each benchmark runs in a separate process.
 
 ## Sequential Read
 
