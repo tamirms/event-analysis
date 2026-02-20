@@ -32,6 +32,8 @@ var (
 	eventstorePath string
 	sstPath        string
 	rocksDBPath    string
+
+	benchSink any // prevents compiler from eliminating benchmark work
 )
 
 func setupBenchData(b *testing.B) {
@@ -214,6 +216,14 @@ func openRocksDB(b *testing.B) *grocksdb.DB {
 	return db
 }
 
+// rocksReadOpts returns ReadOptions with checksum verification disabled,
+// matching packfile which relies on zstd's built-in content checksum only.
+func rocksReadOpts() *grocksdb.ReadOptions {
+	ro := grocksdb.NewDefaultReadOptions()
+	ro.SetVerifyChecksums(false)
+	return ro
+}
+
 // --- Sequential read benchmarks ---
 
 func BenchmarkPackfileSeqRead(b *testing.B) {
@@ -278,7 +288,7 @@ func BenchmarkRocksDBSeqRead(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := rocksReadOpts()
 	defer ro.Destroy()
 
 	b.SetBytes(int64(totalRawBytes))
@@ -315,7 +325,7 @@ func BenchmarkPackfileRandomRead(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = ev
+		benchSink = ev
 	}
 }
 
@@ -365,7 +375,7 @@ func BenchmarkRocksDBRandomRead(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := rocksReadOpts()
 	defer ro.Destroy()
 
 	rng := rand.New(rand.NewSource(42))
@@ -379,7 +389,7 @@ func BenchmarkRocksDBRandomRead(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = val.Data()
+		benchSink = val.Data()
 		val.Destroy()
 	}
 }
@@ -462,7 +472,7 @@ func BenchmarkRocksDBParallelRead(b *testing.B) {
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		ro := grocksdb.NewDefaultReadOptions()
+		ro := rocksReadOpts()
 		defer ro.Destroy()
 
 		rng := rand.New(rand.NewSource(rand.Int63()))
@@ -558,17 +568,19 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := rocksReadOpts()
 	defer ro.Destroy()
 
 	batchSize := min(128, totalEvents)
+
+	it := db.NewIterator(ro)
+	defer it.Close()
 
 	key := make([]byte, 4)
 	b.ResetTimer()
 
 	for range b.N {
 		binary.BigEndian.PutUint32(key, uint32(0))
-		it := db.NewIterator(ro)
 		it.Seek(key)
 		if !it.Valid() {
 			b.Fatal("Seek(0): key not found")
@@ -581,7 +593,6 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 			}
 			_ = it.Value().Data()
 		}
-		it.Close()
 	}
 }
 
@@ -666,8 +677,11 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := rocksReadOpts()
 	defer ro.Destroy()
+
+	it := db.NewIterator(ro)
+	defer it.Close()
 
 	const scanLen = 128
 	rng := rand.New(rand.NewSource(42))
@@ -677,7 +691,6 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	for range b.N {
 		start := rng.Intn(totalEvents - scanLen)
 		binary.BigEndian.PutUint32(key, uint32(start))
-		it := db.NewIterator(ro)
 		it.Seek(key)
 		if !it.Valid() {
 			b.Fatalf("Seek(%d): key not found", start)
@@ -690,7 +703,6 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 			}
 			_ = it.Value().Data()
 		}
-		it.Close()
 	}
 }
 
@@ -815,7 +827,11 @@ func sstParallelSeekGE(b *testing.B, reader *sstable.Reader, indices []int, conc
 		iter.Close()
 		return
 	}
-	var wg sync.WaitGroup
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		firstErr error
+	)
 	perWorker := (len(indices) + concurrency - 1) / concurrency
 	for i := range concurrency {
 		lo := i * perWorker
@@ -828,14 +844,16 @@ func sstParallelSeekGE(b *testing.B, reader *sstable.Reader, indices []int, conc
 			defer wg.Done()
 			iter, err := reader.NewIter(nil, nil)
 			if err != nil {
-				b.Fatal(err)
+				errOnce.Do(func() { firstErr = err })
+				return
 			}
 			key := make([]byte, 4)
 			for _, idx := range indices[lo:hi] {
 				binary.BigEndian.PutUint32(key, uint32(idx))
 				k, val := iter.SeekGE(key, sstable.SeekGEFlags(0))
 				if k == nil {
-					b.Fatalf("SeekGE(%d): key not found", idx)
+					errOnce.Do(func() { firstErr = fmt.Errorf("SeekGE(%d): key not found", idx) })
+					break
 				}
 				_ = val.ValueOrHandle
 			}
@@ -843,6 +861,9 @@ func sstParallelSeekGE(b *testing.B, reader *sstable.Reader, indices []int, conc
 		}()
 	}
 	wg.Wait()
+	if firstErr != nil {
+		b.Fatal(firstErr)
+	}
 }
 
 func BenchmarkSSTReadIndices(b *testing.B) {
@@ -879,8 +900,7 @@ func BenchmarkSSTReadIndices(b *testing.B) {
 func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, keys [][]byte, concurrency int) {
 	b.Helper()
 	if concurrency <= 1 || len(keys) < concurrency {
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
+		ro := rocksReadOpts()
 		ro.SetFillCache(false)
 		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
 		if err != nil {
@@ -893,7 +913,11 @@ func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnF
 		ro.Destroy()
 		return
 	}
-	var wg sync.WaitGroup
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
 	perWorker := (len(keys) + concurrency - 1) / concurrency
 	for i := range concurrency {
 		lo := i * perWorker
@@ -904,12 +928,13 @@ func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnF
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ro := grocksdb.NewDefaultReadOptions()
-			ro.SetVerifyChecksums(false)
+			ro := rocksReadOpts()
 			ro.SetFillCache(false)
 			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys[lo:hi]...)
 			if err != nil {
-				b.Fatal(err)
+				errOnce.Do(func() { firstErr = err })
+				ro.Destroy()
+				return
 			}
 			for _, v := range vals {
 				_ = v.Data()
@@ -919,6 +944,9 @@ func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnF
 		}()
 	}
 	wg.Wait()
+	if firstErr != nil {
+		b.Fatal(firstErr)
+	}
 }
 
 func BenchmarkRocksDBReadIndices(b *testing.B) {
@@ -1005,16 +1033,16 @@ func BenchmarkSSTParallelReadIndices(b *testing.B) {
 func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
 
+	db := openRocksDB(b)
+	defer db.Close()
+
+	cf := db.GetDefaultColumnFamily()
+
 	const numIndices = 50
 
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		db := openRocksDB(b)
-		defer db.Close()
-
-		cf := db.GetDefaultColumnFamily()
-
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
 			indices := generateScatteredIndices(rng, numIndices, totalEvents)

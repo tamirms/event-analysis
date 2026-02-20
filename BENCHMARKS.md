@@ -6,6 +6,10 @@ Dataset: 8,741,671 events, 1,888,365KB total raw (avg 221B/event)
 
 All three formats use **zstd level 3** compression with ~27.6KB block size (128 events).
 
+**Comparison context:** The packfile is a specialized append-only format with positional access (O(1) offset-array lookup). RocksDB and Pebble SSTable are general-purpose sorted key-value formats with key-ordered access (O(log N) block-index traversal). The packfile trades key-based lookup, range deletion, merge semantics, and snapshots for faster positional reads and writes. No block cache or bloom filters are used for any format (zero memory overhead beyond each format's intrinsic index).
+
+**Note on RocksDB numbers:** RocksDB is accessed via grocksdb (CGO bindings). Each CGO boundary crossing costs ~50-100ns. For sequential and batch reads with millions of per-item calls (Valid/Next/Value), CGO overhead accounts for an estimated 10-25% of measured RocksDB time. This is inherent to using RocksDB from Go and representative of real-world Go application performance, but the raw C API would be faster. Checksum verification is disabled for RocksDB (`SetVerifyChecksums(false)`), matching packfile which relies on zstd's built-in content checksum only.
+
 ## Write / Ingestion
 
 | Benchmark | EBS (MB/s) | EBS (s) | NVMe (MB/s) | NVMe (s) |
@@ -40,67 +44,67 @@ Measured via `RssAnon` from `/proc/self/status` with `GODEBUG=madvdontneed=1` an
 
 | Benchmark | Throughput (MB/s) | ns/op | Allocs |
 |-----------|------------------|-------|--------|
-| PackfileSeqRead | 2051 | 943M | 1.1MB / 37 |
-| SSTSeqRead | 394 | 4907M | 6.4KB / 12 |
-| RocksDBSeqRead | 265 | 7285M | 280MB / 17.5M |
+| PackfileSeqRead | 2053 | 942M | 10KB / 11 |
+| SSTSeqRead | 403 | 4802M | 6.4KB / 8 |
+| RocksDBSeqRead | 239 | 8077M | 280MB / 17.5M |
 
-Packfile is 5.2x faster than SSTable and 7.7x faster than RocksDB for sequential reads.
+Packfile is 5.1x faster than SSTable and 8.6x faster than RocksDB for sequential reads. The RocksDB gap includes significant CGO per-item overhead (~26M boundary crossings for 8.7M events).
 
 ## Random Point Read
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileRandomRead | 14,365 | 241B / 1 |
-| SSTRandomRead | 424,547 | 0B / 0 |
-| RocksDBRandomRead | 65,962 | 24B / 3 |
+| PackfileRandomRead | 14,313 | 254B / 2 |
+| SSTRandomRead | 425,992 | 0B / 0 |
+| RocksDBRandomRead | 63,973 | 48B / 4 |
 
-Packfile is 4.6x faster than RocksDB and 30x faster than SSTable for random reads.
+Packfile is 4.5x faster than RocksDB and 30x faster than SSTable for random reads.
 
 ## Parallel Read (32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelRead | 747 | 245B / 1 |
-| SSTParallelRead | 22,522 | 4B / 0 |
-| RocksDBParallelRead | 3,424 | 24B / 3 |
+| PackfileParallelRead | 839 | 234B / 1 |
+| SSTParallelRead | 22,905 | 4B / 0 |
+| RocksDBParallelRead | 3,390 | 24B / 3 |
 
-Packfile is 4.6x faster than RocksDB and 30x faster than SSTable under parallel load.
+Packfile is 4.0x faster than RocksDB and 27x faster than SSTable under parallel load.
 
-## Batch Read (128 events)
+## Batch Read (128 events from offset 0)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadBatch128 | 11,679 | 219B / 7 |
-| SSTReadBatch128 | 480,268 | 0B / 0 |
-| RocksDBReadBatch128 | 164,856 | 4.1KB / 257 |
+| PackfileReadBatch128 | 11,815 | 219B / 7 |
+| SSTReadBatch128 | 479,708 | 0B / 0 |
+| RocksDBReadBatch128 | 173,831 | 4KB / 256 |
 
 ## Range Scan (seek to random offset + read 128 events)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileRangeScan128 | 28,154 | 236B / 7 |
-| SSTRangeScan128 | 504,035 | 0B / 0 |
-| RocksDBRangeScan128 | 190,882 | 4.1KB / 257 |
+| PackfileRangeScan128 | 28,206 | 282B / 7 |
+| SSTRangeScan128 | 496,336 | 0B / 0 |
+| RocksDBRangeScan128 | 182,688 | 4KB / 256 |
 
-Packfile is 6.8x faster than RocksDB and 18x faster than SSTable. Compared to batch-from-0 (12μs), the random seek adds ~16μs for packfile (locating and decompressing the target block).
+Packfile is 6.5x faster than RocksDB and 18x faster than SSTable. Compared to batch-from-0 (12μs), the random seek adds ~16μs for packfile (locating and decompressing the target block).
 
 ## Scattered Read (50 random indices)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadIndices | 186,723 | 57KB / 83 |
-| SSTReadIndices | 3,153,945 | 2.3KB / 21 |
-| RocksDBReadIndices | 570,229 | 6.7KB / 204 |
+| PackfileReadIndices | 182,026 | 58KB / 83 |
+| SSTReadIndices | 3,396,999 | 2.3KB / 23 |
+| RocksDBReadIndices | 575,864 | 7.7KB / 214 |
 
-All three use 8 internal goroutines for parallel I/O. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetVerifyChecksums(false)`, `SetFillCache(false)`. SSTable splits keys across goroutines each with its own iterator.
+All three use 8 internal goroutines for parallel I/O. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input and `SetFillCache(false)`. SSTable splits keys across goroutines each with its own iterator.
 
 ## Parallel Scattered Read (50 indices, 32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelReadIndices | 45,491 | 40KB / 81 |
-| SSTParallelReadIndices | 1,156,341 | 2.8KB / 22 |
-| RocksDBParallelReadIndices | 177,105 | 6.7KB / 204 |
+| PackfileParallelReadIndices | 45,713 | 44KB / 82 |
+| SSTParallelReadIndices | 1,167,340 | 2.8KB / 24 |
+| RocksDBParallelReadIndices | 174,131 | 7.7KB / 214 |
 
 ## Cold Cache Scattered Read (1,000 indices on distinct blocks, includes open)
 
@@ -120,7 +124,7 @@ RocksDB uses optimized open (`SkipStatsUpdateOnDBOpen`, `SkipCheckingSSTFileSize
 | RocksDB | 64 | 23 | 339 |
 
 Notes:
-- **NVMe scales with concurrency** for both formats. Packfile at c=64 (5.2ms) is 4.4x faster than RocksDB at c=64 (23ms). The gap comes from packfile's lighter-weight open (0.5ms vs ~5ms) and simpler index lookup (in-memory offset array vs block index traversal + block decompression overhead).
+- **NVMe scales with concurrency** for both formats. Packfile at c=64 (5.2ms) is 4.4x faster than RocksDB at c=64 (23ms). The gap comes from packfile's lighter-weight open (0.5ms vs ~5ms) and simpler index lookup (in-memory offset array vs block index traversal).
 - **EBS is IOPS-limited at ~3,000 IOPS.** At c=8, RocksDB (238ms) is slightly faster than packfile (256ms) — both saturate the IOPS budget, and per-block overhead differences are negligible. At c=32+, both converge to ~333ms (the 3,000 IOPS floor).
 - **Mmap reads (`SetAllowMmapReads`) hurt** both NVMe and EBS due to per-page fault overhead exceeding explicit pread cost.
 - Serial (c=1) performance reflects the raw per-I/O latency: NVMe ~87μs vs EBS ~738μs.
