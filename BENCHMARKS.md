@@ -20,9 +20,19 @@ All three formats use **zstd level 3** compression with ~27.6KB block size (128 
 
 Notes:
 - **Packfile with 8 goroutines on NVMe (814 MB/s) is 3.4x faster than RocksDB's best (239 MB/s).**
-- Parallel packfile uses batched compression: 256 blocks are compressed across N goroutines, then written sequentially. Peak memory ~8.5MB per batch.
+- Parallel packfile uses batched compression: 256 blocks are compressed across N goroutines, then written sequentially.
 - Pebble SSTable is fully CPU-bound (no NVMe benefit, 47 MB/s on both).
 - NVMe benefit scales with parallelism: packfile serial +20%, packfile 8-goroutine +93%, RocksDB 8-thread +67%.
+
+### Write Peak Memory (RssAnon delta, excluding page cache)
+
+| Benchmark | Peak Delta |
+|-----------|-----------|
+| PackfileWrite (serial) | ~0 MB (single ~27KB block in flight) |
+| PackfileWrite (8 goroutines) | 11 MB (batch of 256 blocks) |
+| RocksDBWrite (8 threads) | 0.2 MB (C-side compression buffers) |
+
+Measured via `RssAnon` from `/proc/self/status` with `GODEBUG=madvdontneed=1`, sampling every 5ms. Each benchmark runs in a separate process. Delta is taken against a baseline after `runtime.GC()` with allEvents already resident.
 
 ## Sequential Read
 

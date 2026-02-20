@@ -57,6 +57,37 @@ go test -v -count=1 -run TestSSTableCompression -timeout 30m github.com/tamir/ev
 go test -v -count=1 -bench=. -benchmem -run='^$' -timeout 30m github.com/tamir/events-analysis
 ```
 
+### Write benchmarks on NVMe
+
+To write temp files to NVMe instead of EBS root:
+```bash
+TMPDIR=/mnt/nvme go test -bench='Benchmark.*Write' -benchmem -run='^$' -timeout 30m
+```
+
+### Measuring Peak Memory
+
+Write benchmarks report `peak-delta-MB` — the peak anonymous RSS delta during the write operation, measured via `RssAnon` from `/proc/self/status` (excludes page cache, captures both Go heap and C allocations).
+
+For accurate readings, run with `GODEBUG=madvdontneed=1` and **each benchmark in a separate process** to avoid cross-contamination:
+
+```bash
+# Compile once
+go test -c -o /tmp/bench.test
+
+# Run each separately
+GODEBUG=madvdontneed=1 LD_LIBRARY_PATH="$HOME/.local/lib" \
+  /tmp/bench.test -test.bench='BenchmarkPackfileWrite$' -test.benchmem -test.run='^$' -test.timeout 30m
+
+GODEBUG=madvdontneed=1 LD_LIBRARY_PATH="$HOME/.local/lib" \
+  /tmp/bench.test -test.bench='BenchmarkPackfileWriteParallel8$' -test.benchmem -test.run='^$' -test.timeout 30m
+```
+
+**Why `GODEBUG=madvdontneed=1`:** Go's default `MADV_FREE` lets the kernel lazily reclaim freed pages, which inflates RSS readings. `madvdontneed=1` forces immediate reclaim so the baseline is clean.
+
+**Why separate processes:** Go's runtime never shrinks its virtual address space, and RocksDB's allocators have their own retention. Separate processes prevent one benchmark's memory footprint from leaking into the next.
+
+**Why `RssAnon` instead of RSS:** RSS includes file-backed page cache from reading source data (~1.7GB) and writing output files (~425MB). `RssAnon` only counts anonymous pages (heap, stack, mmap anonymous) — the actual program working memory.
+
 ### Fixture Caching
 
 Benchmark fixtures (eventstore, SSTable, RocksDB files ~1.3GB total) are cached in `testdata/fixtures/`. First run generates them (~3-4 min); subsequent runs load from cache (~3s).
