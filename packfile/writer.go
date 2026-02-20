@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 )
 
@@ -56,7 +58,8 @@ func (w *Writer) Append(record []byte) error {
 
 // Finish writes the index, metadata, and trailer, fsyncs, and
 // atomically renames to the final path. Returns an error if the
-// writer has already been finished or aborted.
+// writer has already been finished or aborted. On failure, the caller
+// should call Abort to clean up the temp file.
 func (w *Writer) Finish() (Trailer, error) {
 	if w.err != nil {
 		return Trailer{}, w.err
@@ -64,13 +67,13 @@ func (w *Writer) Finish() (Trailer, error) {
 	if w.closed {
 		return Trailer{}, errors.New("packfile: writer is closed")
 	}
-	w.closed = true
 	w.offsets = append(w.offsets, w.pos) // end-of-data offset
 
 	// Encode index using FOR-128.
 	var indexBuf bytes.Buffer
 	recordCount := len(w.offsets) - 1
 
+	var deltas []uint32
 	for g := 0; g*groupInterval < recordCount; g++ {
 		base := g * groupInterval
 		end := base + groupInterval
@@ -78,9 +81,17 @@ func (w *Writer) Finish() (Trailer, error) {
 			end = recordCount
 		}
 
-		deltas := make([]uint32, end-base)
+		deltas = deltas[:0]
+		if cap(deltas) < end-base {
+			deltas = make([]uint32, 0, end-base)
+		}
 		for j := base; j < end; j++ {
-			deltas[j-base] = uint32(w.offsets[j+1] - w.offsets[j])
+			d := w.offsets[j+1] - w.offsets[j]
+			if d > math.MaxUint32 {
+				w.err = errors.New("packfile: record size exceeds 4GB")
+				return Trailer{}, w.err
+			}
+			deltas = append(deltas, uint32(d))
 		}
 
 		indexBuf.Write(EncodeGroup(deltas))
@@ -136,6 +147,13 @@ func (w *Writer) Finish() (Trailer, error) {
 		return Trailer{}, err
 	}
 
+	// Fsync parent directory to ensure the rename is durable.
+	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
+		dir.Sync()
+		dir.Close()
+	}
+
+	w.closed = true
 	return Trailer{
 		Version:         version,
 		RecordCount:     uint32(recordCount),
@@ -152,12 +170,14 @@ func (w *Writer) SetMetadata(meta []byte) {
 }
 
 // Abort discards the in-progress packfile and removes the temp file.
-// No-op after Finish or a previous Abort.
+// Safe to call after a failed Finish to clean up.
+// No-op only after a successful Finish or a previous Abort.
 func (w *Writer) Abort() error {
 	if w.closed {
 		return nil
 	}
 	w.closed = true
-	w.file.Close()
-	return os.Remove(w.tmpPath)
+	closeErr := w.file.Close()
+	removeErr := os.Remove(w.tmpPath)
+	return errors.Join(closeErr, removeErr)
 }

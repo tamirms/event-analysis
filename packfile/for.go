@@ -2,6 +2,7 @@ package packfile
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/bits"
 )
 
@@ -58,6 +59,9 @@ func DecodeGroup(data []byte, n int, dst []uint32) (values []uint32, size int) {
 
 func decodeGroupCore(data []byte, n int, values []uint32) ([]uint32, int) {
 	w := uint64(data[0])
+	if w > 32 {
+		panic(fmt.Sprintf("packfile: invalid FOR width %d (max 32)", w))
+	}
 	groupMin := binary.LittleEndian.Uint32(data[1:])
 
 	packSize := (int(w)*n + 7) / 8

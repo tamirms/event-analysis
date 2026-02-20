@@ -3,7 +3,6 @@ package eventstore
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"iter"
 	"sync"
@@ -14,7 +13,7 @@ import (
 	"github.com/tamir/events-analysis/recordcodec"
 )
 
-var ErrIndexRange = errors.New("eventstore: event index out of range")
+var ErrIndexRange = fmt.Errorf("eventstore: %w", packfile.ErrIndexRange)
 
 // blockBuf holds reusable buffers and a dedicated zstd decoder for ReadEvent.
 // Pooled via sync.Pool to avoid per-call allocations and shared decoder contention.
@@ -22,6 +21,7 @@ type blockBuf struct {
 	compressed   []byte
 	decompressed []byte
 	sizes        []uint32
+	offsets      []int // prefix sum of sizes: offsets[i] = byte offset of event i
 	padded       []byte
 	decoder      *zstd.Decoder
 }
@@ -30,6 +30,39 @@ var blockBufPool = sync.Pool{
 	New: func() any {
 		return &blockBuf{decoder: recordcodec.NewDecoder()}
 	},
+}
+
+// decode decompresses a block and parses its trailing FOR index,
+// populating sizes, offsets, and decompressed data.
+func (bb *blockBuf) decode(compressed []byte, n int) error {
+	var err error
+	bb.decompressed, err = bb.decoder.DecodeAll(compressed, bb.decompressed[:0])
+	if err != nil {
+		return err
+	}
+	bb.sizes, bb.padded, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
+	if err != nil {
+		return err
+	}
+	// Build prefix sum of sizes for offset lookups.
+	if cap(bb.offsets) <= n {
+		bb.offsets = make([]int, n+1)
+	} else {
+		bb.offsets = bb.offsets[:n+1]
+	}
+	bb.offsets[0] = 0
+	for i, s := range bb.sizes {
+		bb.offsets[i+1] = bb.offsets[i] + int(s)
+	}
+	return nil
+}
+
+// event returns a copy of the event at localIdx within the decoded block.
+func (bb *blockBuf) event(localIdx int) []byte {
+	offset := bb.offsets[localIdx]
+	ev := make([]byte, bb.offsets[localIdx+1]-offset)
+	copy(ev, bb.decompressed[offset:])
+	return ev
 }
 
 type Reader struct {
@@ -61,6 +94,22 @@ func Open(path string, opts ...ReaderOption) (*Reader, error) {
 
 	nEvents := int(binary.LittleEndian.Uint32(meta[0:]))
 	blockN := int(binary.LittleEndian.Uint32(meta[4:]))
+
+	if blockN <= 0 {
+		pr.Close()
+		return nil, fmt.Errorf("eventstore: invalid blockN %d in metadata", blockN)
+	}
+
+	// Cross-validate: number of blocks implied by nEvents must match packfile record count.
+	expectedBlocks := (nEvents + blockN - 1) / blockN
+	if nEvents == 0 {
+		expectedBlocks = 0
+	}
+	if expectedBlocks != pr.RecordCount() {
+		pr.Close()
+		return nil, fmt.Errorf("eventstore: metadata says %d events / %d blockN = %d blocks, but packfile has %d records",
+			nEvents, blockN, expectedBlocks, pr.RecordCount())
+	}
 
 	r := &Reader{
 		pr:          pr,
@@ -97,19 +146,23 @@ func (r *Reader) eventsInBlock(blockIdx int) int {
 }
 
 // decodeBlock parses the trailing FOR index from a decompressed block.
-// Returns event sizes and the byte offset where event data ends.
-// Reuses caller-provided slices for sizes and padded scratch space.
-func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, int, error) {
+// Returns event sizes, the reusable padded scratch buffer, and the byte
+// offset where event data ends. Callers must reassign both sizes and padded
+// from the return values to benefit from buffer reuse.
+func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, []byte, int, error) {
 	if len(raw) < 6 { // minimum: 1 event byte + 4B min + 1B W
-		return sizes, 0, fmt.Errorf("eventstore: block too small (%d bytes)", len(raw))
+		return sizes, padded, 0, fmt.Errorf("eventstore: block too small (%d bytes)", len(raw))
 	}
 
 	w := raw[len(raw)-1] // W is the last byte
+	if w > 32 {
+		return sizes, padded, 0, fmt.Errorf("eventstore: invalid FOR width %d in block (max 32)", w)
+	}
 	packSize := (int(w)*n + 7) / 8
 	indexSize := 4 + packSize + 1 // min(4) + packed + W(1)
 
 	if indexSize > len(raw) {
-		return sizes, 0, fmt.Errorf("eventstore: index size %d exceeds block size %d", indexSize, len(raw))
+		return sizes, padded, 0, fmt.Errorf("eventstore: index size %d exceeds block size %d", indexSize, len(raw))
 	}
 
 	indexStart := len(raw) - indexSize
@@ -134,10 +187,10 @@ func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, in
 		sum += int(s)
 	}
 	if sum != dataEnd {
-		return sizes, 0, fmt.Errorf("eventstore: size sum %d != data end %d", sum, dataEnd)
+		return sizes, padded, 0, fmt.Errorf("eventstore: size sum %d != data end %d", sum, dataEnd)
 	}
 
-	return sizes, dataEnd, nil
+	return sizes, padded, dataEnd, nil
 }
 
 // ReadEvent reads a single event by global index.
@@ -151,38 +204,17 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	localIdx := index % r.blockN
 
 	bb := blockBufPool.Get().(*blockBuf)
+	defer blockBufPool.Put(bb)
 
 	var err error
 	bb.compressed, err = r.pr.ReadRecordInto(blockIdx, bb.compressed)
 	if err != nil {
-		blockBufPool.Put(bb)
 		return nil, err
 	}
-
-	bb.decompressed, err = bb.decoder.DecodeAll(bb.compressed, bb.decompressed[:0])
-	if err != nil {
-		blockBufPool.Put(bb)
+	if err := bb.decode(bb.compressed, r.eventsInBlock(blockIdx)); err != nil {
 		return nil, err
 	}
-
-	bb.sizes, _, err = decodeBlock(bb.decompressed, r.eventsInBlock(blockIdx), bb.sizes, bb.padded)
-	if err != nil {
-		blockBufPool.Put(bb)
-		return nil, err
-	}
-
-	offset := 0
-	for i := 0; i < localIdx; i++ {
-		offset += int(bb.sizes[i])
-	}
-
-	// Copy event bytes into a fresh small allocation so we can pool the block buffers.
-	eventSize := int(bb.sizes[localIdx])
-	event := make([]byte, eventSize)
-	copy(event, bb.decompressed[offset:])
-
-	blockBufPool.Put(bb)
-	return event, nil
+	return bb.event(localIdx), nil
 }
 
 // ReadEvents returns an iterator over count contiguous events starting at start.
@@ -214,16 +246,8 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 				return
 			}
 
-			var err error
-			bb.decompressed, err = bb.decoder.DecodeAll(compressed, bb.decompressed[:0])
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-
 			n := r.eventsInBlock(blockIdx)
-			bb.sizes, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
-			if err != nil {
+			if err := bb.decode(compressed, n); err != nil {
 				yield(nil, err)
 				return
 			}
@@ -240,14 +264,9 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 				localEnd = remaining
 			}
 
-			// Compute byte offset for localStart
-			offset := 0
-			for i := 0; i < localStart; i++ {
-				offset += int(bb.sizes[i])
-			}
-
+			offset := bb.offsets[localStart]
 			for i := localStart; i < localEnd; i++ {
-				end := offset + int(bb.sizes[i])
+				end := bb.offsets[i+1]
 				if !yield(bb.decompressed[offset:end], nil) {
 					return
 				}
@@ -345,6 +364,12 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 				defer wg.Done()
 				bb := blockBufPool.Get().(*blockBuf)
 				defer blockBufPool.Put(bb)
+				defer func() {
+					if rv := recover(); rv != nil {
+						errOnce.Do(func() { firstErr = fmt.Errorf("eventstore: panic in worker: %v", rv) })
+						cancel()
+					}
+				}()
 
 				for {
 					bi := int(nextBlock.Add(1)) - 1
@@ -366,6 +391,10 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			yield(nil, firstErr)
 			return
 		}
+		if err := ctx.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
 		for _, ev := range w.events {
 			if !yield(ev, nil) {
 				return
@@ -384,27 +413,11 @@ func (r *Reader) processBlock(w *indicesWork, bi int, indices []int, bb *blockBu
 	if err != nil {
 		return err
 	}
-	bb.decompressed, err = bb.decoder.DecodeAll(bb.compressed, bb.decompressed[:0])
-	if err != nil {
+	if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx)); err != nil {
 		return err
 	}
-
-	n := r.eventsInBlock(blk.blockIdx)
-	bb.sizes, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
-	if err != nil {
-		return err
-	}
-
 	for j := blk.idxStart; j < blk.idxEnd; j++ {
-		localIdx := indices[j] % r.blockN
-		offset := 0
-		for k := range localIdx {
-			offset += int(bb.sizes[k])
-		}
-		eventSize := int(bb.sizes[localIdx])
-		ev := make([]byte, eventSize)
-		copy(ev, bb.decompressed[offset:offset+eventSize])
-		w.events[j] = ev
+		w.events[j] = bb.event(indices[j] % r.blockN)
 	}
 	return nil
 }

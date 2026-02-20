@@ -173,6 +173,9 @@ func TestLargeRecords(t *testing.T) {
 		}
 		j++
 	}
+	if j != 3 {
+		t.Fatalf("ReadRecords yielded %d records, want 3", j)
+	}
 }
 
 func TestIndexIntegrity(t *testing.T) {
@@ -346,7 +349,9 @@ func TestAtomicWrite(t *testing.T) {
 		t.Fatal("file exists at final path before Finish")
 	}
 
-	w.Append([]byte("hello"))
+	if err := w.Append([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := w.Finish(); err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +372,9 @@ func TestAbortCleansUp(t *testing.T) {
 	}
 
 	tmpPath := w.tmpPath
-	w.Append([]byte("hello"))
+	if err := w.Append([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
 
 	// Tmp file should exist.
 	if _, err := os.Stat(tmpPath); err != nil {
@@ -558,6 +565,49 @@ func TestSpeculativeReadFallback(t *testing.T) {
 	}
 	if j != n {
 		t.Fatalf("ReadRecords yielded %d, want %d", j, n)
+	}
+}
+
+func TestFORRoundTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []uint32
+	}{
+		{"uniform", []uint32{100, 100, 100, 100}},
+		{"ascending", []uint32{10, 20, 30, 40, 50}},
+		{"single", []uint32{42}},
+		{"wide_range", []uint32{0, 1, 1000000}},
+		{"max_group", func() []uint32 {
+			v := make([]uint32, 128)
+			for i := range v {
+				v[i] = uint32(i * 7)
+			}
+			return v
+		}()},
+	}
+
+	var dst []uint32
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := EncodeGroup(tt.values)
+			// Pad for safe 8-byte overshoot reads.
+			padded := make([]byte, len(encoded)+7)
+			copy(padded, encoded)
+
+			var consumed int
+			dst, consumed = DecodeGroup(padded, len(tt.values), dst)
+			if consumed != len(encoded) {
+				t.Fatalf("consumed %d bytes, want %d", consumed, len(encoded))
+			}
+			if len(dst) != len(tt.values) {
+				t.Fatalf("decoded %d values, want %d", len(dst), len(tt.values))
+			}
+			for i, v := range dst {
+				if v != tt.values[i] {
+					t.Fatalf("value[%d] = %d, want %d", i, v, tt.values[i])
+				}
+			}
+		})
 	}
 }
 

@@ -17,8 +17,13 @@ func init() {
 
 // NewDecoder creates a new zstd decoder for use in hot parallel paths
 // where a shared singleton decoder would cause contention.
+// Uses single-threaded decoding (only DecodeAll is used, not streaming)
+// and limits max decoded size to 256MB to prevent zip bombs.
 func NewDecoder() *zstd.Decoder {
-	d, err := zstd.NewReader(nil)
+	d, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(256<<20),
+	)
 	if err != nil {
 		panic("recordcodec: failed to create zstd decoder: " + err.Error())
 	}

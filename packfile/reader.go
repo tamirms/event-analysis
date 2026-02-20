@@ -3,14 +3,13 @@ package packfile
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"iter"
 	"os"
 	"sync"
 )
 
 const (
-	readBufSize = 1 << 20     // 1MB
+	readBufSize  = 1 << 20     // 1MB
 	specReadSize = 256 * 1024 // 256KB speculative read for Open
 )
 
@@ -24,11 +23,11 @@ var readBufPool = sync.Pool{
 // Reader provides random access to records in a packfile.
 // Safe for concurrent use by multiple goroutines.
 type Reader struct {
-	file     ReadAtCloser
-	trailer  Trailer
-	metadata []byte
+	file      ReadAtCloser
+	trailer   Trailer
+	metadata  []byte
 	indexBase int64   // byte position where index section starts
-	offsets  []int64 // decoded absolute offsets, len = recordCount + 1
+	offsets   []int64 // decoded absolute offsets, len = recordCount + 1
 }
 
 // Open reads the trailer and full index, validates file integrity,
@@ -41,16 +40,20 @@ func Open(path string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			f.Close()
+		}
+	}()
 
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
 	fileSize := fi.Size()
 
 	if fileSize < trailerSize {
-		f.Close()
 		return nil, ErrSize
 	}
 
@@ -62,7 +65,6 @@ func Open(path string) (*Reader, error) {
 	specOff := fileSize - specSize
 	specBuf := make([]byte, specSize)
 	if _, err := f.ReadAt(specBuf, specOff); err != nil {
-		f.Close()
 		return nil, err
 	}
 
@@ -71,39 +73,23 @@ func Open(path string) (*Reader, error) {
 
 	m := binary.LittleEndian.Uint32(tb[0:])
 	if m != magic {
-		f.Close()
 		return nil, ErrMagic
 	}
 	v := tb[4]
 	if v != version {
-		f.Close()
 		return nil, ErrVersion
 	}
-	if tb[5] != 0 {
-		f.Close()
-		return nil, fmt.Errorf("%w: non-zero reserved byte", ErrCorrupt)
-	}
-
 	recordCount := int(binary.LittleEndian.Uint32(tb[6:]))
 	indexSize := int(binary.LittleEndian.Uint32(tb[10:]))
 	metadataSize := int(binary.LittleEndian.Uint32(tb[14:]))
 	storedTrailerCRC := binary.LittleEndian.Uint32(tb[18:])
 
 	if storedTrailerCRC != crc32c(tb[0:18]) {
-		f.Close()
 		return nil, ErrChecksum
-	}
-
-	for i := 22; i < trailerSize; i++ {
-		if tb[i] != 0 {
-			f.Close()
-			return nil, fmt.Errorf("%w: non-zero reserved byte in trailer", ErrCorrupt)
-		}
 	}
 
 	indexBase := fileSize - int64(trailerSize) - int64(metadataSize) - int64(indexSize)
 	if indexBase < 0 {
-		f.Close()
 		return nil, ErrSize
 	}
 
@@ -131,7 +117,6 @@ func Open(path string) (*Reader, error) {
 		buf := make([]byte, readSize+7) // +7 for safe 8-byte overshoot in DecodeGroup
 		if readSize > 0 {
 			if _, err := f.ReadAt(buf[:readSize], indexBase); err != nil {
-				f.Close()
 				return nil, err
 			}
 		}
@@ -145,12 +130,12 @@ func Open(path string) (*Reader, error) {
 
 	offsets, err := decodeIndex(indexBuf, recordCount, indexSize, indexBase)
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
 
+	cleanup = false
 	return &Reader{
-		file:     f,
+		file: f,
 		trailer: Trailer{
 			Version:         v,
 			RecordCount:     uint32(recordCount),
@@ -158,15 +143,23 @@ func Open(path string) (*Reader, error) {
 			MetadataSize:    uint32(metadataSize),
 			TrailerChecksum: storedTrailerCRC,
 		},
-		metadata: metadata,
+		metadata:  metadata,
 		indexBase: indexBase,
-		offsets:  offsets,
+		offsets:   offsets,
 	}, nil
 }
 
 func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([]int64, error) {
 	if indexSize < 4 {
-		return nil, ErrChecksum
+		return nil, fmt.Errorf("%w: index too small (%d bytes)", ErrCorrupt, indexSize)
+	}
+
+	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
+	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
+	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
+	maxRecords := maxGroups * groupInterval
+	if recordCount > maxRecords {
+		return nil, fmt.Errorf("%w: recordCount %d implausible for indexSize %d", ErrCorrupt, recordCount, indexSize)
 	}
 
 	// Verify CRC32C over raw index bytes (all groups, excluding trailing 4-byte CRC).
@@ -188,6 +181,10 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 		limit := groupInterval
 		if g == groupCount-1 && recordCount%groupInterval != 0 {
 			limit = recordCount % groupInterval
+		}
+
+		if pos > payloadLen {
+			return nil, fmt.Errorf("%w: index decode overran payload at group %d (pos %d > %d)", ErrCorrupt, g, pos, payloadLen)
 		}
 
 		var size int
@@ -220,6 +217,10 @@ func (r *Reader) resolveOffsetPair(index int) (start, end int64, err error) {
 // ReadRecordInto reads a single record into a caller-provided buffer.
 // Returns a slice of buf (possibly reallocated if buf is too small).
 // Caller must reassign: buf, err = r.ReadRecordInto(index, buf)
+//
+// Note: the packfile format does not include per-record checksums.
+// Data integrity for individual records must be provided by an upper
+// layer (e.g. zstd content checksums in the eventstore package).
 func (r *Reader) ReadRecordInto(index int, buf []byte) ([]byte, error) {
 	start, end, err := r.resolveOffsetPair(index)
 	if err != nil {
@@ -286,7 +287,7 @@ func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
 			// Read batch.
 			batchBytes := r.offsets[batchEnd] - r.offsets[batchStart]
 			readBuf := buf[:batchBytes]
-			if _, err := r.file.ReadAt(readBuf, r.offsets[batchStart]); err != nil && err != io.EOF {
+			if _, err := r.file.ReadAt(readBuf, r.offsets[batchStart]); err != nil {
 				yield(nil, err)
 				return
 			}
@@ -315,9 +316,14 @@ func (r *Reader) Trailer() Trailer {
 	return r.trailer
 }
 
-// Metadata returns the opaque metadata stored in the packfile.
+// Metadata returns a copy of the opaque metadata stored in the packfile.
 func (r *Reader) Metadata() []byte {
-	return r.metadata
+	if r.metadata == nil {
+		return nil
+	}
+	out := make([]byte, len(r.metadata))
+	copy(out, r.metadata)
+	return out
 }
 
 // Close closes the underlying file.

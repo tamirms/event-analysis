@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -304,38 +305,6 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 	}
 }
 
-func TestReadIndicesContextCancel(t *testing.T) {
-	rng := rand.New(rand.NewSource(52))
-	events := makeEvents(1000, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
-
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	indices := make([]int, 100)
-	for i := range indices {
-		indices[i] = i * 10
-	}
-
-	j := 0
-	for _, err := range r.ReadIndices(ctx, indices) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		j++
-		if j == 3 {
-			cancel()
-			break
-		}
-	}
-	cancel() // ensure cancel is called even if loop exits normally
-}
-
 func TestEmptyStore(t *testing.T) {
 	path := writeTestStore(t, nil, DefaultBlockSize)
 
@@ -573,6 +542,98 @@ func TestExactBlockMultiple(t *testing.T) {
 	}
 	if j != 256 {
 		t.Fatalf("ReadEvents yielded %d, want 256", j)
+	}
+}
+
+func TestReadIndicesConcurrent(t *testing.T) {
+	rng := rand.New(rand.NewSource(60))
+	events := makeEvents(500, rng)
+	path := writeTestStore(t, events, DefaultBlockSize)
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+
+	for g := range 10 {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			localRng := rand.New(rand.NewSource(int64(seed)))
+			// Each goroutine picks 20 random sorted-unique indices
+			m := map[int]struct{}{}
+			for len(m) < 20 {
+				m[localRng.Intn(500)] = struct{}{}
+			}
+			indices := make([]int, 0, len(m))
+			for idx := range m {
+				indices = append(indices, idx)
+			}
+			// sort
+			for i := range indices {
+				for j := i + 1; j < len(indices); j++ {
+					if indices[j] < indices[i] {
+						indices[i], indices[j] = indices[j], indices[i]
+					}
+				}
+			}
+
+			j := 0
+			for ev, err := range r.ReadIndices(context.Background(), indices) {
+				if err != nil {
+					errs <- fmt.Errorf("goroutine %d: %w", seed, err)
+					return
+				}
+				if !bytes.Equal(ev, events[indices[j]]) {
+					errs <- fmt.Errorf("goroutine %d, index %d: data mismatch", seed, indices[j])
+					return
+				}
+				j++
+			}
+			if j != len(indices) {
+				errs <- fmt.Errorf("goroutine %d: got %d events, want %d", seed, j, len(indices))
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func TestReadIndicesPreCanceled(t *testing.T) {
+	rng := rand.New(rand.NewSource(61))
+	events := makeEvents(100, rng)
+	path := writeTestStore(t, events, DefaultBlockSize)
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	indices := []int{0, 10, 50, 99}
+	var gotErr error
+	for _, err := range r.ReadIndices(ctx, indices) {
+		if err != nil {
+			gotErr = err
+			break
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected error from pre-canceled context")
+	}
+	if !errors.Is(gotErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", gotErr)
 	}
 }
 
