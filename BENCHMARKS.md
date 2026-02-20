@@ -95,14 +95,24 @@ RocksDB uses `BatchedMultiGetCF` with sorted input, `SetVerifyChecksums(false)`,
 
 Each iteration drops page cache (via `posix_fadvise FADV_DONTNEED`), then times open + 1,000 scattered reads + close. All 1,000 indices land on different blocks, forcing 1,000 separate disk I/Os.
 
-| Benchmark | NVMe (ms) | EBS (ms) |
-|-----------|-----------|----------|
-| ColdPackfileReadIndices | 16 | 256 |
-| ColdRocksDBReadIndices | 173 | 852 |
+RocksDB uses optimized open (`SkipStatsUpdateOnDBOpen`, `SkipCheckingSSTFileSizesOnDBOpen`, single file-opening thread) and `BatchedMultiGetCF` with sorted input, no checksum verification. Parallel variants split keys across N goroutines each calling `BatchedMultiGetCF`.
 
-Packfile is **10.7x faster on NVMe** and **3.3x faster on EBS**. The NVMe advantage is dramatic: packfile's 8 parallel pread goroutines saturate NVMe's parallel I/O capability (16ms for 1,000 block reads = ~62,500 IOPS effective), while RocksDB's sequential reads can't exploit NVMe parallelism.
+| Benchmark | Goroutines | NVMe (ms) | EBS (ms) |
+|-----------|-----------|-----------|----------|
+| Packfile | 1 | 109 | 760 |
+| Packfile | 8 | 16 | 256 |
+| Packfile | 32 | 6.7 | 332 |
+| Packfile | 64 | 5.2 | 331 |
+| RocksDB | 1 | 175 | 868 |
+| RocksDB | 8 | 38 | 238 |
+| RocksDB | 32 | 25 | 333 |
+| RocksDB | 64 | 23 | 339 |
 
-NVMe vs EBS: Packfile benefits 16x from NVMe (16ms vs 256ms) while RocksDB benefits 4.9x (173ms vs 852ms).
+Notes:
+- **NVMe scales with concurrency** for both formats. Packfile at c=64 (5.2ms) is 4.4x faster than RocksDB at c=64 (23ms). The gap comes from packfile's lighter-weight open (0.5ms vs ~5ms) and simpler index lookup (in-memory offset array vs block index traversal + block decompression overhead).
+- **EBS is IOPS-limited at ~3,000 IOPS.** At c=8, RocksDB (238ms) is slightly faster than packfile (256ms) — both saturate the IOPS budget, and per-block overhead differences are negligible. At c=32+, both converge to ~333ms (the 3,000 IOPS floor).
+- **Mmap reads (`SetAllowMmapReads`) hurt** both NVMe and EBS due to per-page fault overhead exceeding explicit pread cost.
+- Serial (c=1) performance reflects the raw per-I/O latency: NVMe ~87μs vs EBS ~738μs.
 
 ## Open Latency
 
