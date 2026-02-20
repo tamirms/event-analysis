@@ -74,6 +74,16 @@ Packfile is 4.6x faster than RocksDB and 30x faster than SSTable under parallel 
 | SSTReadBatch128 | 480,268 | 0B / 0 |
 | RocksDBReadBatch128 | 164,856 | 4.1KB / 257 |
 
+## Range Scan (seek to random offset + read 128 events)
+
+| Benchmark | ns/op | Allocs |
+|-----------|-------|--------|
+| PackfileRangeScan128 | 28,154 | 236B / 7 |
+| SSTRangeScan128 | 504,035 | 0B / 0 |
+| RocksDBRangeScan128 | 190,882 | 4.1KB / 257 |
+
+Packfile is 6.8x faster than RocksDB and 18x faster than SSTable. Compared to batch-from-0 (12μs), the random seek adds ~16μs for packfile (locating and decompressing the target block).
+
 ## Scattered Read (50 random indices)
 
 | Benchmark | ns/op | Allocs |

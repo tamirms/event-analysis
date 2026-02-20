@@ -585,6 +585,115 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 	}
 }
 
+// --- Range scan from random offset benchmarks ---
+
+func BenchmarkPackfileRangeScan128(b *testing.B) {
+	setupBenchData(b)
+
+	er, err := eventstore.Open(eventstorePath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer er.Close()
+
+	n := er.EventCount()
+	const scanLen = 128
+	rng := rand.New(rand.NewSource(42))
+	b.ResetTimer()
+
+	for range b.N {
+		start := rng.Intn(n - scanLen)
+		for ev, err := range er.ReadEvents(start, scanLen) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
+		}
+	}
+}
+
+func BenchmarkSSTRangeScan128(b *testing.B) {
+	setupBenchData(b)
+
+	f, err := os.Open(sstPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	readable, err := sstable.NewSimpleReadable(f)
+	if err != nil {
+		f.Close()
+		b.Fatal(err)
+	}
+	reader, err := sstable.NewReader(readable, sstable.ReaderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer reader.Close()
+
+	const scanLen = 128
+	rng := rand.New(rand.NewSource(42))
+	key := make([]byte, 4)
+
+	iter, err := reader.NewIter(nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer iter.Close()
+
+	b.ResetTimer()
+
+	for range b.N {
+		start := rng.Intn(totalEvents - scanLen)
+		binary.BigEndian.PutUint32(key, uint32(start))
+		k, val := iter.SeekGE(key, sstable.SeekGEFlags(0))
+		if k == nil {
+			b.Fatalf("SeekGE(%d): key not found", start)
+		}
+		_ = val.ValueOrHandle
+		for i := 1; i < scanLen; i++ {
+			k, val = iter.Next()
+			if k == nil {
+				b.Fatalf("Next at %d: unexpected end", i)
+			}
+			_ = val.ValueOrHandle
+		}
+	}
+}
+
+func BenchmarkRocksDBRangeScan128(b *testing.B) {
+	setupBenchData(b)
+
+	db := openRocksDB(b)
+	defer db.Close()
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	const scanLen = 128
+	rng := rand.New(rand.NewSource(42))
+	key := make([]byte, 4)
+	b.ResetTimer()
+
+	for range b.N {
+		start := rng.Intn(totalEvents - scanLen)
+		binary.BigEndian.PutUint32(key, uint32(start))
+		it := db.NewIterator(ro)
+		it.Seek(key)
+		if !it.Valid() {
+			b.Fatalf("Seek(%d): key not found", start)
+		}
+		_ = it.Value().Data()
+		for i := 1; i < scanLen; i++ {
+			it.Next()
+			if !it.Valid() {
+				b.Fatalf("Next at %d: unexpected end", i)
+			}
+			_ = it.Value().Data()
+		}
+		it.Close()
+	}
+}
+
 // --- Scattered read benchmarks (ReadIndices) ---
 
 // generateScatteredIndices returns n sorted unique random indices in [0, total).
