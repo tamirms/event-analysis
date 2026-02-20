@@ -734,24 +734,32 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 	defer db.Close()
 
 	ro := grocksdb.NewDefaultReadOptions()
+	ro.SetVerifyChecksums(false)
+	ro.SetFillCache(false)
 	defer ro.Destroy()
+
+	cf := db.GetDefaultColumnFamily()
 
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
-	key := make([]byte, 4)
 	b.ResetTimer()
 
 	for range b.N {
 		indices := generateScatteredIndices(rng, numIndices, totalEvents)
-		for _, idx := range indices {
-			binary.BigEndian.PutUint32(key, uint32(idx))
-			val, err := db.GetPinned(ro, key)
-			if err != nil {
-				b.Fatal(err)
-			}
-			_ = val.Data()
-			val.Destroy()
+		keys := make([][]byte, len(indices))
+		for i, idx := range indices {
+			k := make([]byte, 4)
+			binary.BigEndian.PutUint32(k, uint32(idx))
+			keys[i] = k
 		}
+		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, v := range vals {
+			_ = v.Data()
+		}
+		vals.Destroy()
 	}
 }
 
@@ -793,21 +801,29 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 		db := openRocksDB(b)
 		defer db.Close()
 		ro := grocksdb.NewDefaultReadOptions()
+		ro.SetVerifyChecksums(false)
+		ro.SetFillCache(false)
 		defer ro.Destroy()
 
+		cf := db.GetDefaultColumnFamily()
+
 		rng := rand.New(rand.NewSource(rand.Int63()))
-		key := make([]byte, 4)
 		for pb.Next() {
 			indices := generateScatteredIndices(rng, numIndices, totalEvents)
-			for _, idx := range indices {
-				binary.BigEndian.PutUint32(key, uint32(idx))
-				val, err := db.GetPinned(ro, key)
-				if err != nil {
-					b.Fatal(err)
-				}
-				_ = val.Data()
-				val.Destroy()
+			keys := make([][]byte, len(indices))
+			for i, idx := range indices {
+				k := make([]byte, 4)
+				binary.BigEndian.PutUint32(k, uint32(idx))
+				keys[i] = k
 			}
+			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for _, v := range vals {
+				_ = v.Data()
+			}
+			vals.Destroy()
 		}
 	})
 }
