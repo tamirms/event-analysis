@@ -88,18 +88,19 @@ Packfile is 6.8x faster than RocksDB and 18x faster than SSTable. Compared to ba
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadIndices | 183,209 | 60KB / 83 |
-| SSTReadIndices | 21,197,755 | 1.6KB / 4 |
-| RocksDBReadIndices | 724,028 | 6.7KB / 204 |
+| PackfileReadIndices | 186,723 | 57KB / 83 |
+| SSTReadIndices | 3,153,945 | 2.3KB / 21 |
+| RocksDBReadIndices | 570,229 | 6.7KB / 204 |
 
-Both packfile and RocksDB use 8 internal goroutines for parallel I/O. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetVerifyChecksums(false)`, `SetFillCache(false)`. Packfile `ReadIndices` uses work-stealing parallel pread.
+All three use 8 internal goroutines for parallel I/O. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetVerifyChecksums(false)`, `SetFillCache(false)`. SSTable splits keys across goroutines each with its own iterator.
 
 ## Parallel Scattered Read (50 indices, 32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelReadIndices | 45,059 | 40KB / 81 |
-| RocksDBParallelReadIndices | 174,769 | 6.7KB / 204 |
+| PackfileParallelReadIndices | 45,491 | 40KB / 81 |
+| SSTParallelReadIndices | 1,156,341 | 2.8KB / 22 |
+| RocksDBParallelReadIndices | 177,105 | 6.7KB / 204 |
 
 ## Cold Cache Scattered Read (1,000 indices on distinct blocks, includes open)
 

@@ -794,6 +794,57 @@ func BenchmarkPackfileReadEventSeq50(b *testing.B) {
 	}
 }
 
+// sstParallelSeekGE splits indices across goroutines for parallel SSTable lookups,
+// matching packfile ReadIndices' internal goroutine parallelism.
+func sstParallelSeekGE(b *testing.B, reader *sstable.Reader, indices []int, concurrency int) {
+	b.Helper()
+	if concurrency <= 1 || len(indices) < concurrency {
+		iter, err := reader.NewIter(nil, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		key := make([]byte, 4)
+		for _, idx := range indices {
+			binary.BigEndian.PutUint32(key, uint32(idx))
+			k, val := iter.SeekGE(key, sstable.SeekGEFlags(0))
+			if k == nil {
+				b.Fatalf("SeekGE(%d): key not found", idx)
+			}
+			_ = val.ValueOrHandle
+		}
+		iter.Close()
+		return
+	}
+	var wg sync.WaitGroup
+	perWorker := (len(indices) + concurrency - 1) / concurrency
+	for i := range concurrency {
+		lo := i * perWorker
+		hi := min(lo+perWorker, len(indices))
+		if lo >= len(indices) {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			iter, err := reader.NewIter(nil, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			key := make([]byte, 4)
+			for _, idx := range indices[lo:hi] {
+				binary.BigEndian.PutUint32(key, uint32(idx))
+				k, val := iter.SeekGE(key, sstable.SeekGEFlags(0))
+				if k == nil {
+					b.Fatalf("SeekGE(%d): key not found", idx)
+				}
+				_ = val.ValueOrHandle
+			}
+			iter.Close()
+		}()
+	}
+	wg.Wait()
+}
+
 func BenchmarkSSTReadIndices(b *testing.B) {
 	setupBenchData(b)
 
@@ -814,26 +865,12 @@ func BenchmarkSSTReadIndices(b *testing.B) {
 
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
-	key := make([]byte, 4)
-
-	iter, err := reader.NewIter(nil, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer iter.Close()
 
 	b.ResetTimer()
 
 	for range b.N {
 		indices := generateScatteredIndices(rng, numIndices, totalEvents)
-		for _, idx := range indices {
-			binary.BigEndian.PutUint32(key, uint32(idx))
-			k, val := iter.SeekGE(key, sstable.SeekGEFlags(0))
-			if k == nil {
-				b.Fatalf("SeekGE(%d): key not found", idx)
-			}
-			_ = val.ValueOrHandle
-		}
+		sstParallelSeekGE(b, reader, indices, 8)
 	}
 }
 
@@ -931,6 +968,36 @@ func BenchmarkPackfileParallelReadIndices(b *testing.B) {
 				}
 				_ = ev
 			}
+		}
+	})
+}
+
+func BenchmarkSSTParallelReadIndices(b *testing.B) {
+	setupBenchData(b)
+
+	f, err := os.Open(sstPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	readable, err := sstable.NewSimpleReadable(f)
+	if err != nil {
+		f.Close()
+		b.Fatal(err)
+	}
+	reader, err := sstable.NewReader(readable, sstable.ReaderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer reader.Close()
+
+	const numIndices = 50
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		for pb.Next() {
+			indices := generateScatteredIndices(rng, numIndices, totalEvents)
+			sstParallelSeekGE(b, reader, indices, 8)
 		}
 	})
 }
