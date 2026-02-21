@@ -1195,6 +1195,26 @@ func benchPackfileWrite(b *testing.B, concurrency int) {
 	b.SetBytes(int64(totalRawBytes))
 	b.ResetTimer()
 
+	for range b.N {
+		p := filepath.Join(b.TempDir(), "bench.events")
+		ew, err := eventstore.Create(p, eventstore.WriterOptions{Concurrency: concurrency})
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, ev := range allEvents {
+			if err := ew.Append(ev); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := ew.Finish(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchPackfileWriteMemory(b *testing.B, concurrency int) {
+	ensureAllEvents(b)
+
 	var peakDelta int64
 	for range b.N {
 		p := filepath.Join(b.TempDir(), "bench.events")
@@ -1240,6 +1260,9 @@ func BenchmarkPackfileWriteParallel32(b *testing.B) {
 	benchPackfileWrite(b, 32)
 }
 
+func BenchmarkPackfileWriteMemory(b *testing.B)          { benchPackfileWriteMemory(b, 0) }
+func BenchmarkPackfileWriteMemoryParallel8(b *testing.B) { benchPackfileWriteMemory(b, 8) }
+
 func BenchmarkSSTWrite(b *testing.B) {
 	ensureAllEvents(b)
 
@@ -1275,71 +1298,82 @@ func BenchmarkSSTWrite(b *testing.B) {
 	}
 }
 
+// rocksDBWriteCore contains the shared write logic for throughput and memory benchmarks.
+func rocksDBWriteCore(b *testing.B, parallelComp int) {
+	dir := b.TempDir()
+	sstFilePath := filepath.Join(dir, "ingest.sst")
+	dbPath := filepath.Join(dir, "rocks.db")
+
+	// Write SST file via SSTFileWriter.
+	writeOpts := grocksdb.NewDefaultOptions()
+	writeOpts.SetCompression(grocksdb.ZSTDCompression)
+	if parallelComp > 1 {
+		writeOpts.SetCompressionOptionsParallelThreads(parallelComp)
+	}
+	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+	avgEventSize := totalRawBytes / len(allEvents)
+	bbto.SetBlockSize(128 * avgEventSize)
+	writeOpts.SetBlockBasedTableFactory(bbto)
+
+	envOpts := grocksdb.NewDefaultEnvOptions()
+	sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
+	if err := sfw.Open(sstFilePath); err != nil {
+		b.Fatal(err)
+	}
+	key := make([]byte, 4)
+	for i, ev := range allEvents {
+		binary.BigEndian.PutUint32(key, uint32(i))
+		if err := sfw.Add(key, ev); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := sfw.Finish(); err != nil {
+		b.Fatal(err)
+	}
+	sfw.Destroy()
+	envOpts.Destroy()
+	writeOpts.Destroy()
+
+	// Open DB and ingest.
+	dbOpts := grocksdb.NewDefaultOptions()
+	dbOpts.SetCreateIfMissing(true)
+	dbOpts.SetCompression(grocksdb.ZSTDCompression)
+	dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
+	dbBbto.SetNoBlockCache(true)
+	dbBbto.SetBlockSize(128 * avgEventSize)
+	dbOpts.SetBlockBasedTableFactory(dbBbto)
+
+	db, err := grocksdb.OpenDb(dbOpts, dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+	if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
+		b.Fatal(err)
+	}
+	ingestOpts.Destroy()
+	db.Close()
+	dbOpts.Destroy()
+}
+
 func benchRocksDBWrite(b *testing.B, parallelComp int) {
 	ensureAllEvents(b)
-
-	avgEventSize := totalRawBytes / len(allEvents)
-	blockSize := 128 * avgEventSize
 
 	b.SetBytes(int64(totalRawBytes))
 	b.ResetTimer()
 
+	for range b.N {
+		rocksDBWriteCore(b, parallelComp)
+	}
+}
+
+func benchRocksDBWriteMemory(b *testing.B, parallelComp int) {
+	ensureAllEvents(b)
+
 	var peakDelta int64
 	for range b.N {
-		dir := b.TempDir()
-		sstFilePath := filepath.Join(dir, "ingest.sst")
-		dbPath := filepath.Join(dir, "rocks.db")
-
 		peakDelta = peakRssAnonDelta(func() {
-			// Write SST file via SSTFileWriter.
-			writeOpts := grocksdb.NewDefaultOptions()
-			writeOpts.SetCompression(grocksdb.ZSTDCompression)
-			if parallelComp > 1 {
-				writeOpts.SetCompressionOptionsParallelThreads(parallelComp)
-			}
-			bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-			bbto.SetBlockSize(blockSize)
-			writeOpts.SetBlockBasedTableFactory(bbto)
-
-			envOpts := grocksdb.NewDefaultEnvOptions()
-			sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
-			if err := sfw.Open(sstFilePath); err != nil {
-				b.Fatal(err)
-			}
-			key := make([]byte, 4)
-			for i, ev := range allEvents {
-				binary.BigEndian.PutUint32(key, uint32(i))
-				if err := sfw.Add(key, ev); err != nil {
-					b.Fatal(err)
-				}
-			}
-			if err := sfw.Finish(); err != nil {
-				b.Fatal(err)
-			}
-			sfw.Destroy()
-			envOpts.Destroy()
-			writeOpts.Destroy()
-
-			// Open DB and ingest.
-			dbOpts := grocksdb.NewDefaultOptions()
-			dbOpts.SetCreateIfMissing(true)
-			dbOpts.SetCompression(grocksdb.ZSTDCompression)
-			dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-			dbBbto.SetNoBlockCache(true)
-			dbBbto.SetBlockSize(blockSize)
-			dbOpts.SetBlockBasedTableFactory(dbBbto)
-
-			db, err := grocksdb.OpenDb(dbOpts, dbPath)
-			if err != nil {
-				b.Fatal(err)
-			}
-			ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-			if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
-				b.Fatal(err)
-			}
-			ingestOpts.Destroy()
-			db.Close()
-			dbOpts.Destroy()
+			rocksDBWriteCore(b, parallelComp)
 		})
 	}
 	b.ReportMetric(float64(peakDelta)/(1<<20), "peak-delta-MB")
@@ -1356,6 +1390,9 @@ func BenchmarkRocksDBWriteParallel4(b *testing.B) {
 func BenchmarkRocksDBWriteParallel8(b *testing.B) {
 	benchRocksDBWrite(b, 8)
 }
+
+func BenchmarkRocksDBWriteMemory(b *testing.B)          { benchRocksDBWriteMemory(b, 1) }
+func BenchmarkRocksDBWriteMemoryParallel8(b *testing.B) { benchRocksDBWriteMemory(b, 8) }
 
 // --- Cold cache scattered read benchmarks ---
 

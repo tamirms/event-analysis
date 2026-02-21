@@ -53,15 +53,29 @@ go test -v -count=1 -run TestSSTableCompression -timeout 30m github.com/tamir/ev
 
 ## Running Benchmarks
 
+**Run each benchmark in a separate process** to avoid two sources of contamination:
+
+1. **Page cache warming**: Go's test framework runs benchmarks alphabetically within a single process. Earlier benchmarks (e.g., `BenchmarkPackfile*`) warm the page cache for later ones (e.g., `BenchmarkRocksDB*`), inflating the later numbers.
+2. **GOGC=1 contamination**: Memory benchmarks (`*WriteMemory*`) set `GOGC=1` to measure working set. This penalizes Go-side allocations ~10x while leaving C-side allocations (RocksDB) unaffected. Running throughput and memory benchmarks in the same process invalidates throughput comparisons.
+
 ```bash
-go test -v -count=1 -bench=. -benchmem -run='^$' -timeout 30m github.com/tamir/events-analysis
+# Correct: each benchmark in its own process
+go test -bench='^BenchmarkPackfileWrite$' -benchmem -run='^$' -count=5 -timeout 30m
+go test -bench='^BenchmarkRocksDBWrite$' -benchmem -run='^$' -count=5 -timeout 30m
+
+# Wrong: all benchmarks in one process
+go test -bench='.*' -benchmem -run='^$' -timeout 30m
 ```
 
-### Write benchmarks on NVMe
+Use `benchstat` for statistical comparison across runs.
 
-To write temp files to NVMe instead of EBS root:
+### Write throughput (fast feedback)
+
+`TestWriteThroughput` runs all write configurations in a single test without `GOGC=1` overhead. Use `WRITE_DIR` to target a specific device:
+
 ```bash
-TMPDIR=/mnt/nvme go test -bench='Benchmark.*Write' -benchmem -run='^$' -timeout 30m
+WRITE_DIR=/mnt/nvme go test -run=TestWriteThroughput -timeout 30m
+WRITE_DIR=/tmp go test -run=TestWriteThroughput -timeout 30m   # EBS
 ```
 
 ### Measuring Peak Memory

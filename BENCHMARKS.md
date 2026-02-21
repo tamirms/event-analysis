@@ -10,26 +10,30 @@ All three formats use **zstd level 3** compression with ~27.6KB block size (128 
 
 **Note on RocksDB numbers:** RocksDB is accessed via grocksdb (CGO bindings). Each CGO boundary crossing costs ~50-100ns. For sequential and batch reads with millions of per-item calls (Valid/Next/Value), CGO overhead accounts for an estimated 10-25% of measured RocksDB time. This is inherent to using RocksDB from Go and representative of real-world Go application performance, but the raw C API would be faster. Checksum verification is disabled for RocksDB (`SetVerifyChecksums(false)`), matching packfile which relies on zstd's built-in content checksum only.
 
+See CLAUDE.md for instructions on running benchmarks (separate-process execution, avoiding GOGC contamination, etc.).
+
 ## Write / Ingestion
 
 | Benchmark | EBS (MB/s) | EBS (s) | NVMe (MB/s) | NVMe (s) |
 |-----------|-----------|---------|-------------|----------|
-| PackfileWrite | 137 | 14.1 | 162 | 11.9 |
-| PackfileWrite (4 goroutines) | 394 | 4.9 | 726 | 2.7 |
-| PackfileWrite (8 goroutines) | 539 | 3.6 | 1,387 | 1.4 |
-| PackfileWrite (16 goroutines) | 591 | 3.3 | 2,016 | 1.0 |
-| **PackfileWrite (24 goroutines)** | **591** | **3.3** | **2,122** | **0.9** |
-| PackfileWrite (32 goroutines) | 590 | 3.3 | 2,050 | 0.9 |
-| SSTWrite | 47 | 40.8 | 47 | 40.8 |
-| RocksDBWrite | 40 | 48.0 | 46 | 42.4 |
-| RocksDBWrite (4 threads) | 96 | 20.1 | 133 | 14.5 |
-| RocksDBWrite (8 threads) | 143 | 13.6 | 239 | 8.1 |
+| PackfileWrite | 125 | 15.5 | 103 | 18.7 |
+| PackfileWrite (4 goroutines) | 393 | 4.9 | 482 | 4.0 |
+| PackfileWrite (8 goroutines) | 542 | 3.6 | 1,027 | 1.9 |
+| PackfileWrite (16 goroutines) | 590 | 3.3 | 1,681 | 1.2 |
+| **PackfileWrite (24 goroutines)** | **589** | **3.3** | **1,742** | **1.1** |
+| PackfileWrite (32 goroutines) | 587 | 3.3 | 1,692 | 1.1 |
+| SSTWrite | — | — | 47 | 40.8 |
+| RocksDBWrite | 40 | 48.6 | 45 | 42.9 |
+| RocksDBWrite (4 threads) | 95 | 20.3 | 132 | 14.7 |
+| RocksDBWrite (8 threads) | 141 | 13.7 | 239 | 8.1 |
 
 Notes:
-- **Packfile with 24 goroutines on NVMe (2,122 MB/s) is 8.9x faster than RocksDB's best (239 MB/s).**
+- **Packfile with 24 goroutines on NVMe (1,742 MB/s) is 7.3x faster than RocksDB's best (239 MB/s).**
 - Parallel packfile uses streaming compression: each full block is sent to one of N compress goroutines via a buffered channel. A dedicated writer goroutine receives compressed blocks and uses a reorder buffer to emit them in original order.
-- Pebble SSTable is fully CPU-bound (no NVMe benefit, 47 MB/s on both).
-- **EBS plateaus at ~591 MB/s (c=16+)** due to EBS bandwidth limits. **NVMe plateaus at ~2.1 GB/s (c=16-24)** where the serial main goroutine (block building at 3.4 GB/s) becomes the bottleneck.
+- Pebble SSTable is fully CPU-bound (no NVMe benefit, 47 MB/s).
+- **Serial writes are CPU-bound** (zstd compression dominates). At ~110 MB/s raw throughput with 4.4x compression, the actual disk write rate is only ~25 MB/s — trivial for both EBS and NVMe. EBS/NVMe serial numbers are within noise of each other.
+- **EBS plateaus at ~590 MB/s (c=16+)** due to EBS bandwidth limits. **NVMe plateaus at ~1.7-2.1 GB/s (c=16-24)** where the serial main goroutine (block building) becomes the bottleneck.
+- Throughput benchmarks do NOT use `GOGC=1` — they measure actual ingestion speed. See memory benchmarks below for working set measurements.
 
 ### Write Peak Memory (RssAnon delta, excluding page cache)
 
@@ -131,6 +135,20 @@ Notes:
 - **EBS is IOPS-limited at ~3,000 IOPS.** At c=8, RocksDB (238ms) is slightly faster than packfile (256ms) — both saturate the IOPS budget, and per-block overhead differences are negligible. At c=32+, both converge to ~333ms (the 3,000 IOPS floor).
 - **Mmap reads (`SetAllowMmapReads`) hurt** both NVMe and EBS due to per-page fault overhead exceeding explicit pread cost.
 - Serial (c=1) performance reflects the raw per-I/O latency: NVMe ~87μs vs EBS ~738μs.
+
+### Improving EBS Cold Cache Latency
+
+The EBS bottleneck is **IOPS, not bandwidth**. 1,000 scattered reads × ~6.4KB per block = ~6.4MB total data (trivial bandwidth), but 1,000 random I/Os at 3,000 IOPS = ~333ms floor.
+
+| Option | IOPS | Expected latency (c=32) | $/month (us-east-1) |
+|--------|------|------------------------|---------------------|
+| gp3 baseline | 3,000 | 332 ms | included |
+| gp3 + provisioned IOPS | 16,000 | ~62 ms | +$65 (13K × $0.005) |
+| io2 | 40,000 | ~25 ms | ~$2,725 (40K × $0.065 + 1TB storage) |
+| io2 Block Express | 160,000 | ~6 ms | ~$9,520 |
+| NVMe instance storage (i4i.xlarge) | 40,000 | 6.7 ms | ~$250 (instance cost) |
+
+Provisioning gp3 to 16,000 IOPS ($65/month) is the best value — ~5x latency improvement. Beyond that, NVMe instance storage (i4i family) delivers io2-level IOPS at ~11x lower cost, but storage is ephemeral (lost on instance stop). io2 is only justified when you need both high IOPS and persistence without a replication strategy.
 
 ## Open Latency
 
