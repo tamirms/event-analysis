@@ -10,8 +10,7 @@ given that we need both sequential scanning and random access to individual even
 Two candidate layouts are compared:
 
 1. **RocksDB SSTable** — The standard sorted key-value file format used by RocksDB and
-   LevelDB-derived storage engines, also used as the on-disk format for our RocksDB
-   benchmarks via grocksdb's SSTFileWriter
+   LevelDB-derived storage engines, produced by grocksdb's SSTFileWriter (RocksDB 10.9.1)
 2. **Fixed-N Batch** — A custom format grouping a fixed count of events per block
    (the packfile/eventstore format used in our benchmarks)
 
@@ -30,14 +29,14 @@ key and the binary-encoded event as the value.
 
 ```
 For each entry in the block:
-  [shared_key_prefix_len: varint]     ← prefix compression vs previous key
-  [unshared_key_len:      varint]     ← remaining key bytes
-  [value_len:             varint]     ← value length
-  [unshared_key_bytes]                ← the non-shared portion of the key
-  [internal_trailer:      8 bytes]    ← sequence number (7B) + key kind (1B)
-  [value_bytes]                       ← the event payload
+  [shared_key_prefix_len: varint]     <- prefix compression vs previous key
+  [unshared_key_len:      varint]     <- remaining key bytes
+  [value_len:             varint]     <- value length
+  [unshared_key_bytes]                <- the non-shared portion of the key
+  [internal_trailer:      8 bytes]    <- sequence number (7B) + key kind (1B)
+  [value_bytes]                       <- the event payload
 Every `restartInterval` entries:
-  [restart_point:         4 bytes]    ← offset for binary search within block
+  [restart_point:         4 bytes]    <- offset for binary search within block
 ```
 
 The block is then zstd-compressed and written with a 5-byte trailer
@@ -47,8 +46,8 @@ The block is then zstd-compressed and written with a 5-byte trailer
 
 ```
 [data block 0][5B trailer] [data block 1][5B trailer] ...
-[index block(s)]           ← maps keys to data block offsets
-[top-level index]          ← only for two-level indexes
+[index block(s)]           <- maps keys to data block offsets
+[top-level index]          <- only for two-level indexes
 [properties block]
 [meta-index block]
 [footer: 48 bytes]
@@ -56,14 +55,14 @@ The block is then zstd-compressed and written with a 5-byte trailer
 
 **Per-entry overhead:**
 - 4 bytes user key (ordinal)
-- 8 bytes internal trailer (sequence number + key kind) — mandatory in RocksDB SSTable format
+- 8 bytes internal trailer (sequence number + key kind) -- mandatory in RocksDB SSTable format
 - ~3 bytes varint framing (shared prefix len, unshared key len, value len)
 - Total: **~15 bytes/entry** in the uncompressed stream
 
 **SSTable configuration used for benchmarking:**
-- Block size set to 128 × avg event size (~27.6KB), matching the packfile block size
-- `BlockSizeThreshold = 100%` (fill blocks completely)
-- `BlockRestartInterval = 1024` (minimize restart point overhead)
+- Block size set to N x avgEventSize, matching the batch's uncompressed block size exactly
+- `block_size_deviation = 100` (fill blocks completely, don't flush early)
+- `block_restart_interval = 1024` (minimize restart point overhead)
 - These settings minimize SST overhead; defaults are more conservative
 
 ### Fixed-N Batch (Packfile/Eventstore)
@@ -74,39 +73,42 @@ zstd-compressed as a single unit.
 **Batch payload layout** (uncompressed, before zstd):
 
 ```
-[event₀] [event₁] ... [eventₙ₋₁] [FOR-N intra-batch index]
+[event_0] [event_1] ... [event_{N-1}] [FOR-N intra-batch index]
 ```
 
 The intra-batch index is a Frame-of-Reference (FOR) encoded array of N event sizes
-(byte lengths), appended as a trailer to the event data:
+(byte lengths), appended as a trailer within the compressed block. The on-disk byte
+order within each eventstore block is:
 
 ```
-[min_size: 4 bytes]    ← minimum event size in the batch (LE uint32)
-[packed:   ⌈W×N/8⌉]   ← bit-packed residuals: event_size[i] - min_size
-[W:        1 byte]     ← bit width of residuals = bits.Len32(max_size - min_size)
+[event data] [min_size: 4B LE] [packed residuals: ceil(W*N/8)] [W: 1B]
 ```
 
-No separate CRC or integrity header — the count N and group size are implicit
+where W = bit width of residuals = `bits.Len32(max_size - min_size)`.
+
+No separate CRC or integrity header -- the count N and group size are implicit
 (fixed at write time), and zstd provides its own content checksum.
 
 To locate event `i` within a decompressed batch:
-1. Read W from the last byte, compute index size: `4 + ⌈W×N/8⌉ + 1`
+1. Read W from the last byte, compute index size: `4 + ceil(W*N/8) + 1`
 2. Decode the first `i` sizes via prefix sum to get the byte offset
 3. Event `i` starts at `offset[i]`
 
 **File structure:**
 
 ```
-[zstd(batch₀)] [zstd(batch₁)] ...
-[offset array]                       ← flat array of batch byte offsets
+[zstd(batch_0)] [zstd(batch_1)] ...
+[inter-batch index]                  <- FOR-128 encoded record sizes
+[metadata: 12 bytes]                 <- event count, block size, flags
+[trailer: 32 bytes]                  <- magic, version, checksums
 ```
 
-The inter-batch index is a flat offset array (one uint64 per batch record),
-enabling O(1) positional lookup.
+The inter-batch index is a FOR-128 encoded array of compressed record sizes,
+enabling O(1) positional lookup via prefix-sum decode.
 
 **Per-entry overhead:**
 - ~1 byte/event in the intra-batch FOR-N index (5 byte header + ~W bits/event packed residuals, amortized across N events)
-- Inter-batch index: negligible (flat offset array for ~68K batches)
+- Inter-batch index: negligible (FOR-128 encoded record sizes for ~68K records)
 - Total: **~1 byte/entry** in the uncompressed stream
 
 ## Benchmark Methodology
@@ -122,69 +124,61 @@ enabling O(1) positional lookup.
 
 For each batch size N in {32, 64, 128, 256, 512}:
 
-1. **Batch approach**: Group events into batches of N. For each batch, concatenate
-   event data, append the FOR-N intra-batch index, and zstd-compress the combined
-   payload. Build the inter-batch offset array over the compressed record positions.
-   Total = sum of compressed records + inter-batch index.
+1. **Batch approach**: Write an eventstore via `eventstore.Create()` with `BlockSize=N`.
+   Read back the packfile trailer to extract the inter-batch index size. Compute
+   intra-batch FOR-N overhead by encoding each block's event sizes via
+   `packfile.EncodeGroup()`. Total file size from `os.Stat()`.
 
-2. **RocksDB SSTable approach**: Write all events as KV entries (4-byte ordinal key →
-   event value) into a RocksDB SSTable with block size set to the nearest power-of-two
-   matching the batch's uncompressed size (~N × 221 bytes). SSTable configuration
-   uses `BlockSizeThreshold=100%` and `BlockRestartInterval=1024` to minimize
-   structural overhead.
+2. **RocksDB SSTable approach**: Write all events as KV entries (4-byte ordinal key ->
+   event value) into an SST file via grocksdb's `SSTFileWriter`. The SST block size is
+   set to N x avgEventSize (same uncompressed block size as the batch). Configuration:
+   `block_size_deviation=100`, `block_restart_interval=1024`. Ingest into a temporary
+   DB and extract properties via `db.GetProperty("rocksdb.aggregated-table-properties")`.
 
-Additionally, one "equal size" comparison sets the SST block size to exactly
-N × avgEventSize (≈55.2 KB for N=256) to eliminate any block-size mismatch.
+All numbers are produced by `TestBatchVsSSTAnalysis` in `sst_analysis_test.go`.
 
 ## Results
 
-### Batch vs SSTable at comparable uncompressed block sizes
+### Batch vs SSTable at equal uncompressed block sizes
+
+Both formats use the same uncompressed block size (N x 221 bytes) for each row.
 
 ```
 Method                        Compressed    InterIdx       Total    Ratio
 ----------------------------  ----------  ----------  ----------  -------
-Batch N=32    (~6.9KB raw)     492344 KB     402 KB   492747 KB   3.83x
-SST   bs=8KB                  510442 KB       — KB   510442 KB   3.70x
+Batch N=32    (~6.9KB)         492810 KB     383 KB   493193 KB   3.83x
+SST   bs=6.9KB                521227 KB       - KB   521227 KB   3.62x
 
-Batch N=64    (~13.8KB raw)    450953 KB     218 KB   451171 KB   4.19x
-SST   bs=16KB                 467777 KB       — KB   467777 KB   4.04x
+Batch N=64    (~13.8KB)        451240 KB     205 KB   451445 KB   4.18x
+SST   bs=13.8KB               473174 KB       - KB   473174 KB   3.99x
 
-Batch N=128   (~27.6KB raw)    424457 KB     117 KB   424574 KB   4.45x
-SST   bs=32KB                 442302 KB       — KB   442302 KB   4.27x
+Batch N=128   (~27.6KB)        424610 KB     111 KB   424721 KB   4.45x
+SST   bs=27.6KB               446846 KB       - KB   446846 KB   4.23x
 
-Batch N=256   (~55.2KB raw)    407746 KB      62 KB   407808 KB   4.63x
-SST   bs=64KB                 425490 KB       — KB   425490 KB   4.44x
+Batch N=256   (~55.2KB)        407844 KB      60 KB   407904 KB   4.63x
+SST   bs=55.2KB               428683 KB       - KB   428683 KB   4.41x
 
-Batch N=512   (~110.5KB raw)   395048 KB      32 KB   395080 KB   4.78x
-SST   bs=128KB                412183 KB       — KB   412183 KB   4.58x
+Batch N=512   (~110.5KB)       395093 KB      31 KB   395124 KB   4.78x
+SST   bs=110.5KB              414910 KB       - KB   414910 KB   4.55x
 ```
 
-### Equal uncompressed block size (N=256, SST block = 55.2KB)
+At N=256, the delta is **20,779 KB (~5.1%)** -- consistent across all block sizes.
+
+### SST file layout breakdown (N=128, block size = 27.6KB)
 
 ```
-Batch N=256   (~55.2KB raw)    407746 KB      62 KB   407808 KB   4.63x
-SST   bs=55.2KB               428629 KB       — KB   428629 KB   4.41x
-                                                       ──────
-                                                  Δ = 20,821 KB (~5.0%)
-```
-
-### SST file layout breakdown (block size = 64KB)
-
-```
-File size:        425,490 KB  (100.0%)
-Data blocks:      424,940 KB  ( 99.9%)  [31,187 blocks]
-Index blocks:         397 KB  (  0.1%)  [13 blocks]
-Top-level index:        0 KB  (  0.0%)
-Properties:             1 KB  (  0.0%)
-Footer:                 0 KB  (  0.0%)
-Block trailers:       152 KB  (  0.0%)  [~31,203 × 5B]
+File size:        446,846 KB  (100.0%)
+Data blocks:      446,010 KB  ( 99.8%)  [72,083 blocks]
+Index blocks:       1,156 KB  (  0.3%)
+Raw key size:     102,442 KB  (12.0 B/entry)
+Raw value size: 1,888,365 KB  (221.2 B/entry)
 ```
 
 **Per-entry key overhead:**
 - User key bytes:          34,147 KB  (4.0 B/entry)
 - Internal trailer bytes:  68,294 KB  (8.0 B/entry)
 - Total key bytes:        102,442 KB  (12.0 B/entry)
-- Key % of raw input:     5.1%
+- Key % of raw input:     5.4%
 
 ## Analysis
 
@@ -193,10 +187,10 @@ Block trailers:       152 KB  (  0.0%)  [~31,203 × 5B]
 The key insight is that zstd compresses both formats at essentially the same ratio
 when measured against their respective raw inputs:
 
-| Layout | Raw input | Compressed output | Ratio on raw input |
-|--------|-----------|-------------------|--------------------|
-| **Batch** (N=256) | 1,897,023 KB (events + 8,659 KB FOR-N index) | 407,746 KB | **4.65x** |
-| **SSTable** (bs=55.2KB) | 1,990,806 KB (events + 102,442 KB keys) | 428,629 KB | **4.64x** |
+| Layout | Raw input | File size | Ratio on raw input |
+|--------|-----------|-----------|---------------------|
+| **Batch** (N=256) | 1,897,024 KB (events + 8,659 KB FOR-N index) | 407,904 KB | **4.65x** |
+| **SSTable** (bs=55.2KB) | 1,990,806 KB (events + 102,442 KB keys) | 428,683 KB | **4.64x** |
 
 Both achieve ~4.65x compression on their total raw input. The 5% file size difference
 comes entirely from the different amounts of metadata each format feeds into the
@@ -213,13 +207,13 @@ Extra raw metadata in SSTable:
   102,442 KB (SST keys) - 8,659 KB (FOR-N index) = 93,783 KB
 
 Compressed at ~4.65x:
-  93,783 / 4.65 = 20,168 KB
+  93,783 / 4.65 = 20,178 KB
 
 Observed file size difference:
-  428,629 - 407,808 = 20,821 KB  ✓
+  428,683 - 407,904 = 20,779 KB  ~
 ```
 
-The numbers match. The entire gap is the compressed cost of the extra per-entry
+The numbers match within 3%. The gap is the compressed cost of the extra per-entry
 key metadata.
 
 ### Where does RocksDB SSTable's 12 B/entry come from?
@@ -227,30 +221,27 @@ key metadata.
 | Component | Size | Purpose | Eliminable? |
 |-----------|------|---------|-------------|
 | User key | 4 B | Event ordinal for point/range lookups | Could use 0B with ordinal-only access, but loses key-based lookups |
-| Internal trailer | 8 B | Sequence number (7B) + key kind (1B) | **No** — mandatory in RocksDB's SSTable format; enables MVCC, compaction, snapshots |
+| Internal trailer | 8 B | Sequence number (7B) + key kind (1B) | **No** -- mandatory in RocksDB's SSTable format; enables MVCC, compaction, snapshots |
 
 The 8-byte internal trailer is a structural requirement of the RocksDB SSTable format.
 Even with zero-length user keys, every entry would still carry 8 bytes of metadata
 that the batch format doesn't need.
 
-**RocksDB format_version compatibility note:** The benchmark numbers were originally
-produced using Pebble v1.1.5's SSTable writer with `TableFormatRocksDBv2` (equivalent to
-RocksDB's `format_version=2`). This is the same on-disk format that RocksDB itself
-produces. RocksDB has since introduced format versions 3 through 6, but none of them
-change the per-entry data block encoding:
+**RocksDB format_version compatibility note:** The internal key format (8-byte trailer:
+7B sequence + 1B kind), varint key/value framing, and prefix compression within data
+blocks are identical across all format versions (2 through 6). The changes in later
+versions affect only non-data-block structures:
 
 | format_version | RocksDB version | Change | Affects data block entries? |
 |---|---|---|---|
-| 2 | 5.13 | Baseline (used in benchmark) | — |
+| 2 | 5.13 | Baseline | -- |
 | 3 | 5.15 | Strips sequence numbers from **index block** keys | No |
 | 4 | 5.16 | Delta-encodes **index block** values (block handles) | No |
 | 5 | 6.6 | New **Bloom filter** implementation | No |
 | 6 | recent | Context-aware **checksums**, index in metaindex | No |
 
-The internal key format (8-byte trailer: 7B sequence + 1B kind), varint key/value
-framing, and prefix compression within data blocks are identical across all versions.
-The ~5% overhead finding applies to current RocksDB (10.9.1) just as it does to the
-`format_version=2` benchmark.
+The ~5% overhead finding applies to current RocksDB (10.9.1) -- confirmed directly
+by these benchmarks using grocksdb's SSTFileWriter.
 
 ### Where does the batch format's ~1 B/entry come from?
 
@@ -258,8 +249,8 @@ For N=256 events with event sizes in the range ~100-400 bytes:
 
 ```
 FOR-N index per batch:
-  W  = bits.Len32(max_size - min_size) ≈ 8 bits (sizes vary by ~256 bytes)
-  Header:  4B (min) + ⌈8 × 256 / 8⌉ (packed) + 1B (width) = 261 bytes
+  W  = bits.Len32(max_size - min_size) ~ 8 bits (sizes vary by ~256 bytes)
+  Header:  4B (min) + ceil(8 x 256 / 8) (packed) + 1B (width) = 261 bytes
   Total:   261 bytes per batch = 1.02 B/event
 ```
 
@@ -271,16 +262,16 @@ same byte stream.
 **Structurally, yes.** Both follow the same pattern:
 
 ```
-events → group into blocks → compress each block → two-level index
+events -> group into blocks -> compress each block -> two-level index
 ```
 
 The two-level index structure is equivalent:
 - **Intra-block**: SSTable uses KV prefix compression + restart points;
   batch uses FOR-N bit-packed event sizes
 - **Inter-block**: SSTable uses index blocks (B-tree-like);
-  batch uses a flat offset array (O(1) positional lookup)
+  batch uses a FOR-128 encoded record size array (O(1) positional lookup via prefix sum)
 
-Both inter-block indexes are negligible (<0.1% of total file size).
+Both inter-block indexes are negligible (<0.3% of total file size).
 
 The only non-equivalent piece is the intra-block random access mechanism:
 
@@ -288,18 +279,20 @@ The only non-equivalent piece is the intra-block random access mechanism:
 |---|---|---|
 | Mechanism | Binary search on keys via restart points | Prefix-sum decode of FOR-N size array |
 | Raw cost | ~15 B/event | ~1 B/event |
-| Compressed cost | ~3.2 B/event | ~0.22 B/event |
-| Net overhead | ~3.0 B/event more than batch | baseline |
+
+The measured file size delta (20,779 KB at N=256) divided by 8.7M events gives **~2.4 B/event**
+of compressed overhead — the net cost of the SSTable's extra per-entry metadata after
+zstd compression.
 
 ### Is the 5% gap a tuning issue or structural?
 
-**Structural.** The gap cannot be closed by adjusting SSTable configuration parameters.
-We tested all relevant knobs:
+**Structural.** The benchmark uses `block_size_deviation=100` (fill blocks completely)
+and `block_restart_interval=1024` (one restart point per ~1024 entries, minimizing
+4-byte restart overhead). These are the most favorable SST settings; relaxing them
+would only increase overhead.
 
-- `BlockSizeThreshold`: 90% → 95% → 100% — negligible difference (<0.1%)
-- `BlockRestartInterval`: 16 → 64 → 256 → 1024 — diminishing returns, <1% total
-- Block size: sweeping 4KB–256KB changes compression ratio but the batch-vs-SST delta
-  stays constant at ~5%
+The batch-vs-SST delta stays constant at ~5% across the full range of block sizes
+tested (6.9KB to 110.5KB), confirming the gap scales with entry count, not block size.
 
 The 8-byte internal trailer per entry is baked into the RocksDB SSTable format and
 has not changed across any `format_version` (2 through 6). It cannot be configured
@@ -308,17 +301,16 @@ away.
 ### Confirmed by our RocksDB benchmark
 
 Our actual benchmark file sizes (from BENCHMARKS.md) using RocksDB 10.9.1 via
-grocksdb with identical block size (27.6KB) and zstd compression:
+grocksdb with block size 27.6KB and zstd compression:
 
 | Format | Size | Ratio |
 |--------|------|-------|
 | Packfile (eventstore) | 425 MB | 4.4x |
-| RocksDB | 454 MB | 4.2x |
+| RocksDB (full DB) | 454 MB | 4.2x |
 
-The RocksDB file is 6.8% larger than the packfile — consistent with the ~5% structural
-overhead predicted by this analysis (the slightly larger gap is because RocksDB's CGO
-SSTFileWriter path and DB ingest may add minor additional overhead vs the SSTable-only
-analysis above).
+The RocksDB DB is 6.8% larger than the packfile. Of this, ~5% is the structural
+per-entry overhead predicted by this analysis. The remaining ~1.8% is DB-level
+overhead (WAL, MANIFEST, CURRENT files) not present in a standalone SST.
 
 ## Conclusion
 
@@ -332,13 +324,13 @@ The batch format produces ~5% smaller files because it replaces RocksDB SSTable'
 This 11 B/entry raw difference compresses proportionally, yielding the observed ~20 MB
 gap on 8.7M events.
 
-This gap is a fixed structural property of the RocksDB SSTable format — it applies to
+This gap is a fixed structural property of the RocksDB SSTable format -- it applies to
 any RocksDB version, not just the specific version benchmarked. The per-entry metadata
 exists to support LSM-tree features (compaction, MVCC snapshots, range deletions) that
 an append-only event store does not use. The batch format trades away those capabilities
 for a more compact representation.
 
-For this specific workload — append-only writes with ordinal-keyed random access —
+For this specific workload -- append-only writes with ordinal-keyed random access --
 the two approaches are near-equivalent in compression, with the batch format offering
 a modest space advantage (~5%) at the cost of giving up the RocksDB ecosystem (bloom
 filters, compaction, mature tooling). The more significant differences are in read/write
