@@ -93,8 +93,12 @@ func doSetup() error {
 
 	sstWriteOpts := grocksdb.NewDefaultOptions()
 	sstWriteOpts.SetCompression(grocksdb.ZSTDCompression)
+	sstWriteOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
 	sstBbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	sstBbto.SetBlockSize(rocksBlockSize)
+	sstBbto.SetBlockSizeDeviation(100)
+	sstBbto.SetFormatVersion(5)
+	sstBbto.SetBlockRestartInterval(128)
 	sstWriteOpts.SetBlockBasedTableFactory(sstBbto)
 
 	envOpts := grocksdb.NewDefaultEnvOptions()
@@ -129,6 +133,7 @@ func doSetup() error {
 		return fmt.Errorf("open rocksdb: %w", err)
 	}
 	ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+	ingestOpts.SetMoveFiles(true)
 	if err := rdb.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
 		rdb.Close()
 		return fmt.Errorf("rocksdb ingest: %w", err)
@@ -170,13 +175,19 @@ func dirSize(path string) int64 {
 func openRocksDB(b *testing.B) *grocksdb.DB {
 	b.Helper()
 	opts := grocksdb.NewDefaultOptions()
+	opts.SetSkipStatsUpdateOnDBOpen(true)
+	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
+	opts.SetMaxFileOpeningThreads(1)
+	opts.SetDisableAutoCompactions(true)
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	bbto.SetNoBlockCache(true)
+	bbto.SetFormatVersion(5)
 	opts.SetBlockBasedTableFactory(bbto)
 	db, err := grocksdb.OpenDbForReadOnly(opts, rocksDBPath, false)
 	if err != nil {
 		b.Fatal(err)
 	}
+	b.Cleanup(func() { opts.Destroy() })
 	return db
 }
 
@@ -185,6 +196,7 @@ func openRocksDB(b *testing.B) *grocksdb.DB {
 func rocksReadOpts() *grocksdb.ReadOptions {
 	ro := grocksdb.NewDefaultReadOptions()
 	ro.SetVerifyChecksums(false)
+	ro.SetFillCache(false)
 	return ro
 }
 
@@ -222,16 +234,20 @@ func BenchmarkRocksDBSeqRead(b *testing.B) {
 	ro := rocksReadOpts()
 	defer ro.Destroy()
 
+	it := db.NewIterator(ro)
+	defer it.Close()
+
 	b.SetBytes(int64(totalRawBytes))
 	b.ResetTimer()
 
 	for range b.N {
-		it := db.NewIterator(ro)
 		it.SeekToFirst()
 		for ; it.Valid(); it.Next() {
-			_ = it.Value().Data()
+			_ = it.ValueSlice().Data()
 		}
-		it.Close()
+		if err := it.Err(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -388,14 +404,17 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 		if !it.Valid() {
 			b.Fatal("Seek(0): key not found")
 		}
-		_ = it.Value().Data()
+		_ = it.ValueSlice().Data()
 		for i := 1; i < batchSize; i++ {
 			it.Next()
 			if !it.Valid() {
 				b.Fatalf("Next at %d: unexpected end", i)
 			}
-			_ = it.Value().Data()
+			_ = it.ValueSlice().Data()
 		}
+	}
+	if err := it.Err(); err != nil {
+		b.Fatal(err)
 	}
 }
 
@@ -450,14 +469,17 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 		if !it.Valid() {
 			b.Fatalf("Seek(%d): key not found", start)
 		}
-		_ = it.Value().Data()
+		_ = it.ValueSlice().Data()
 		for i := 1; i < scanLen; i++ {
 			it.Next()
 			if !it.Valid() {
 				b.Fatalf("Next at %d: unexpected end", i)
 			}
-			_ = it.Value().Data()
+			_ = it.ValueSlice().Data()
 		}
+	}
+	if err := it.Err(); err != nil {
+		b.Fatal(err)
 	}
 }
 
@@ -563,11 +585,17 @@ func BenchmarkPackfileReadEventSeq50(b *testing.B) {
 
 // rocksDBParallelMultiGet splits keys across goroutines for parallel I/O,
 // matching packfile ReadIndices' internal goroutine parallelism.
-func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, keys [][]byte, concurrency int) {
+// rocksMultiGetReadOpts returns a shared ReadOptions for scattered reads.
+func rocksMultiGetReadOpts() *grocksdb.ReadOptions {
+	ro := grocksdb.NewDefaultReadOptions()
+	ro.SetVerifyChecksums(false)
+	ro.SetFillCache(false)
+	return ro
+}
+
+func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, ro *grocksdb.ReadOptions, keys [][]byte, concurrency int) {
 	b.Helper()
 	if concurrency <= 1 || len(keys) < concurrency {
-		ro := rocksReadOpts()
-		ro.SetFillCache(false)
 		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
 		if err != nil {
 			b.Fatal(err)
@@ -576,7 +604,6 @@ func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnF
 			_ = v.Data()
 		}
 		vals.Destroy()
-		ro.Destroy()
 		return
 	}
 	var (
@@ -594,19 +621,15 @@ func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnF
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ro := rocksReadOpts()
-			ro.SetFillCache(false)
 			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys[lo:hi]...)
 			if err != nil {
 				errOnce.Do(func() { firstErr = err })
-				ro.Destroy()
 				return
 			}
 			for _, v := range vals {
 				_ = v.Data()
 			}
 			vals.Destroy()
-			ro.Destroy()
 		}()
 	}
 	wg.Wait()
@@ -622,20 +645,24 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 	defer db.Close()
 
 	cf := db.GetDefaultColumnFamily()
+	ro := rocksMultiGetReadOpts()
+	defer ro.Destroy()
 
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
+	keys := make([][]byte, numIndices)
+	keyBuf := make([]byte, numIndices*4)
+	for i := range keys {
+		keys[i] = keyBuf[i*4 : i*4+4]
+	}
 	b.ResetTimer()
 
 	for range b.N {
 		indices := generateScatteredIndices(rng, numIndices, totalEvents)
-		keys := make([][]byte, len(indices))
 		for i, idx := range indices {
-			k := make([]byte, 4)
-			binary.BigEndian.PutUint32(k, uint32(idx))
-			keys[i] = k
+			binary.BigEndian.PutUint32(keys[i], uint32(idx))
 		}
-		rocksDBParallelMultiGet(b, db, cf, keys, 8)
+		rocksDBParallelMultiGet(b, db, cf, ro, keys, 8)
 	}
 }
 
@@ -673,6 +700,8 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	defer db.Close()
 
 	cf := db.GetDefaultColumnFamily()
+	ro := rocksMultiGetReadOpts()
+	defer ro.Destroy()
 
 	const numIndices = 50
 
@@ -680,15 +709,17 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
+		keys := make([][]byte, numIndices)
+		keyBuf := make([]byte, numIndices*4)
+		for i := range keys {
+			keys[i] = keyBuf[i*4 : i*4+4]
+		}
 		for pb.Next() {
 			indices := generateScatteredIndices(rng, numIndices, totalEvents)
-			keys := make([][]byte, len(indices))
 			for i, idx := range indices {
-				k := make([]byte, 4)
-				binary.BigEndian.PutUint32(k, uint32(idx))
-				keys[i] = k
+				binary.BigEndian.PutUint32(keys[i], uint32(idx))
 			}
-			rocksDBParallelMultiGet(b, db, cf, keys, 8)
+			rocksDBParallelMultiGet(b, db, cf, ro, keys, 8)
 		}
 	})
 }
@@ -710,19 +741,27 @@ func BenchmarkPackfileOpen(b *testing.B) {
 
 func BenchmarkRocksDBOpen(b *testing.B) {
 	setupBenchData(b)
-	b.ResetTimer()
 
+	opts := grocksdb.NewDefaultOptions()
+	opts.SetSkipStatsUpdateOnDBOpen(true)
+	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
+	opts.SetMaxFileOpeningThreads(1)
+	opts.SetDisableAutoCompactions(true)
+	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+	bbto.SetNoBlockCache(true)
+	bbto.SetFormatVersion(5)
+	opts.SetBlockBasedTableFactory(bbto)
+
+	b.ResetTimer()
 	for range b.N {
-		opts := grocksdb.NewDefaultOptions()
-		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		bbto.SetNoBlockCache(true)
-		opts.SetBlockBasedTableFactory(bbto)
 		db, err := grocksdb.OpenDbForReadOnly(opts, rocksDBPath, false)
 		if err != nil {
 			b.Fatal(err)
 		}
 		db.Close()
 	}
+	b.StopTimer()
+	opts.Destroy()
 }
 
 // --- Write / ingestion benchmarks ---
@@ -791,12 +830,16 @@ func rocksDBWriteCore(b *testing.B, parallelComp int) {
 	// Write SST file via SSTFileWriter.
 	writeOpts := grocksdb.NewDefaultOptions()
 	writeOpts.SetCompression(grocksdb.ZSTDCompression)
+	writeOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
 	if parallelComp > 1 {
 		writeOpts.SetCompressionOptionsParallelThreads(parallelComp)
 	}
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	avgEventSize := totalRawBytes / len(allEvents)
 	bbto.SetBlockSize(128 * avgEventSize)
+	bbto.SetBlockSizeDeviation(100)
+	bbto.SetFormatVersion(5)
+	bbto.SetBlockRestartInterval(128)
 	writeOpts.SetBlockBasedTableFactory(bbto)
 
 	envOpts := grocksdb.NewDefaultEnvOptions()
@@ -832,6 +875,7 @@ func rocksDBWriteCore(b *testing.B, parallelComp int) {
 		b.Fatal(err)
 	}
 	ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+	ingestOpts.SetMoveFiles(true)
 	if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
 		b.Fatal(err)
 	}

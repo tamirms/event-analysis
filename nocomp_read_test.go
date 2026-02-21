@@ -19,8 +19,13 @@ import (
 // Returns db, opts, and a cleanup function that closes/destroys all resources.
 func openNoCompRocksDB(path string) (*grocksdb.DB, func(), error) {
 	opts := grocksdb.NewDefaultOptions()
+	opts.SetSkipStatsUpdateOnDBOpen(true)
+	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
+	opts.SetMaxFileOpeningThreads(1)
+	opts.SetDisableAutoCompactions(true)
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	bbto.SetNoBlockCache(true)
+	bbto.SetFormatVersion(5)
 	opts.SetBlockBasedTableFactory(bbto)
 	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
 	if err != nil {
@@ -96,6 +101,9 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		writeOpts.SetCompression(grocksdb.NoCompression)
 		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		bbto.SetBlockSize(blockSize)
+		bbto.SetBlockSizeDeviation(100)
+		bbto.SetFormatVersion(5)
+		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
@@ -123,6 +131,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		dbBbto.SetNoBlockCache(true)
 		dbBbto.SetBlockSize(blockSize)
+		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
@@ -130,13 +139,13 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			t.Fatal(err)
 		}
 		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+		ingestOpts.SetMoveFiles(true)
 		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
 			t.Fatal(err)
 		}
 		ingestOpts.Destroy()
 		db.Close()
 		dbOpts.Destroy()
-		os.Remove(sstFilePath)
 
 		elapsed := time.Since(start)
 		rocksSize := dirSize(dbPath)
@@ -194,7 +203,10 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			it := db.NewIterator(ro)
 			it.SeekToFirst()
 			for ; it.Valid(); it.Next() {
-				_ = it.Value().Data()
+				_ = it.ValueSlice().Data()
+			}
+			if err := it.Err(); err != nil {
+				t.Fatal(err)
 			}
 			it.Close()
 			times[r] = time.Since(start).Seconds()
@@ -335,6 +347,15 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		}
 
 		cf := db.GetDefaultColumnFamily()
+		ro := grocksdb.NewDefaultReadOptions()
+		ro.SetVerifyChecksums(false)
+		ro.SetFillCache(false)
+
+		keys := make([][]byte, scatteredN)
+		keyBuf := make([]byte, scatteredN*4)
+		for i := range keys {
+			keys[i] = keyBuf[i*4 : i*4+4]
+		}
 
 		times := make([]float64, scatteredRuns)
 		for r := range scatteredRuns {
@@ -342,15 +363,9 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			start := time.Now()
 			for range scatteredIter {
 				indices := generateScatteredIndices(rng, scatteredN, numEvents)
-				keys := make([][]byte, len(indices))
 				for i, idx := range indices {
-					k := make([]byte, 4)
-					binary.BigEndian.PutUint32(k, uint32(idx))
-					keys[i] = k
+					binary.BigEndian.PutUint32(keys[i], uint32(idx))
 				}
-				ro := grocksdb.NewDefaultReadOptions()
-				ro.SetVerifyChecksums(false)
-				ro.SetFillCache(false)
 				vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
 				if err != nil {
 					t.Fatal(err)
@@ -359,10 +374,10 @@ func TestReadThroughputNoCompression(t *testing.T) {
 					_ = v.Data()
 				}
 				vals.Destroy()
-				ro.Destroy()
 			}
 			times[r] = time.Since(start).Seconds()
 		}
+		ro.Destroy()
 		cleanup()
 
 		sort.Float64s(times)
@@ -423,6 +438,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		ro := grocksdb.NewDefaultReadOptions()
 		ro.SetVerifyChecksums(false)
 
+		it := db.NewIterator(ro)
 		key := make([]byte, 4)
 
 		times := make([]float64, rangeScanRuns)
@@ -432,16 +448,18 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			for range rangeScanIter {
 				off := rng.Intn(numEvents - rangeScanLen)
 				binary.BigEndian.PutUint32(key, uint32(off))
-				it := db.NewIterator(ro)
 				it.Seek(key)
 				for i := 0; i < rangeScanLen && it.Valid(); i++ {
-					_ = it.Value().Data()
+					_ = it.ValueSlice().Data()
 					it.Next()
 				}
-				it.Close()
 			}
 			times[r] = time.Since(start).Seconds()
 		}
+		if err := it.Err(); err != nil {
+			t.Fatal(err)
+		}
+		it.Close()
 		ro.Destroy()
 		cleanup()
 

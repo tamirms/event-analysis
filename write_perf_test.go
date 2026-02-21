@@ -98,11 +98,15 @@ func TestWriteThroughput(t *testing.T) {
 
 		writeOpts := grocksdb.NewDefaultOptions()
 		writeOpts.SetCompression(grocksdb.ZSTDCompression)
+		writeOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
 		if threads > 1 {
 			writeOpts.SetCompressionOptionsParallelThreads(threads)
 		}
 		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		bbto.SetBlockSize(blockSize)
+		bbto.SetBlockSizeDeviation(100)
+		bbto.SetFormatVersion(5)
+		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
@@ -130,6 +134,7 @@ func TestWriteThroughput(t *testing.T) {
 		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		dbBbto.SetNoBlockCache(true)
 		dbBbto.SetBlockSize(blockSize)
+		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
@@ -137,6 +142,7 @@ func TestWriteThroughput(t *testing.T) {
 			t.Fatal(err)
 		}
 		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+		ingestOpts.SetMoveFiles(true)
 		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
 			t.Fatal(err)
 		}
@@ -166,6 +172,9 @@ func TestWriteThroughput(t *testing.T) {
 		writeOpts.SetCompression(grocksdb.NoCompression)
 		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		bbto.SetBlockSize(blockSize)
+		bbto.SetBlockSizeDeviation(100)
+		bbto.SetFormatVersion(5)
+		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
@@ -193,6 +202,7 @@ func TestWriteThroughput(t *testing.T) {
 		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		dbBbto.SetNoBlockCache(true)
 		dbBbto.SetBlockSize(blockSize)
+		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
@@ -200,6 +210,7 @@ func TestWriteThroughput(t *testing.T) {
 			t.Fatal(err)
 		}
 		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
+		ingestOpts.SetMoveFiles(true)
 		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
 			t.Fatal(err)
 		}

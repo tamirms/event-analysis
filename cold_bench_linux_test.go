@@ -146,11 +146,15 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	indices := coldScatteredIndices(rng, numReads, totalEvents, blockSize)
 
 	keys := make([][]byte, numReads)
+	keyBuf := make([]byte, numReads*4)
 	for i, idx := range indices {
-		k := make([]byte, 4)
-		binary.BigEndian.PutUint32(k, uint32(idx))
-		keys[i] = k
+		keys[i] = keyBuf[i*4 : i*4+4]
+		binary.BigEndian.PutUint32(keys[i], uint32(idx))
 	}
+
+	ro := rocksMultiGetReadOpts()
+	ro.SetAsyncIO(true)
+	defer ro.Destroy()
 
 	for range b.N {
 		b.StopTimer()
@@ -165,7 +169,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 		}
 		cf := db.GetDefaultColumnFamily()
 
-		rocksDBParallelMultiGet(b, db, cf, keys, concurrency)
+		rocksDBParallelMultiGet(b, db, cf, ro, keys, concurrency)
 
 		db.Close()
 		dbOpts.Destroy()

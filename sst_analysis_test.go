@@ -142,10 +142,12 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		// Write SST file.
 		writeOpts := grocksdb.NewDefaultOptions()
 		writeOpts.SetCompression(grocksdb.ZSTDCompression)
+		writeOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
 		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 		bbto.SetBlockSize(sstBlockSize)
 		bbto.SetBlockSizeDeviation(100) // fill blocks completely
-		bbto.SetBlockRestartInterval(1024)
+		bbto.SetFormatVersion(5)
+		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
@@ -181,7 +183,8 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		dbBbto.SetNoBlockCache(true)
 		dbBbto.SetBlockSize(sstBlockSize)
 		dbBbto.SetBlockSizeDeviation(100)
-		dbBbto.SetBlockRestartInterval(1024)
+		dbBbto.SetFormatVersion(5)
+		dbBbto.SetBlockRestartInterval(128)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
