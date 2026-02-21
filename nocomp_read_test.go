@@ -38,9 +38,9 @@ func openNoCompRocksDB(path string) (*grocksdb.DB, func(), error) {
 // RocksDB with compression disabled, isolating raw I/O and decoding overhead.
 func TestReadThroughputNoCompression(t *testing.T) {
 	// Load events.
-	sstOnce.Do(func() { sstDataErr = loadAllEvents() })
-	if sstDataErr != nil {
-		t.Fatal(sstDataErr)
+	dataOnce.Do(func() { dataLoadErr = loadAllEvents() })
+	if dataLoadErr != nil {
+		t.Fatal(dataLoadErr)
 	}
 
 	numEvents := len(allEvents)

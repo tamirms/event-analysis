@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Benchmarking and analysis tool for event storage formats: custom packfile/eventstore vs Pebble SSTable vs RocksDB. Uses real Stellar ledger data (~8.7M events from 1.7GB source files).
+Benchmarking and analysis tool for event storage formats: custom packfile/eventstore vs RocksDB. Uses real Stellar ledger data (~8.7M events from 1.7GB source files).
 
 ## Prerequisites
 
@@ -44,11 +44,6 @@ go test ./eventstore/... ./packfile/... ./recordcodec/...
 Root package tests (need RocksDB + CGO flags, ~15 min total):
 ```bash
 go test -v -count=1 -timeout 30m github.com/tamir/events-analysis
-```
-
-`TestSSTableCompression` alone takes ~9 min. Run it separately if needed:
-```bash
-go test -v -count=1 -run TestSSTableCompression -timeout 30m github.com/tamir/events-analysis
 ```
 
 ## Running Benchmarks
@@ -104,7 +99,7 @@ GODEBUG=madvdontneed=1 LD_LIBRARY_PATH="$HOME/.local/lib" \
 
 ### Fixture Caching
 
-Benchmark fixtures (eventstore, SSTable, RocksDB files ~1.3GB total) are cached in `testdata/fixtures/`. First run generates them (~3-4 min); subsequent runs load from cache (~3s).
+Benchmark fixtures (eventstore and RocksDB files ~1.3GB total) are cached in `testdata/fixtures/`. First run generates them (~3-4 min); subsequent runs load from cache (~3s).
 
 - Fixtures are invalidated automatically when source data files (`006016.data`, `006016.index`) change (mtime comparison).
 - Force regeneration: `FORCE_REGEN=1 go test -bench=...`

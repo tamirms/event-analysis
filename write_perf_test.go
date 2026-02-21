@@ -16,9 +16,9 @@ import (
 // levels without GOGC=1 overhead. Use WRITE_DIR to control the target device
 // (defaults to os.TempDir, typically EBS).
 func TestWriteThroughput(t *testing.T) {
-	sstOnce.Do(func() { sstDataErr = loadAllEvents() })
-	if sstDataErr != nil {
-		t.Fatal(sstDataErr)
+	dataOnce.Do(func() { dataLoadErr = loadAllEvents() })
+	if dataLoadErr != nil {
+		t.Fatal(dataLoadErr)
 	}
 
 	baseDir := os.Getenv("WRITE_DIR")

@@ -37,10 +37,10 @@ func ensureTestData(t *testing.T) {
 }
 
 func generateTestData() error {
-	// Use loadAllEvents (from sstable_bench_test.go) to avoid re-parsing source.
-	sstOnce.Do(func() { sstDataErr = loadAllEvents() })
-	if sstDataErr != nil {
-		return fmt.Errorf("load events: %w", sstDataErr)
+	// Use loadAllEvents (from testdata_test.go) to avoid re-parsing source.
+	dataOnce.Do(func() { dataLoadErr = loadAllEvents() })
+	if dataLoadErr != nil {
+		return fmt.Errorf("load events: %w", dataLoadErr)
 	}
 
 	fmt.Printf("generating index test data from %d events...\n", len(allEvents))

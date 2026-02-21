@@ -70,10 +70,8 @@ func fixturesStale() bool {
 }
 
 func benchFixturesExist() bool {
-	for _, name := range []string{"bench.events", "bench.sst"} {
-		if _, err := os.Stat(filepath.Join(fixtureDir, name)); err != nil {
-			return false
-		}
+	if _, err := os.Stat(filepath.Join(fixtureDir, "bench.events")); err != nil {
+		return false
 	}
 	// RocksDB is a directory — check it's non-empty.
 	entries, err := os.ReadDir(filepath.Join(fixtureDir, "rocks.db"))
