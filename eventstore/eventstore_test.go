@@ -501,6 +501,72 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNoCompressionRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	events := makeEvents(500, rng)
+
+	// Test with Concurrency set — verifies it's correctly forced to serial.
+	path := filepath.Join(t.TempDir(), "nocomp.events")
+	w, err := Create(path, WriterOptions{NoCompression: true, Concurrency: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := w.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if r.EventCount() != 500 {
+		t.Fatalf("EventCount = %d, want 500", r.EventCount())
+	}
+
+	// Verify via ReadEvent (point reads).
+	for i, want := range events {
+		got, err := r.ReadEvent(i)
+		if err != nil {
+			t.Fatalf("ReadEvent(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadEvent(%d): data mismatch", i)
+		}
+	}
+
+	// Verify via ReadEvents (sequential range).
+	i := 0
+	for got, err := range r.ReadEvents(0, r.EventCount()) {
+		if err != nil {
+			t.Fatalf("ReadEvents at %d: %v", i, err)
+		}
+		if !bytes.Equal(got, events[i]) {
+			t.Fatalf("ReadEvents at %d: data mismatch", i)
+		}
+		i++
+	}
+
+	// Verify via ReadIndices (scattered).
+	indices := []int{0, 50, 127, 128, 250, 499}
+	j := 0
+	for got, err := range r.ReadIndices(context.Background(), indices) {
+		if err != nil {
+			t.Fatalf("ReadIndices at %d: %v", j, err)
+		}
+		if !bytes.Equal(got, events[indices[j]]) {
+			t.Fatalf("ReadIndices at %d (idx=%d): data mismatch", j, indices[j])
+		}
+		j++
+	}
+}
+
 func TestReadIndicesAllFromSingleBlock(t *testing.T) {
 	rng := rand.New(rand.NewSource(57))
 	events := makeEvents(200, rng)

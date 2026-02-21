@@ -161,6 +161,42 @@ The EBS bottleneck is **IOPS, not bandwidth**. 1,000 scattered reads × ~6.4KB p
 
 Provisioning gp3 to 16,000 IOPS ($65/month) is the best value — ~5x latency improvement. Beyond that, NVMe instance storage (i4i family) delivers io2-level IOPS at ~11x lower cost, but storage is ephemeral (lost on instance stop). io2 is only justified when you need both high IOPS and persistence without a replication strategy.
 
+## Raw I/O (No Compression)
+
+Compression and CRC disabled for both formats to isolate format overhead, block-building cost, and I/O patterns.
+
+### Write (NVMe)
+
+| Benchmark | Serial (MB/s) | Note |
+|-----------|--------------|------|
+| Packfile (no zstd) | 1,007 | Concurrency has no effect — nothing to parallelize |
+| RocksDB (no zstd) | 329 | Parallel compression threads have no effect |
+
+Packfile raw I/O is 3.1x faster than RocksDB. The gap is intrinsic format overhead: flat append + offset array vs SST block construction + key encoding + ~8.7M CGO Add calls + file ingest.
+
+### Write (EBS)
+
+| Benchmark | Serial (MB/s) | Note |
+|-----------|--------------|------|
+| Packfile (no zstd) | 127 | EBS bandwidth-limited writing ~1.9GB uncompressed |
+| RocksDB (no zstd) | 41 | SST construction overhead + EBS bandwidth |
+
+Without compression, both formats are **slower** than with-compression at high concurrency (packfile 127 vs 590 MB/s, RocksDB 41 vs 141 MB/s) — writing 4.4x more data to disk dominates.
+
+### Read
+
+| Benchmark | Packfile (no zstd) | RocksDB (no zstd) | Packfile (zstd) | RocksDB (zstd) |
+|-----------|-------------------|-------------------|----------------|----------------|
+| Sequential | 4,868 MB/s | 479 MB/s | 2,053 MB/s | 239 MB/s |
+| Point read | 5.8 us | 6.8 us | 14.3 us | 64.0 us |
+| Scattered 50 | 121 us | 351 us | 182 us | 576 us |
+| Range scan 128 | 12 us | 69 us | 28 us | 183 us |
+
+Notes:
+- **Sequential reads**: Packfile 10.2x faster than RocksDB without compression (vs 8.6x with). The format advantage widens because decompression is no longer amortized over sequential access.
+- **Point reads**: RocksDB improves 9.4x without compression (64→6.8 us) — zstd decompression dominated its per-read cost. Packfile improves 2.5x (14→5.8 us). Without compression, they're nearly competitive (5.8 vs 6.8 us).
+- **Scattered/range**: Packfile stays 2.9–5.8x faster — offset array lookup vs block index traversal.
+
 ## Open Latency
 
 | Benchmark | ns/op | Allocs |

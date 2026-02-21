@@ -3,6 +3,8 @@ package eventstore
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 
 	"github.com/tamir/events-analysis/packfile"
@@ -13,8 +15,9 @@ const DefaultBlockSize = 128
 
 // WriterOptions configures how the eventstore is written.
 type WriterOptions struct {
-	BlockSize   int // events per block; 0 defaults to DefaultBlockSize (128)
-	Concurrency int // compression goroutines; 0 or 1 = serial
+	BlockSize     int  // events per block; 0 defaults to DefaultBlockSize (128)
+	Concurrency   int  // compression goroutines; 0 or 1 = serial
+	NoCompression bool // skip zstd compression and CRC (for benchmarking raw I/O)
 }
 
 type blockResult struct {
@@ -23,13 +26,14 @@ type blockResult struct {
 }
 
 type Writer struct {
-	pw     *packfile.Writer
-	buf    []byte   // accumulates raw events for current block
-	sizes  []uint32 // event sizes in current block
-	total  int      // total events written
-	blockN int      // events per block
-	closed bool     // set by Finish or Abort
-	err    error    // sticky — once set, all subsequent ops fail
+	pw         *packfile.Writer
+	buf        []byte   // accumulates raw events for current block
+	sizes      []uint32 // event sizes in current block
+	total      int      // total events written
+	blockN     int      // events per block
+	closed     bool     // set by Finish or Abort
+	err        error    // sticky — once set, all subsequent ops fail
+	noCompress bool     // skip zstd compression
 
 	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
@@ -51,10 +55,15 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
+	conc := opts.Concurrency
+	if opts.NoCompression {
+		conc = 0 // no pipeline when compression is disabled
+	}
 	w := &Writer{
 		pw:          pw,
 		blockN:      opts.BlockSize,
-		concurrency: opts.Concurrency,
+		concurrency: conc,
+		noCompress:  opts.NoCompression,
 	}
 	if w.concurrency > 1 {
 		w.workCh = make(chan blockResult, w.concurrency)
@@ -151,8 +160,10 @@ func (w *Writer) flush() error {
 	block := w.buildBlock()
 
 	if w.concurrency <= 1 {
-		compressed := recordcodec.Encode(block)
-		return w.pw.Append(compressed)
+		if !w.noCompress {
+			block = recordcodec.Encode(block)
+		}
+		return w.pw.Append(block)
 	}
 
 	// Send to streaming compress pipeline.
@@ -181,6 +192,7 @@ func (w *Writer) Finish() error {
 	// Drain the streaming pipeline.
 	if w.workCh != nil {
 		close(w.workCh)        // signal compress workers to stop
+		w.workCh = nil         // prevent double-close from Abort()
 		err := <-w.writerDone  // wait for writer to finish
 		if err != nil {
 			w.err = err
@@ -188,10 +200,21 @@ func (w *Writer) Finish() error {
 		}
 	}
 
-	// Encode metadata: [4B eventCount LE][4B blockSize LE]
-	var meta [8]byte
+	if w.total > math.MaxUint32 {
+		w.err = fmt.Errorf("eventstore: event count %d exceeds uint32 max", w.total)
+		return w.err
+	}
+
+	// Encode metadata: [4B eventCount LE][4B blockSize LE][4B flags LE]
+	// flags bit 0: noCompression
+	var meta [12]byte
 	binary.LittleEndian.PutUint32(meta[0:], uint32(w.total))
 	binary.LittleEndian.PutUint32(meta[4:], uint32(w.blockN))
+	var flags uint32
+	if w.noCompress {
+		flags |= 1
+	}
+	binary.LittleEndian.PutUint32(meta[8:], flags)
 	w.pw.SetMetadata(meta[:])
 
 	_, err := w.pw.Finish()

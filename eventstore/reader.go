@@ -32,14 +32,19 @@ var blockBufPool = sync.Pool{
 	},
 }
 
-// decode decompresses a block and parses its trailing FOR index,
-// populating sizes, offsets, and decompressed data.
-func (bb *blockBuf) decode(compressed []byte, n int) error {
-	var err error
-	bb.decompressed, err = bb.decoder.DecodeAll(compressed, bb.decompressed[:0])
-	if err != nil {
-		return err
+// decode decompresses a block (unless noCompress) and parses its trailing FOR
+// index, populating sizes, offsets, and decompressed data.
+func (bb *blockBuf) decode(data []byte, n int, noCompress bool) error {
+	if noCompress {
+		bb.decompressed = append(bb.decompressed[:0], data...)
+	} else {
+		var err error
+		bb.decompressed, err = bb.decoder.DecodeAll(data, bb.decompressed[:0])
+		if err != nil {
+			return err
+		}
 	}
+	var err error
 	bb.sizes, bb.padded, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
 	if err != nil {
 		return err
@@ -70,6 +75,7 @@ type Reader struct {
 	nEvents     int
 	blockN      int
 	concurrency int
+	noCompress  bool // blocks stored uncompressed
 }
 
 type ReaderOption func(*Reader)
@@ -87,13 +93,15 @@ func Open(path string, opts ...ReaderOption) (*Reader, error) {
 	}
 
 	meta := pr.Metadata()
-	if len(meta) < 8 {
+	if len(meta) < 12 {
 		pr.Close()
-		return nil, fmt.Errorf("eventstore: invalid metadata length %d", len(meta))
+		return nil, fmt.Errorf("eventstore: invalid metadata length %d (want >= 12)", len(meta))
 	}
 
 	nEvents := int(binary.LittleEndian.Uint32(meta[0:]))
 	blockN := int(binary.LittleEndian.Uint32(meta[4:]))
+	flags := binary.LittleEndian.Uint32(meta[8:])
+	noCompress := flags&1 != 0
 
 	if blockN <= 0 {
 		pr.Close()
@@ -115,6 +123,7 @@ func Open(path string, opts ...ReaderOption) (*Reader, error) {
 		pr:          pr,
 		nEvents:     nEvents,
 		blockN:      blockN,
+		noCompress:  noCompress,
 		concurrency: 8,
 	}
 	for _, opt := range opts {
@@ -134,6 +143,9 @@ func (r *Reader) blockCount() int {
 }
 
 func (r *Reader) eventsInBlock(blockIdx int) int {
+	if r.nEvents == 0 {
+		return 0
+	}
 	last := r.blockCount() - 1
 	if blockIdx < last {
 		return r.blockN
@@ -211,7 +223,7 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := bb.decode(bb.compressed, r.eventsInBlock(blockIdx)); err != nil {
+	if err := bb.decode(bb.compressed, r.eventsInBlock(blockIdx), r.noCompress); err != nil {
 		return nil, err
 	}
 	return bb.event(localIdx), nil
@@ -247,7 +259,7 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 			}
 
 			n := r.eventsInBlock(blockIdx)
-			if err := bb.decode(compressed, n); err != nil {
+			if err := bb.decode(compressed, n, r.noCompress); err != nil {
 				yield(nil, err)
 				return
 			}
@@ -413,7 +425,7 @@ func (r *Reader) processBlock(w *indicesWork, bi int, indices []int, bb *blockBu
 	if err != nil {
 		return err
 	}
-	if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx)); err != nil {
+	if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx), r.noCompress); err != nil {
 		return err
 	}
 	for j := blk.idxStart; j < blk.idxEnd; j++ {
