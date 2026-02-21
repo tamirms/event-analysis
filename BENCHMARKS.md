@@ -52,9 +52,11 @@ Measured via `RssAnon` from `/proc/self/status` with `GOGC=1` (minimizes GC head
 | Benchmark | Peak Delta |
 |-----------|-----------|
 | PackfileSeqRead (full 8.7M events) | 3.9 MB |
-| PackfileReadIndices (1,000 scattered) | 3.1 MB |
+| PackfileReadIndices (1,000 scattered, c=1) | 0.6 MB |
+| PackfileReadIndices (1,000 scattered, c=8) | 3.0 MB |
+| PackfileReadIndices (1,000 scattered, c=32) | 6.8 MB |
 
-Read memory is minimal — just pooled `blockBuf` decoders (~300KB each) from `sync.Pool`. No per-event allocations accumulate.
+Read memory is minimal — just pooled `blockBuf` decoders (~200KB each) from `sync.Pool`, scaling linearly with concurrency.
 
 ## Sequential Read
 
