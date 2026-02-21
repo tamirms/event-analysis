@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/tamir/events-analysis/zstd"
 )
 
 const (
@@ -16,12 +16,12 @@ const (
 // ChunkReader reads ledgers from a single chunk's index+data file pair.
 // ReadLedger reuses internal buffers — the returned []byte is only valid until the next ReadLedger call.
 type ChunkReader struct {
-	dataFile   *os.File
-	offsets    []uint64
-	decoder    *zstd.Decoder
-	numLedgers int
-	compBuf    []byte // reusable compressed read buffer
-	decompBuf  []byte // reusable decompression buffer
+	dataFile     *os.File
+	offsets      []uint64
+	decompressor *zstd.Decompressor
+	numLedgers   int
+	compBuf      []byte // reusable compressed read buffer
+	decompBuf    []byte // reusable decompression buffer
 }
 
 // NewChunkReader opens the index and data files and parses offsets.
@@ -78,18 +78,11 @@ func NewChunkReader(indexPath, dataPath string) (*ChunkReader, error) {
 		return nil, fmt.Errorf("failed to open data file: %w", err)
 	}
 
-	// Create zstd decoder
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		dataFile.Close()
-		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-	}
-
 	return &ChunkReader{
-		dataFile:   dataFile,
-		offsets:    offsets,
-		decoder:    decoder,
-		numLedgers: numLedgers,
+		dataFile:     dataFile,
+		offsets:      offsets,
+		decompressor: zstd.NewDecompressor(),
+		numLedgers:   numLedgers,
 	}, nil
 }
 
@@ -120,7 +113,7 @@ func (r *ChunkReader) ReadLedger(localIndex int) ([]byte, error) {
 	}
 
 	// Reuse decompression buffer
-	decompressed, err := r.decoder.DecodeAll(r.compBuf, r.decompBuf[:0])
+	decompressed, err := r.decompressor.Decode(r.decompBuf[:0], r.compBuf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress ledger at index %d: %w", localIndex, err)
 	}
@@ -131,8 +124,8 @@ func (r *ChunkReader) ReadLedger(localIndex int) ([]byte, error) {
 
 // Close releases all resources.
 func (r *ChunkReader) Close() {
-	if r.decoder != nil {
-		r.decoder.Close()
+	if r.decompressor != nil {
+		r.decompressor.Close()
 	}
 	if r.dataFile != nil {
 		r.dataFile.Close()

@@ -1,15 +1,18 @@
 package main
 
+// Benchmarks comparing our CGO zstd wrapper (see package zstd for rationale)
+// against klauspost/compress (pure Go). Requires source event data.
+// Use MAX_EVENTS=500000 for fast runs.
+
 import (
 	"fmt"
 	"sync"
 	"testing"
 
-	datadogzstd "github.com/DataDog/zstd"
 	klauspostzstd "github.com/klauspost/compress/zstd"
-)
 
-const zstdLevel = 3 // matched level for fair comparison
+	"github.com/tamir/events-analysis/zstd"
+)
 
 // zstdBlocks holds pre-built uncompressed blocks for benchmarking.
 // Each block is 128 contiguous events concatenated, matching production layout.
@@ -52,11 +55,37 @@ func buildZstdBlocks(b *testing.B) {
 	})
 }
 
-// --- Klauspost compress ---
+func zstdTotalBytes() int64 {
+	var total int64
+	for _, blk := range zstdBlocks {
+		total += int64(len(blk))
+	}
+	return total
+}
+
+// --- cgo-zstd (CGO wrapper) compress ---
+
+func BenchmarkZstdCgoCompress(b *testing.B) {
+	buildZstdBlocks(b)
+	c := zstd.NewCompressor()
+	defer c.Close()
+
+	b.SetBytes(zstdTotalBytes())
+	b.ResetTimer()
+	var dst []byte
+	for range b.N {
+		for _, blk := range zstdBlocks {
+			out := c.Encode(blk)
+			dst = append(dst[:0], out...)
+		}
+	}
+	benchSink = dst
+}
+
+// --- Klauspost (pure Go) compress ---
 
 func BenchmarkZstdKlauspostCompress(b *testing.B) {
 	buildZstdBlocks(b)
-
 	enc, err := klauspostzstd.NewWriter(nil,
 		klauspostzstd.WithEncoderLevel(klauspostzstd.SpeedDefault),
 		klauspostzstd.WithEncoderCRC(true),
@@ -65,14 +94,9 @@ func BenchmarkZstdKlauspostCompress(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	var totalBytes int64
-	for _, blk := range zstdBlocks {
-		totalBytes += int64(len(blk))
-	}
-
-	var dst []byte
-	b.SetBytes(totalBytes)
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
+	var dst []byte
 	for range b.N {
 		for _, blk := range zstdBlocks {
 			dst = enc.EncodeAll(blk, dst[:0])
@@ -81,25 +105,29 @@ func BenchmarkZstdKlauspostCompress(b *testing.B) {
 	benchSink = dst
 }
 
-// --- DataDog compress ---
+// --- cgo-zstd decompress ---
 
-func BenchmarkZstdDataDogCompress(b *testing.B) {
+func BenchmarkZstdCgoDecompress(b *testing.B) {
 	buildZstdBlocks(b)
-
-	ctx := datadogzstd.NewCtx()
-
-	var totalBytes int64
-	for _, blk := range zstdBlocks {
-		totalBytes += int64(len(blk))
+	c := zstd.NewCompressor()
+	compressed := make([][]byte, len(zstdBlocks))
+	for i, blk := range zstdBlocks {
+		out := c.Encode(blk)
+		compressed[i] = make([]byte, len(out))
+		copy(compressed[i], out)
 	}
+	c.Close()
 
-	var dst []byte
-	b.SetBytes(totalBytes)
+	d := zstd.NewDecompressor()
+	defer d.Close()
+
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
+	var dst []byte
 	for range b.N {
-		for _, blk := range zstdBlocks {
+		for _, comp := range compressed {
 			var err error
-			dst, err = ctx.CompressLevel(dst[:0], blk, zstdLevel)
+			dst, err = d.Decode(dst, comp)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -112,7 +140,6 @@ func BenchmarkZstdDataDogCompress(b *testing.B) {
 
 func BenchmarkZstdKlauspostDecompress(b *testing.B) {
 	buildZstdBlocks(b)
-
 	enc, err := klauspostzstd.NewWriter(nil,
 		klauspostzstd.WithEncoderLevel(klauspostzstd.SpeedDefault),
 		klauspostzstd.WithEncoderCRC(true),
@@ -125,54 +152,17 @@ func BenchmarkZstdKlauspostDecompress(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	// Pre-compress all blocks.
 	compressed := make([][]byte, len(zstdBlocks))
-	var totalBytes int64
 	for i, blk := range zstdBlocks {
 		compressed[i] = enc.EncodeAll(blk, nil)
-		totalBytes += int64(len(blk))
 	}
 
-	var dst []byte
-	b.SetBytes(totalBytes)
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
-	for range b.N {
-		for _, c := range compressed {
-			dst, err = dec.DecodeAll(c, dst[:0])
-			if err != nil {
-				b.Fatal(err)
-			}
-		}
-	}
-	benchSink = dst
-}
-
-// --- DataDog decompress ---
-
-func BenchmarkZstdDataDogDecompress(b *testing.B) {
-	buildZstdBlocks(b)
-
-	ctx := datadogzstd.NewCtx()
-
-	// Pre-compress all blocks using DataDog at level 3.
-	compressed := make([][]byte, len(zstdBlocks))
-	var totalBytes int64
-	for i, blk := range zstdBlocks {
-		var err error
-		compressed[i], err = ctx.CompressLevel(nil, blk, zstdLevel)
-		if err != nil {
-			b.Fatal(err)
-		}
-		totalBytes += int64(len(blk))
-	}
-
 	var dst []byte
-	b.SetBytes(totalBytes)
-	b.ResetTimer()
 	for range b.N {
-		for _, c := range compressed {
-			var err error
-			dst, err = ctx.Decompress(dst[:0], c)
+		for _, comp := range compressed {
+			dst, err = dec.DecodeAll(comp, dst[:0])
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -183,15 +173,40 @@ func BenchmarkZstdDataDogDecompress(b *testing.B) {
 
 // --- Parallel compress (simulates streaming pipeline with N workers) ---
 
-func benchZstdKlauspostCompressParallel(b *testing.B, workers int) {
+func benchCgoCompressParallel(b *testing.B, workers int) {
 	buildZstdBlocks(b)
 
-	var totalBytes int64
-	for _, blk := range zstdBlocks {
-		totalBytes += int64(len(blk))
-	}
+	b.SetBytes(zstdTotalBytes())
+	b.ResetTimer()
+	for range b.N {
+		ch := make(chan int, len(zstdBlocks))
+		for i := range zstdBlocks {
+			ch <- i
+		}
+		close(ch)
 
-	// Pre-create encoders (amortize init cost, matches real pipeline usage).
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				c := zstd.NewCompressor()
+				defer c.Close()
+				var dst []byte
+				for i := range ch {
+					out := c.Encode(zstdBlocks[i])
+					dst = append(dst[:0], out...)
+				}
+				_ = dst
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+func benchKlauspostCompressParallel(b *testing.B, workers int) {
+	buildZstdBlocks(b)
+
 	encoders := make([]*klauspostzstd.Encoder, workers)
 	for i := range workers {
 		enc, err := klauspostzstd.NewWriter(nil,
@@ -204,7 +219,7 @@ func benchZstdKlauspostCompressParallel(b *testing.B, workers int) {
 		encoders[i] = enc
 	}
 
-	b.SetBytes(totalBytes)
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	for range b.N {
 		ch := make(chan int, len(zstdBlocks))
@@ -230,25 +245,27 @@ func benchZstdKlauspostCompressParallel(b *testing.B, workers int) {
 	}
 }
 
-func benchZstdDataDogCompressParallel(b *testing.B, workers int) {
+func BenchmarkZstdCgoCompressP8(b *testing.B) { benchCgoCompressParallel(b, 8) }
+func BenchmarkZstdKlauspostCompressP8(b *testing.B)   { benchKlauspostCompressParallel(b, 8) }
+
+// --- Parallel decompress ---
+
+func benchCgoDecompressParallel(b *testing.B, workers int) {
 	buildZstdBlocks(b)
-
-	var totalBytes int64
-	for _, blk := range zstdBlocks {
-		totalBytes += int64(len(blk))
+	c := zstd.NewCompressor()
+	compressed := make([][]byte, len(zstdBlocks))
+	for i, blk := range zstdBlocks {
+		out := c.Encode(blk)
+		compressed[i] = make([]byte, len(out))
+		copy(compressed[i], out)
 	}
+	c.Close()
 
-	// Pre-create contexts (not goroutine-safe, one per worker).
-	contexts := make([]datadogzstd.Ctx, workers)
-	for i := range workers {
-		contexts[i] = datadogzstd.NewCtx()
-	}
-
-	b.SetBytes(totalBytes)
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	for range b.N {
-		ch := make(chan int, len(zstdBlocks))
-		for i := range zstdBlocks {
+		ch := make(chan int, len(compressed))
+		for i := range compressed {
 			ch <- i
 		}
 		close(ch)
@@ -257,14 +274,15 @@ func benchZstdDataDogCompressParallel(b *testing.B, workers int) {
 		var errOnce sync.Once
 		var wg sync.WaitGroup
 		wg.Add(workers)
-		for w := range workers {
+		for range workers {
 			go func() {
 				defer wg.Done()
-				ctx := contexts[w]
+				d := zstd.NewDecompressor()
+				defer d.Close()
 				var dst []byte
 				for i := range ch {
 					var err error
-					dst, err = ctx.CompressLevel(dst[:0], zstdBlocks[i], zstdLevel)
+					dst, err = d.Decode(dst, compressed[i])
 					if err != nil {
 						errOnce.Do(func() { firstErr = err })
 						return
@@ -280,16 +298,8 @@ func benchZstdDataDogCompressParallel(b *testing.B, workers int) {
 	}
 }
 
-func BenchmarkZstdKlauspostCompressP8(b *testing.B)  { benchZstdKlauspostCompressParallel(b, 8) }
-func BenchmarkZstdKlauspostCompressP16(b *testing.B) { benchZstdKlauspostCompressParallel(b, 16) }
-func BenchmarkZstdDataDogCompressP8(b *testing.B)    { benchZstdDataDogCompressParallel(b, 8) }
-func BenchmarkZstdDataDogCompressP16(b *testing.B)   { benchZstdDataDogCompressParallel(b, 16) }
-
-// --- Parallel decompress ---
-
-func benchZstdKlauspostDecompressParallel(b *testing.B, workers int) {
+func benchKlauspostDecompressParallel(b *testing.B, workers int) {
 	buildZstdBlocks(b)
-
 	enc, err := klauspostzstd.NewWriter(nil,
 		klauspostzstd.WithEncoderLevel(klauspostzstd.SpeedDefault),
 		klauspostzstd.WithEncoderCRC(true),
@@ -297,15 +307,11 @@ func benchZstdKlauspostDecompressParallel(b *testing.B, workers int) {
 	if err != nil {
 		b.Fatal(err)
 	}
-
 	compressed := make([][]byte, len(zstdBlocks))
-	var totalBytes int64
 	for i, blk := range zstdBlocks {
 		compressed[i] = enc.EncodeAll(blk, nil)
-		totalBytes += int64(len(blk))
 	}
 
-	// Pre-create decoders (one per worker, matches real usage).
 	decoders := make([]*klauspostzstd.Decoder, workers)
 	for i := range workers {
 		dec, err := klauspostzstd.NewReader(nil, klauspostzstd.WithDecoderConcurrency(1))
@@ -320,7 +326,7 @@ func benchZstdKlauspostDecompressParallel(b *testing.B, workers int) {
 		}
 	})
 
-	b.SetBytes(totalBytes)
+	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	for range b.N {
 		ch := make(chan int, len(compressed))
@@ -356,68 +362,8 @@ func benchZstdKlauspostDecompressParallel(b *testing.B, workers int) {
 	}
 }
 
-func benchZstdDataDogDecompressParallel(b *testing.B, workers int) {
-	buildZstdBlocks(b)
-
-	ctx := datadogzstd.NewCtx()
-
-	compressed := make([][]byte, len(zstdBlocks))
-	var totalBytes int64
-	for i, blk := range zstdBlocks {
-		var err error
-		compressed[i], err = ctx.CompressLevel(nil, blk, zstdLevel)
-		if err != nil {
-			b.Fatal(err)
-		}
-		totalBytes += int64(len(blk))
-	}
-
-	// Pre-create contexts (not goroutine-safe, one per worker).
-	contexts := make([]datadogzstd.Ctx, workers)
-	for i := range workers {
-		contexts[i] = datadogzstd.NewCtx()
-	}
-
-	b.SetBytes(totalBytes)
-	b.ResetTimer()
-	for range b.N {
-		ch := make(chan int, len(compressed))
-		for i := range compressed {
-			ch <- i
-		}
-		close(ch)
-
-		var firstErr error
-		var errOnce sync.Once
-		var wg sync.WaitGroup
-		wg.Add(workers)
-		for w := range workers {
-			go func() {
-				defer wg.Done()
-				dCtx := contexts[w]
-				var dst []byte
-				for i := range ch {
-					var err error
-					dst, err = dCtx.Decompress(dst[:0], compressed[i])
-					if err != nil {
-						errOnce.Do(func() { firstErr = err })
-						return
-					}
-				}
-				_ = dst
-			}()
-		}
-		wg.Wait()
-		if firstErr != nil {
-			b.Fatal(firstErr)
-		}
-	}
-}
-
-func BenchmarkZstdKlauspostDecompressP8(b *testing.B)  { benchZstdKlauspostDecompressParallel(b, 8) }
-func BenchmarkZstdKlauspostDecompressP16(b *testing.B) { benchZstdKlauspostDecompressParallel(b, 16) }
-func BenchmarkZstdDataDogDecompressP8(b *testing.B)    { benchZstdDataDogDecompressParallel(b, 8) }
-func BenchmarkZstdDataDogDecompressP16(b *testing.B)   { benchZstdDataDogDecompressParallel(b, 16) }
+func BenchmarkZstdCgoDecompressP8(b *testing.B) { benchCgoDecompressParallel(b, 8) }
+func BenchmarkZstdKlauspostDecompressP8(b *testing.B)   { benchKlauspostDecompressParallel(b, 8) }
 
 // --- Compression ratio comparison ---
 
@@ -430,7 +376,6 @@ func TestZstdCompressionRatio(t *testing.T) {
 	n := len(allEvents)
 	numBlocks := (n + blockN - 1) / blockN
 
-	// Build blocks.
 	blocks := make([][]byte, numBlocks)
 	var totalRaw int64
 	for i := range numBlocks {
@@ -451,7 +396,16 @@ func TestZstdCompressionRatio(t *testing.T) {
 		totalRaw += int64(len(block))
 	}
 
-	// Klauspost level 3.
+	// cgo-zstd (C libzstd level 3 with checksum).
+	c := zstd.NewCompressor()
+	var rcTotal int64
+	for _, blk := range blocks {
+		out := c.Encode(blk)
+		rcTotal += int64(len(out))
+	}
+	c.Close()
+
+	// Klauspost (pure Go, level 3 with CRC).
 	klEnc, err := klauspostzstd.NewWriter(nil,
 		klauspostzstd.WithEncoderLevel(klauspostzstd.SpeedDefault),
 		klauspostzstd.WithEncoderCRC(true),
@@ -459,25 +413,13 @@ func TestZstdCompressionRatio(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	var klTotal int64
 	for _, blk := range blocks {
 		klTotal += int64(len(klEnc.EncodeAll(blk, nil)))
 	}
 
-	// DataDog level 3.
-	ddCtx := datadogzstd.NewCtx()
-	var ddTotal int64
-	for _, blk := range blocks {
-		c, err := ddCtx.CompressLevel(nil, blk, zstdLevel)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ddTotal += int64(len(c))
-	}
-
-	fmt.Printf("Compression ratio comparison (level %d, %d blocks):\n", zstdLevel, numBlocks)
-	fmt.Printf("  Raw:      %s\n", fmtKB(float64(totalRaw)))
-	fmt.Printf("  Klauspost: %s (%.2fx)\n", fmtKB(float64(klTotal)), float64(totalRaw)/float64(klTotal))
-	fmt.Printf("  DataDog:   %s (%.2fx)\n", fmtKB(float64(ddTotal)), float64(totalRaw)/float64(ddTotal))
+	fmt.Printf("Compression ratio comparison (level 3, %d blocks, %d events):\n", numBlocks, n)
+	fmt.Printf("  Raw:         %s\n", fmtKB(float64(totalRaw)))
+	fmt.Printf("  cgo-zstd: %s (%.2fx)\n", fmtKB(float64(rcTotal)), float64(totalRaw)/float64(rcTotal))
+	fmt.Printf("  klauspost:   %s (%.2fx)\n", fmtKB(float64(klTotal)), float64(totalRaw)/float64(klTotal))
 }

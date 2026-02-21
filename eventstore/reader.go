@@ -5,17 +5,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"iter"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/recordcodec"
+	"github.com/tamir/events-analysis/zstd"
 )
 
 var ErrIndexRange = fmt.Errorf("eventstore: %w", packfile.ErrIndexRange)
 
-// blockBuf holds reusable buffers and a dedicated zstd decoder for ReadEvent.
+// blockBuf holds reusable buffers and a dedicated zstd decompressor for ReadEvent.
 // Pooled via sync.Pool to avoid per-call allocations and shared decoder contention.
 type blockBuf struct {
 	compressed   []byte
@@ -23,12 +23,16 @@ type blockBuf struct {
 	sizes        []uint32
 	offsets      []int // prefix sum of sizes: offsets[i] = byte offset of event i
 	padded       []byte
-	decoder      *zstd.Decoder
+	decompressor *zstd.Decompressor
 }
 
 var blockBufPool = sync.Pool{
 	New: func() any {
-		return &blockBuf{decoder: recordcodec.NewDecoder()}
+		bb := &blockBuf{decompressor: zstd.NewDecompressor()}
+		runtime.SetFinalizer(bb, func(b *blockBuf) {
+			b.decompressor.Close()
+		})
+		return bb
 	},
 }
 
@@ -39,7 +43,7 @@ func (bb *blockBuf) decode(data []byte, n int, noCompress bool) error {
 		bb.decompressed = append(bb.decompressed[:0], data...)
 	} else {
 		var err error
-		bb.decompressed, err = bb.decoder.DecodeAll(data, bb.decompressed[:0])
+		bb.decompressed, err = bb.decompressor.Decode(bb.decompressed[:0], data)
 		if err != nil {
 			return err
 		}

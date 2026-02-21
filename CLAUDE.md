@@ -13,32 +13,56 @@ Benchmarking and analysis tool for event storage formats: custom packfile/events
 
 The `grocksdb v1.10.7` Go binding requires RocksDB headers and shared library at build time. The system `librocksdb-dev` package (Ubuntu 24.04) provides RocksDB 8.9.1 which is **incompatible** — the API changed between 8.x versions.
 
-**Build RocksDB 10.9.1 from source:**
+**Build zstd 1.5.7 from source** (must be done before RocksDB):
+
+```bash
+cd /tmp
+git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git zstd-1.5.7
+cd zstd-1.5.7
+make -j$(nproc) && PREFIX=$HOME/.local make install
+```
+
+**Required system compression dev libraries (install via apt):**
+```bash
+sudo apt-get install -y libsnappy-dev liblz4-dev libbz2-dev
+```
+
+**Build RocksDB 10.9.1 from source** (links against the zstd 1.5.7 above via RPATH):
 
 ```bash
 cd /tmp
 git clone --depth 1 --branch v10.9.1 https://github.com/facebook/rocksdb.git
 cd rocksdb
-USE_ZSTD=1 USE_LZ4=1 USE_SNAPPY=1 USE_BZ2=1 PREFIX=$HOME/.local make install-shared -j$(nproc)
-```
-
-**Required system compression dev libraries (install via apt):**
-```bash
-sudo apt-get install -y libsnappy-dev liblz4-dev libzstd-dev libbz2-dev
+EXTRA_LDFLAGS="-Wl,-rpath,$HOME/.local/lib" \
+EXTRA_CFLAGS="-I$HOME/.local/include" \
+EXTRA_CXXFLAGS="-I$HOME/.local/include" \
+USE_ZSTD=1 USE_LZ4=1 USE_SNAPPY=1 USE_BZ2=1 \
+PREFIX=$HOME/.local \
+make install-shared -j$(nproc)
 ```
 
 **CGO flags for every `go test` / `go build` command:**
 ```bash
 export CGO_CFLAGS="-I$HOME/.local/include"
-export CGO_LDFLAGS="-L$HOME/.local/lib"
-export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
+export CGO_LDFLAGS="-L$HOME/.local/lib -Wl,-rpath,$HOME/.local/lib"
 ```
+
+The RPATH baked into both `librocksdb.so` and the Go binary ensures `~/.local/lib/libzstd.so` (1.5.7) is always used at runtime — no `LD_LIBRARY_PATH` needed.
+
+### Zstd wrapper (`zstd/`)
+
+The `zstd/` package is a ~60-line CGO wrapper that links system libzstd via `pkg-config`. We wrote this instead of using third-party bindings because:
+
+- **klauspost/compress** (pure Go): ~92 MB/s on our blocks vs ~365 MB/s with system libzstd. 4x slower.
+- **DataDog/zstd**: Compiles vendored C zstd without `-O2` (~49 MB/s). Worse, on Linux the vendored ELF symbols cause interposition — RocksDB's `ZSTD_compress2` calls resolve to the unoptimized copy, making RocksDB 5x slower. macOS is immune (Mach-O two-level namespace).
+
+The wrapper requires system libzstd >= 1.5.7 (enforced at compile time).
 
 ## Running Tests
 
 Subpackage tests (fast, no RocksDB needed):
 ```bash
-go test ./eventstore/... ./packfile/... ./recordcodec/...
+go test ./eventstore/... ./packfile/... ./zstd/...
 ```
 
 Root package tests (need RocksDB + CGO flags, ~15 min total):
@@ -73,6 +97,11 @@ WRITE_DIR=/mnt/nvme go test -run=TestWriteThroughput -timeout 30m
 WRITE_DIR=/tmp go test -run=TestWriteThroughput -timeout 30m   # EBS
 ```
 
+Use `MAX_EVENTS` to truncate the dataset for faster iteration (~30s vs ~3 min):
+```bash
+MAX_EVENTS=500000 WRITE_DIR=/mnt/nvme go test -run=TestWriteThroughput -timeout 5m
+```
+
 ### Measuring Peak Memory
 
 Write benchmarks report `peak-delta-MB` — the peak anonymous RSS delta during the write operation, measured via `RssAnon` from `/proc/self/status` (excludes page cache, captures both Go heap and C allocations).
@@ -84,11 +113,8 @@ For accurate readings, run with `GODEBUG=madvdontneed=1` and **each benchmark in
 go test -c -o /tmp/bench.test
 
 # Run each separately
-GODEBUG=madvdontneed=1 LD_LIBRARY_PATH="$HOME/.local/lib" \
-  /tmp/bench.test -test.bench='BenchmarkPackfileWrite$' -test.benchmem -test.run='^$' -test.timeout 30m
-
-GODEBUG=madvdontneed=1 LD_LIBRARY_PATH="$HOME/.local/lib" \
-  /tmp/bench.test -test.bench='BenchmarkPackfileWriteParallel8$' -test.benchmem -test.run='^$' -test.timeout 30m
+GODEBUG=madvdontneed=1 /tmp/bench.test -test.bench='BenchmarkPackfileWrite$' -test.benchmem -test.run='^$' -test.timeout 30m
+GODEBUG=madvdontneed=1 /tmp/bench.test -test.bench='BenchmarkPackfileWriteParallel8$' -test.benchmem -test.run='^$' -test.timeout 30m
 ```
 
 **Why `GODEBUG=madvdontneed=1`:** Go's default `MADV_FREE` lets the kernel lazily reclaim freed pages, which inflates RSS readings. `madvdontneed=1` forces immediate reclaim so the baseline is clean.

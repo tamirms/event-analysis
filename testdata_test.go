@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 )
 
@@ -25,6 +26,7 @@ func loadAllEvents() error {
 	// re-parsing source ledger files (~7 min).
 	if !fixturesStale() {
 		if err := loadEventsFromCache(); err == nil {
+			truncateEvents()
 			return nil
 		}
 	}
@@ -36,7 +38,22 @@ func loadAllEvents() error {
 	if err := saveEventsCache(); err != nil {
 		fmt.Printf("  warning: failed to cache events: %v\n", err)
 	}
+	truncateEvents()
 	return nil
+}
+
+// truncateEvents limits allEvents to MAX_EVENTS if set, for faster iteration.
+func truncateEvents() {
+	if s := os.Getenv("MAX_EVENTS"); s != "" {
+		if max, err := strconv.Atoi(s); err == nil && max > 0 && max < len(allEvents) {
+			allEvents = allEvents[:max]
+			totalRawBytes = 0
+			for _, ev := range allEvents {
+				totalRawBytes += len(ev)
+			}
+			fmt.Printf("  truncated to %d events, %s total raw bytes (MAX_EVENTS)\n", len(allEvents), fmtKB(float64(totalRawBytes)))
+		}
+	}
 }
 
 func loadEventsFromCache() error {

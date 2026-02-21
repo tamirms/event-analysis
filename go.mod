@@ -3,7 +3,6 @@ module github.com/tamir/events-analysis
 go 1.26.0
 
 require (
-	github.com/DataDog/zstd v1.5.7
 	github.com/klauspost/compress v1.18.3
 	github.com/linxGnu/grocksdb v1.10.7
 	github.com/stellar/go-stellar-sdk v0.1.0

@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/recordcodec"
+	"github.com/tamir/events-analysis/zstd"
 )
 
 const DefaultBlockSize = 128
@@ -34,6 +34,7 @@ type Writer struct {
 	closed     bool     // set by Finish or Abort
 	err        error    // sticky — once set, all subsequent ops fail
 	noCompress bool     // skip zstd compression
+	compressor *zstd.Compressor // for serial flush path
 
 	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
@@ -91,8 +92,13 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 // compressWorker reads uncompressed blocks from workCh and sends compressed
 // results to resultCh, preserving the blockID for reordering.
 func (w *Writer) compressWorker() {
+	c := zstd.NewCompressor()
+	defer c.Close()
 	for work := range w.workCh {
-		work.compressed = recordcodec.Encode(work.compressed)
+		compressed := c.Encode(work.compressed)
+		// Copy: compressed aliases c's scratch buffer, but must outlive
+		// until the writer goroutine consumes it.
+		work.compressed = append(work.compressed[:0], compressed...)
 		w.resultCh <- work
 	}
 }
@@ -161,7 +167,10 @@ func (w *Writer) flush() error {
 
 	if w.concurrency <= 1 {
 		if !w.noCompress {
-			block = recordcodec.Encode(block)
+			if w.compressor == nil {
+				w.compressor = zstd.NewCompressor()
+			}
+			block = w.compressor.Encode(block)
 		}
 		return w.pw.Append(block)
 	}
@@ -217,6 +226,11 @@ func (w *Writer) Finish() error {
 	binary.LittleEndian.PutUint32(meta[8:], flags)
 	w.pw.SetMetadata(meta[:])
 
+	if w.compressor != nil {
+		w.compressor.Close()
+		w.compressor = nil
+	}
+
 	_, err := w.pw.Finish()
 	if err != nil {
 		w.err = err
@@ -232,6 +246,10 @@ func (w *Writer) Abort() error {
 		return nil
 	}
 	w.closed = true
+	if w.compressor != nil {
+		w.compressor.Close()
+		w.compressor = nil
+	}
 	if w.workCh != nil {
 		close(w.workCh)
 		<-w.writerDone
