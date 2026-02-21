@@ -47,6 +47,15 @@ The 75 MB packfile baseline is the zstd encoder's internal buffer pool (klauspos
 
 Measured via `RssAnon` from `/proc/self/status` with `GOGC=1` (minimizes GC headroom to capture actual working set). Each benchmark runs in a separate process.
 
+### Read Peak Memory (RssAnon delta, excluding page cache)
+
+| Benchmark | Peak Delta |
+|-----------|-----------|
+| PackfileSeqRead (full 8.7M events) | 3.9 MB |
+| PackfileReadIndices (1,000 scattered) | 3.1 MB |
+
+Read memory is minimal — just pooled `blockBuf` decoders (~300KB each) from `sync.Pool`. No per-event allocations accumulate.
+
 ## Sequential Read
 
 | Benchmark | Throughput (MB/s) | ns/op | Allocs |
