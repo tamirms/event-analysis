@@ -60,9 +60,11 @@ func doSetup() error {
 	os.Remove(eventstorePath)
 	os.RemoveAll(rocksDBPath)
 
-	// Load events from source.
-	if err := loadAllEvents(); err != nil {
-		return fmt.Errorf("load events: %w", err)
+	// Load events from source (via dataOnce to avoid double-load if
+	// ensureAllEvents is called independently by write benchmarks).
+	dataOnce.Do(func() { dataLoadErr = loadAllEvents() })
+	if dataLoadErr != nil {
+		return fmt.Errorf("load events: %w", dataLoadErr)
 	}
 	totalEvents = len(allEvents)
 	fmt.Printf("bench setup: %d events loaded, %s total raw bytes\n",
@@ -100,6 +102,7 @@ func doSetup() error {
 	sstBbto.SetFormatVersion(5)
 	sstBbto.SetBlockRestartInterval(128)
 	sstWriteOpts.SetBlockBasedTableFactory(sstBbto)
+	sstBbto.Destroy()
 
 	envOpts := grocksdb.NewDefaultEnvOptions()
 	sfw := grocksdb.NewSSTFileWriter(envOpts, sstWriteOpts)
@@ -127,6 +130,7 @@ func doSetup() error {
 	dbBbto.SetNoBlockCache(true)
 	dbBbto.SetBlockSize(rocksBlockSize)
 	dbOpts.SetBlockBasedTableFactory(dbBbto)
+	dbBbto.Destroy()
 
 	rdb, err := grocksdb.OpenDb(dbOpts, rocksDBPath)
 	if err != nil {
@@ -183,6 +187,7 @@ func openRocksDB(b *testing.B) *grocksdb.DB {
 	bbto.SetNoBlockCache(true)
 	bbto.SetFormatVersion(5)
 	opts.SetBlockBasedTableFactory(bbto)
+	bbto.Destroy()
 	db, err := grocksdb.OpenDbForReadOnly(opts, rocksDBPath, false)
 	if err != nil {
 		b.Fatal(err)
@@ -321,7 +326,8 @@ func BenchmarkPackfileParallelRead(b *testing.B) {
 			idx := rng.Intn(n)
 			ev, err := er.ReadEvent(idx)
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
+				return
 			}
 			_ = ev
 		}
@@ -348,7 +354,8 @@ func BenchmarkRocksDBParallelRead(b *testing.B) {
 			binary.BigEndian.PutUint32(key, uint32(idx))
 			val, err := db.GetPinned(ro, key)
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
+				return
 			}
 			_ = val.Data()
 			val.Destroy()
@@ -685,7 +692,8 @@ func BenchmarkPackfileParallelReadIndices(b *testing.B) {
 			indices := generateScatteredIndices(rng, numIndices, n)
 			for ev, err := range er.ReadIndices(context.Background(), indices) {
 				if err != nil {
-					b.Fatal(err)
+					b.Error(err)
+					return
 				}
 				_ = ev
 			}
@@ -751,6 +759,7 @@ func BenchmarkRocksDBOpen(b *testing.B) {
 	bbto.SetNoBlockCache(true)
 	bbto.SetFormatVersion(5)
 	opts.SetBlockBasedTableFactory(bbto)
+	bbto.Destroy()
 
 	b.ResetTimer()
 	for range b.N {
@@ -841,6 +850,7 @@ func rocksDBWriteCore(b *testing.B, parallelComp int) {
 	bbto.SetFormatVersion(5)
 	bbto.SetBlockRestartInterval(128)
 	writeOpts.SetBlockBasedTableFactory(bbto)
+	bbto.Destroy()
 
 	envOpts := grocksdb.NewDefaultEnvOptions()
 	sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
@@ -869,6 +879,7 @@ func rocksDBWriteCore(b *testing.B, parallelComp int) {
 	dbBbto.SetNoBlockCache(true)
 	dbBbto.SetBlockSize(128 * avgEventSize)
 	dbOpts.SetBlockBasedTableFactory(dbBbto)
+	dbBbto.Destroy()
 
 	db, err := grocksdb.OpenDb(dbOpts, dbPath)
 	if err != nil {

@@ -149,6 +149,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		bbto.SetFormatVersion(5)
 		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
+		bbto.Destroy()
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
 		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
@@ -186,6 +187,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		dbBbto.SetFormatVersion(5)
 		dbBbto.SetBlockRestartInterval(128)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
+		dbBbto.Destroy()
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
 		if err != nil {

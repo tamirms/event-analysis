@@ -108,6 +108,7 @@ func TestWriteThroughput(t *testing.T) {
 		bbto.SetFormatVersion(5)
 		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
+		bbto.Destroy()
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
 		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
@@ -136,6 +137,7 @@ func TestWriteThroughput(t *testing.T) {
 		dbBbto.SetBlockSize(blockSize)
 		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
+		dbBbto.Destroy()
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
 		if err != nil {
@@ -176,6 +178,7 @@ func TestWriteThroughput(t *testing.T) {
 		bbto.SetFormatVersion(5)
 		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
+		bbto.Destroy()
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
 		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
@@ -204,6 +207,7 @@ func TestWriteThroughput(t *testing.T) {
 		dbBbto.SetBlockSize(blockSize)
 		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
+		dbBbto.Destroy()
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
 		if err != nil {

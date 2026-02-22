@@ -27,6 +27,7 @@ func openNoCompRocksDB(path string) (*grocksdb.DB, func(), error) {
 	bbto.SetNoBlockCache(true)
 	bbto.SetFormatVersion(5)
 	opts.SetBlockBasedTableFactory(bbto)
+	bbto.Destroy()
 	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
 	if err != nil {
 		opts.Destroy()
@@ -105,6 +106,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		bbto.SetFormatVersion(5)
 		bbto.SetBlockRestartInterval(128)
 		writeOpts.SetBlockBasedTableFactory(bbto)
+		bbto.Destroy()
 
 		envOpts := grocksdb.NewDefaultEnvOptions()
 		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
@@ -133,6 +135,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 		dbBbto.SetBlockSize(blockSize)
 		dbBbto.SetFormatVersion(5)
 		dbOpts.SetBlockBasedTableFactory(dbBbto)
+		dbBbto.Destroy()
 
 		db, err := grocksdb.OpenDb(dbOpts, dbPath)
 		if err != nil {

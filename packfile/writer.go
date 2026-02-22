@@ -13,14 +13,15 @@ import (
 
 // Writer creates a new packfile. Records must be appended in order.
 type Writer struct {
-	file    *os.File
-	path    string // final path
-	tmpPath string // {path}.tmp.{random}
-	pos     int64
-	offsets []int64
-	opts    WriterOptions
-	err     error // sticky — once set, all subsequent ops fail
-	closed  bool  // set by Finish or Abort
+	file       *os.File
+	path       string // final path
+	tmpPath    string // {path}.tmp.{random}
+	pos        int64
+	offsets    []int64
+	opts       WriterOptions
+	err        error // sticky — once set, all subsequent ops fail
+	closed     bool  // set by Finish or Abort
+	fileClosed bool  // set when file.Close() succeeds, prevents double-close in Abort
 }
 
 // Create starts writing a new packfile at path.
@@ -72,6 +73,10 @@ func (w *Writer) Finish() (Trailer, error) {
 	// Encode index using FOR-128.
 	var indexBuf bytes.Buffer
 	recordCount := len(w.offsets) - 1
+	if recordCount > math.MaxUint32 {
+		w.err = errors.New("packfile: record count exceeds uint32 max")
+		return Trailer{}, w.err
+	}
 
 	var deltas []uint32
 	for g := 0; g*groupInterval < recordCount; g++ {
@@ -142,6 +147,7 @@ func (w *Writer) Finish() (Trailer, error) {
 		w.err = err
 		return Trailer{}, err
 	}
+	w.fileClosed = true
 	if err := os.Rename(w.tmpPath, w.path); err != nil {
 		w.err = err
 		return Trailer{}, err
@@ -149,8 +155,12 @@ func (w *Writer) Finish() (Trailer, error) {
 
 	// Fsync parent directory to ensure the rename is durable.
 	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		dir.Sync()
-		dir.Close()
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			w.err = err
+			return Trailer{}, err
+		}
 	}
 
 	w.closed = true
@@ -177,7 +187,10 @@ func (w *Writer) Abort() error {
 		return nil
 	}
 	w.closed = true
-	closeErr := w.file.Close()
+	var closeErr error
+	if !w.fileClosed {
+		closeErr = w.file.Close()
+	}
 	removeErr := os.Remove(w.tmpPath)
 	return errors.Join(closeErr, removeErr)
 }
