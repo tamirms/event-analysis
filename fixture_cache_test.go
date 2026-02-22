@@ -81,6 +81,20 @@ func benchFixturesExist() bool {
 	return true
 }
 
+func bitmapBenchFixturesExist() bool {
+	if _, err := os.Stat(filepath.Join(fixtureDir, "bitmapindex.mphf")); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(fixtureDir, "bitmapindex.bitmaps")); err != nil {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(fixtureDir, "bitmapindex.rocksdb"))
+	if err != nil || len(entries) == 0 {
+		return false
+	}
+	return true
+}
+
 func buildMeta() (*fixtureMeta, error) {
 	dataStat, err := os.Stat("006016.data")
 	if err != nil {
