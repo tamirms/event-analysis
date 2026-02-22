@@ -7,11 +7,9 @@ require (
 	github.com/klauspost/compress v1.18.3
 	github.com/linxGnu/grocksdb v1.10.7
 	github.com/stellar/go-stellar-sdk v0.1.0
-	github.com/tamirms/streamhash v0.0.0-00010101000000-000000000000
+	github.com/tamirms/streamhash v0.0.0-20260222180902-234f2350378c
 	golang.org/x/sys v0.40.0
 )
-
-replace github.com/tamirms/streamhash => /Users/tamir/streamsplit-master
 
 require (
 	cloud.google.com/go v0.114.0 // indirect
