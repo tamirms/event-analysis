@@ -201,8 +201,8 @@ func (w *Writer) Finish() error {
 	// Drain the streaming pipeline.
 	if w.workCh != nil {
 		close(w.workCh)        // signal compress workers to stop
-		w.workCh = nil         // prevent double-close from Abort()
 		err := <-w.writerDone  // wait for writer to finish
+		w.workCh = nil         // safe now — all workers have exited
 		if err != nil {
 			w.err = err
 			return err

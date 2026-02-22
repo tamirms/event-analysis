@@ -68,10 +68,17 @@ func ExtractEvents(ledgerXDR []byte, events []IngestEvent) ([]IngestEvent, error
 			if ev.Event.Body.V == 0 {
 				body := ev.Event.Body.MustV0()
 				for _, topic := range body.Topics {
-					topicBytes, _ := topic.MarshalBinary()
+					topicBytes, err := topic.MarshalBinary()
+					if err != nil {
+						return events, fmt.Errorf("failed to marshal topic: %w", err)
+					}
 					topics = append(topics, topicBytes)
 				}
-				dataBytes, _ = body.Data.MarshalBinary()
+				var err error
+				dataBytes, err = body.Data.MarshalBinary()
+				if err != nil {
+					return events, fmt.Errorf("failed to marshal event data: %w", err)
+				}
 			}
 
 			events = append(events, IngestEvent{
@@ -106,10 +113,17 @@ func ExtractEvents(ledgerXDR []byte, events []IngestEvent) ([]IngestEvent, error
 				if ev.Body.V == 0 {
 					body := ev.Body.MustV0()
 					for _, topic := range body.Topics {
-						topicBytes, _ := topic.MarshalBinary()
+						topicBytes, err := topic.MarshalBinary()
+						if err != nil {
+							return events, fmt.Errorf("failed to marshal topic: %w", err)
+						}
 						topics = append(topics, topicBytes)
 					}
-					dataBytes, _ = body.Data.MarshalBinary()
+					var err error
+					dataBytes, err = body.Data.MarshalBinary()
+					if err != nil {
+						return events, fmt.Errorf("failed to marshal event data: %w", err)
+					}
 				}
 
 				events = append(events, IngestEvent{

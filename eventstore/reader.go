@@ -42,11 +42,11 @@ func (bb *blockBuf) decode(data []byte, n int, noCompress bool) error {
 	if noCompress {
 		bb.decompressed = append(bb.decompressed[:0], data...)
 	} else {
-		var err error
-		bb.decompressed, err = bb.decompressor.Decode(bb.decompressed[:0], data)
+		decoded, err := bb.decompressor.Decode(bb.decompressed[:0], data)
 		if err != nil {
 			return err
 		}
+		bb.decompressed = decoded
 	}
 	var err error
 	bb.sizes, bb.padded, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
