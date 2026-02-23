@@ -153,7 +153,7 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 			bitmapSampleKeys = append(bitmapSampleKeys, bitmapSampleKey{
 				field:   f,
 				key:     keyCopy,
-				mphfKey: bitmapindex.ComposeKey(keyCopy, byte(f)),
+				mphfKey: composeKey(keyCopy, f),
 			})
 		}
 	}

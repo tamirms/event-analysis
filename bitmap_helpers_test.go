@@ -66,9 +66,13 @@ func extractKey(event []byte, f field) []byte {
 	}
 }
 
-// composeKey wraps bitmapindex.ComposeKey for local field type.
+// composeKey appends the field byte to key, producing a lookup key
+// that disambiguates the same raw key across different logical fields.
 func composeKey(key []byte, f field) []byte {
-	return bitmapindex.ComposeKey(key, byte(f))
+	out := make([]byte, len(key)+1)
+	copy(out, key)
+	out[len(key)] = byte(f)
+	return out
 }
 
 // makeEvent builds a minimal binary event for testing.

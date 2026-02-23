@@ -20,7 +20,7 @@ import (
 
 // WriterOptions configures Writer behavior.
 type WriterOptions struct {
-	BatchSize    int // bitmaps per packfile record; 0 → DefaultBatchSize (128)
+	BatchSize    int // bitmaps per packfile record; 0 → 128
 	CapacityHint int // pre-sizes internal map; 0 → no hint
 }
 
@@ -35,7 +35,7 @@ type Writer struct {
 func NewWriter(opts WriterOptions) *Writer {
 	bs := opts.BatchSize
 	if bs <= 0 {
-		bs = DefaultBatchSize
+		bs = defaultBatchSize
 	}
 	return &Writer{
 		bitmaps:   make(map[[16]byte]*roaring.Bitmap, opts.CapacityHint),
@@ -44,7 +44,6 @@ func NewWriter(opts WriterOptions) *Writer {
 }
 
 // Add records that the event at ordinal has the given key.
-// The key should be pre-composed via ComposeKey if field disambiguation is needed.
 func (w *Writer) Add(ordinal uint32, key []byte) {
 	var hk [16]byte
 	streamhash.PreHashInPlace(key, hk[:])
@@ -63,7 +62,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 		return fmt.Errorf("bitmapindex: no keys to index")
 	}
 
-	// Phase 2a: Collect and sort MPHF keys.
+	// Collect and sort MPHF keys.
 	sortedKeys := make([][16]byte, 0, totalKeys)
 	for mk := range w.bitmaps {
 		sortedKeys = append(sortedKeys, mk)
@@ -72,7 +71,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 		return bytes.Compare(sortedKeys[i][:], sortedKeys[j][:]) < 0
 	})
 
-	// Phase 2b: Build MPHF.
+	// Build MPHF.
 	builder, err := streamhash.NewBuilder(ctx, mphfPath, uint64(totalKeys),
 		streamhash.WithWorkers(4),
 	)
@@ -89,7 +88,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 		return fmt.Errorf("bitmapindex: finish MPHF: %w", err)
 	}
 
-	// Phase 2c: Open MPHF, assign bitmaps to rank slots.
+	// Open MPHF and assign bitmaps to rank slots.
 	idx, err := streamhash.Open(mphfPath)
 	if err != nil {
 		return fmt.Errorf("bitmapindex: open MPHF for ranking: %w", err)
@@ -117,7 +116,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 	// Free the original map — bitmaps are now owned by ranked[].
 	w.bitmaps = nil
 
-	// Phase 2d: Parallel per-bitmap preparation (RunOptimize + serialize + compress).
+	// Parallel per-bitmap preparation (RunOptimize + serialize + compress).
 	type preparedBitmap struct {
 		fingerprint [4]byte
 		flags       byte
@@ -177,7 +176,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 		return fmt.Errorf("bitmapindex: record preparation: %w", *ep)
 	}
 
-	// Phase 2e: Group into batch records and write to packfile.
+	// Group into batch records and write to packfile.
 	batchSize := w.batchSize
 	numBatches := (totalKeys + batchSize - 1) / batchSize
 

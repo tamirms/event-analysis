@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -14,17 +15,26 @@ import (
 	"github.com/tamir/events-analysis/packfile"
 )
 
+// composeKey appends disc as a trailing byte, producing a lookup key
+// that disambiguates the same raw key across different logical fields.
+func composeKey(key []byte, disc byte) []byte {
+	out := make([]byte, len(key)+1)
+	copy(out, key)
+	out[len(key)] = disc
+	return out
+}
+
 func TestRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	// Create test keys using ComposeKey with different discriminators.
-	keyA := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00) // "contractA, field 0"
-	keyB := ComposeKey(bytes.Repeat([]byte{0x02}, 32), 0x00) // "contractB, field 0"
-	topicKey := ComposeKey([]byte("transfer"), 0x01)          // "transfer, field 1"
-	approveKey := ComposeKey([]byte("approve"), 0x01)         // "approve, field 1"
-	mintKey := ComposeKey([]byte("mint"), 0x01)               // "mint, field 1"
+	// Create test keys with different discriminators.
+	keyA := composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00) // "contractA, field 0"
+	keyB := composeKey(bytes.Repeat([]byte{0x02}, 32), 0x00) // "contractB, field 0"
+	topicKey := composeKey([]byte("transfer"), 0x01)          // "transfer, field 1"
+	approveKey := composeKey([]byte("approve"), 0x01)         // "approve, field 1"
+	mintKey := composeKey([]byte("mint"), 0x01)               // "mint, field 1"
 
 	// Build index.
 	w := NewWriter(WriterOptions{})
@@ -95,7 +105,7 @@ func TestNonMemberLookup(t *testing.T) {
 
 	// Build a small index with one key.
 	w := NewWriter(WriterOptions{})
-	w.Add(0, ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00))
+	w.Add(0, composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -111,7 +121,7 @@ func TestNonMemberLookup(t *testing.T) {
 	defer r.Close()
 
 	// Look up a key that doesn't exist.
-	_, err = r.Lookup(ComposeKey(bytes.Repeat([]byte{0xFF}, 32), 0x00))
+	_, err = r.Lookup(composeKey(bytes.Repeat([]byte{0xFF}, 32), 0x00))
 	if err != ErrKeyNotFound {
 		t.Fatalf("expected ErrKeyNotFound, got: %v", err)
 	}
@@ -126,12 +136,12 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 
 	w := NewWriter(WriterOptions{})
 	// Add many ordinals to a single key to trigger compression (>= 256 bytes serialized).
-	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
+	key := composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	for i := uint32(0); i < 5000; i++ {
 		w.Add(i, key)
 	}
 	// Add a second key for diversity.
-	key2 := ComposeKey(bytes.Repeat([]byte{0x02}, 32), 0x00)
+	key2 := composeKey(bytes.Repeat([]byte{0x02}, 32), 0x00)
 	w.Add(0, key2)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -185,7 +195,7 @@ func TestConcurrentLookups(t *testing.T) {
 		raw := make([]byte, 32)
 		raw[0] = byte(i)
 		raw[31] = byte(i)
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 		w.Add(uint32(i), keys[i])
 	}
 
@@ -205,7 +215,7 @@ func TestConcurrentLookups(t *testing.T) {
 	// Launch concurrent lookups.
 	const goroutines = 8
 	const iterations = 100
-	errs := make(chan error, goroutines*iterations)
+	errs := make(chan error, goroutines)
 
 	for g := range goroutines {
 		go func() {
@@ -217,7 +227,8 @@ func TestConcurrentLookups(t *testing.T) {
 					return
 				}
 				if bm.GetCardinality() != 1 {
-					errs <- bytes.ErrTooLarge // placeholder error
+					errs <- fmt.Errorf("key %d: cardinality got %d, want 1",
+						(g*iterations+i)%len(keys), bm.GetCardinality())
 					return
 				}
 			}
@@ -245,7 +256,7 @@ func TestManyKeys(t *testing.T) {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
 		binary.BigEndian.PutUint32(raw[28:], uint32(i*7919))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 		w.Add(uint32(i), keys[i])
 	}
 
@@ -278,7 +289,7 @@ func TestManyKeys(t *testing.T) {
 	nonMember := make([]byte, 32)
 	nonMember[0] = 0xFF
 	nonMember[1] = 0xFF
-	_, err = r.Lookup(ComposeKey(nonMember, 0x00))
+	_, err = r.Lookup(composeKey(nonMember, 0x00))
 	if err != ErrKeyNotFound {
 		t.Errorf("non-member: got %v, want ErrKeyNotFound", err)
 	}
@@ -294,9 +305,9 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	w := NewWriter(WriterOptions{})
 	raw := bytes.Repeat([]byte{0x42}, 32)
 	// Same raw key, different discriminators, different ordinals.
-	w.Add(10, ComposeKey(raw, 0x00))
-	w.Add(20, ComposeKey(raw, 0x01))
-	w.Add(30, ComposeKey(raw, 0x02))
+	w.Add(10, composeKey(raw, 0x00))
+	w.Add(20, composeKey(raw, 0x01))
+	w.Add(30, composeKey(raw, 0x02))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -319,7 +330,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 		{0x01, 20},
 		{0x02, 30},
 	} {
-		bm, err := r.Lookup(ComposeKey(raw, tt.disc))
+		bm, err := r.Lookup(composeKey(raw, tt.disc))
 		if err != nil {
 			t.Fatalf("Lookup disc %d: %v", tt.disc, err)
 		}
@@ -339,7 +350,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 
 	// Build a small index.
 	w := NewWriter(WriterOptions{})
-	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
+	key := composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	w.Add(0, key)
 	w.Add(1, key)
 
@@ -413,28 +424,6 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	t.Logf("corruption detected: %v", err)
 }
 
-// TestComposeKey verifies the ComposeKey helper.
-func TestComposeKey(t *testing.T) {
-	key := []byte("hello")
-	composed := ComposeKey(key, 0x42)
-	if len(composed) != 6 {
-		t.Fatalf("len: got %d, want 6", len(composed))
-	}
-	if !bytes.Equal(composed[:5], key) {
-		t.Errorf("prefix: got %x, want %x", composed[:5], key)
-	}
-	if composed[5] != 0x42 {
-		t.Errorf("discriminator: got %x, want 0x42", composed[5])
-	}
-
-	// Different discriminators produce different composed keys.
-	c1 := ComposeKey(key, 0x00)
-	c2 := ComposeKey(key, 0x01)
-	if bytes.Equal(c1, c2) {
-		t.Error("different discriminators should produce different composed keys")
-	}
-}
-
 // TestCRC32CPackfileIntegrity verifies CRC32C is correctly written and verified
 // by manually checking a record's CRC32C.
 func TestCRC32CPackfileIntegrity(t *testing.T) {
@@ -443,7 +432,7 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	w := NewWriter(WriterOptions{})
-	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
+	key := composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	w.Add(0, key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -506,7 +495,7 @@ func TestLookupKeys(t *testing.T) {
 	for i := range keys {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 	}
 
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
@@ -529,23 +518,15 @@ func TestLookupKeys(t *testing.T) {
 		t.Fatalf("results length: got %d, want %d", len(results), len(query))
 	}
 
+	wantOrds := []uint32{0, 10, 49}
 	for i, bm := range results {
 		if bm == nil {
 			t.Errorf("result[%d] is nil", i)
 			continue
 		}
 		arr := bm.ToArray()
-		var wantOrd uint32
-		switch i {
-		case 0:
-			wantOrd = 0
-		case 1:
-			wantOrd = 10
-		case 2:
-			wantOrd = 49
-		}
-		if len(arr) != 1 || arr[0] != wantOrd {
-			t.Errorf("result[%d]: got %v, want [%d]", i, arr, wantOrd)
+		if len(arr) != 1 || arr[0] != wantOrds[i] {
+			t.Errorf("result[%d]: got %v, want [%d]", i, arr, wantOrds[i])
 		}
 	}
 }
@@ -553,7 +534,7 @@ func TestLookupKeys(t *testing.T) {
 func TestLookupKeysAllNotFound(t *testing.T) {
 	dir := t.TempDir()
 
-	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	keys := [][]byte{composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
 
 	r, err := Open(mphfPath, dataPath)
@@ -564,9 +545,9 @@ func TestLookupKeysAllNotFound(t *testing.T) {
 
 	// Query with keys that don't exist.
 	query := [][]byte{
-		ComposeKey(bytes.Repeat([]byte{0xAA}, 32), 0x00),
-		ComposeKey(bytes.Repeat([]byte{0xBB}, 32), 0x00),
-		ComposeKey(bytes.Repeat([]byte{0xCC}, 32), 0x00),
+		composeKey(bytes.Repeat([]byte{0xAA}, 32), 0x00),
+		composeKey(bytes.Repeat([]byte{0xBB}, 32), 0x00),
+		composeKey(bytes.Repeat([]byte{0xCC}, 32), 0x00),
 	}
 	results, err := r.LookupKeys(context.Background(), query)
 	if err != nil {
@@ -590,7 +571,7 @@ func TestLookupKeysMixedBatches(t *testing.T) {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
 		binary.BigEndian.PutUint32(raw[28:], uint32(i*7919))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 	}
 
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{BatchSize: 16})
@@ -602,7 +583,7 @@ func TestLookupKeysMixedBatches(t *testing.T) {
 	defer r.Close()
 
 	// Mix found and not-found keys from different batches.
-	nonExistent := ComposeKey(bytes.Repeat([]byte{0xFF}, 32), 0x00)
+	nonExistent := composeKey(bytes.Repeat([]byte{0xFF}, 32), 0x00)
 	query := [][]byte{keys[0], nonExistent, keys[50], keys[150], nonExistent}
 
 	results, err := r.LookupKeys(context.Background(), query)
@@ -645,7 +626,7 @@ func TestLookupKeysBatchCoalescing(t *testing.T) {
 	for i := range keys {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 	}
 
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
@@ -673,41 +654,6 @@ func TestLookupKeysBatchCoalescing(t *testing.T) {
 	}
 }
 
-func TestLookupKeysSingleBatch(t *testing.T) {
-	dir := t.TempDir()
-
-	// 5 keys, batch size 128 → all in batch 0.
-	keys := make([][]byte, 5)
-	for i := range keys {
-		raw := make([]byte, 32)
-		raw[0] = byte(i + 1)
-		keys[i] = ComposeKey(raw, 0x00)
-	}
-
-	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
-
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer r.Close()
-
-	results, err := r.LookupKeys(context.Background(), keys)
-	if err != nil {
-		t.Fatalf("LookupKeys: %v", err)
-	}
-
-	for i, bm := range results {
-		if bm == nil {
-			t.Errorf("result[%d] is nil", i)
-			continue
-		}
-		if bm.GetCardinality() != 1 {
-			t.Errorf("result[%d]: cardinality got %d, want 1", i, bm.GetCardinality())
-		}
-	}
-}
-
 func TestLookupKeysConcurrent(t *testing.T) {
 	dir := t.TempDir()
 
@@ -716,7 +662,7 @@ func TestLookupKeysConcurrent(t *testing.T) {
 	for i := range keys {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 	}
 
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
@@ -747,11 +693,11 @@ func TestLookupKeysConcurrent(t *testing.T) {
 			}
 			for i, bm := range results {
 				if bm == nil {
-					errs <- bytes.ErrTooLarge
+					errs <- fmt.Errorf("result[%d] is nil", start+i)
 					return
 				}
 				if !bm.Contains(uint32(start + i)) {
-					errs <- bytes.ErrTooLarge
+					errs <- fmt.Errorf("result[%d]: missing ordinal %d", start+i, start+i)
 					return
 				}
 			}
@@ -771,7 +717,7 @@ func TestLookupKeysConcurrent(t *testing.T) {
 func TestLookupKeysEmpty(t *testing.T) {
 	dir := t.TempDir()
 
-	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	keys := [][]byte{composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
 
 	r, err := Open(mphfPath, dataPath)
@@ -807,7 +753,7 @@ func TestCustomBatchSize(t *testing.T) {
 	for i := range keys {
 		raw := make([]byte, 32)
 		binary.BigEndian.PutUint32(raw, uint32(i))
-		keys[i] = ComposeKey(raw, 0x00)
+		keys[i] = composeKey(raw, 0x00)
 	}
 
 	// Use non-default batch size.
@@ -856,7 +802,7 @@ func TestMetadataValidation(t *testing.T) {
 	dir := t.TempDir()
 
 	// Build a valid index first.
-	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	keys := [][]byte{composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
 
 	// Verify it opens cleanly.
@@ -887,7 +833,7 @@ func TestMetadataFlags(t *testing.T) {
 	dir := t.TempDir()
 
 	// Build a valid index first to get a valid MPHF.
-	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	keys := [][]byte{composeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
 	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
 
 	// Read the valid packfile and tamper with metadata flags.
