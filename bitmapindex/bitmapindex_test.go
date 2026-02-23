@@ -94,6 +94,54 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPrefetchPath exercises the ReadAll→OpenBytes MPHF loading path
+// by passing a large WithExpectedLookups value on a small file.
+func TestPrefetchPath(t *testing.T) {
+	dir := t.TempDir()
+	mphfPath := filepath.Join(dir, "index.mphf")
+	dataPath := filepath.Join(dir, "index.bitmaps")
+
+	contractA := bytes.Repeat([]byte{0x01}, 32)
+	contractB := bytes.Repeat([]byte{0x02}, 32)
+
+	w := NewWriter(WriterOptions{})
+	w.Add(makeTestEvent(contractA), 0)
+	w.Add(makeTestEvent(contractA), 1)
+	w.Add(makeTestEvent(contractB), 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	// Large expectedLookups on a small file → prefetch path.
+	r, err := Open(mphfPath, dataPath, WithExpectedLookups(1000))
+	if err != nil {
+		t.Fatalf("Open with prefetch: %v", err)
+	}
+	defer r.Close()
+
+	bm, err := r.Lookup(FieldContractID, contractA)
+	if err != nil {
+		t.Fatalf("Lookup contractA: %v", err)
+	}
+	got := bm.ToArray()
+	if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("contractA: got %v, want [0 1]", got)
+	}
+
+	bm, err = r.Lookup(FieldContractID, contractB)
+	if err != nil {
+		t.Fatalf("Lookup contractB: %v", err)
+	}
+	got = bm.ToArray()
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("contractB: got %v, want [2]", got)
+	}
+}
+
 func TestNonMemberLookup(t *testing.T) {
 	dir := t.TempDir()
 	mphfPath := filepath.Join(dir, "index.mphf")

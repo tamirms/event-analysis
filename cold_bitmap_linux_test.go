@@ -46,7 +46,7 @@ func benchColdBitmapMPHF(b *testing.B, numLookups int) {
 		}
 		b.StartTimer()
 
-		r, err := bitmapindex.Open(mphfPath, dataPath)
+		r, err := bitmapindex.Open(mphfPath, dataPath, bitmapindex.WithExpectedLookups(numLookups))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -100,7 +100,7 @@ func benchColdBitmapMPHFLookupKeys(b *testing.B, numLookups int) {
 		}
 		b.StartTimer()
 
-		r, err := bitmapindex.Open(mphfPath, dataPath)
+		r, err := bitmapindex.Open(mphfPath, dataPath, bitmapindex.WithExpectedLookups(numLookups))
 		if err != nil {
 			b.Fatal(err)
 		}
