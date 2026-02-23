@@ -263,6 +263,46 @@ func TestChecksumDetectsBitFlip(t *testing.T) {
 	}
 }
 
+// TestWithoutChecksum verifies that WithoutChecksum produces valid frames
+// and that bit flips in the compressed payload are NOT detected (no checksum).
+func TestWithoutChecksum(t *testing.T) {
+	data := make([]byte, 4096)
+	rand.Read(data)
+
+	c := NewCompressor(WithoutChecksum())
+	defer c.Close()
+
+	compressed, err := c.Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	saved := make([]byte, len(compressed))
+	copy(saved, compressed)
+
+	// Round-trip must work.
+	got, err := Decode(nil, saved)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("round-trip mismatch")
+	}
+
+	// Without checksum, a bit flip in the block area may decode without error
+	// (producing wrong data) rather than being caught. Flip the same position
+	// as TestChecksumDetectsBitFlip.
+	corrupted := make([]byte, len(saved))
+	copy(corrupted, saved)
+	corrupted[len(corrupted)/2] ^= 0x01
+
+	result, err := Decode(nil, corrupted)
+	if err == nil && bytes.Equal(result, data) {
+		t.Fatal("bit-flipped data decoded to identical output — checksum may still be enabled")
+	}
+	// Either err != nil (zstd block structure broken) or result != data (silent corruption).
+	// Both are acceptable without checksum; the key is we don't guarantee detection.
+}
+
 // TestConcurrentInstances verifies that independent Compressor/Decompressor
 // instances work correctly from multiple goroutines simultaneously.
 // This mirrors the sync.Pool usage in eventstore/reader.go.

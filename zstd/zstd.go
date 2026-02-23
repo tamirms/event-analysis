@@ -47,8 +47,25 @@ type Compressor struct {
 	scratch []byte
 }
 
-// NewCompressor creates a new Compressor with content checksums enabled.
-func NewCompressor() *Compressor {
+// CompressorOption configures a Compressor.
+type CompressorOption func(*compressorConfig)
+
+type compressorConfig struct {
+	checksum bool
+}
+
+// WithoutChecksum disables the zstd content checksum.
+// Use when the caller provides its own integrity check (e.g., CRC32C).
+func WithoutChecksum() CompressorOption {
+	return func(cfg *compressorConfig) { cfg.checksum = false }
+}
+
+// NewCompressor creates a new Compressor. By default content checksums are enabled.
+func NewCompressor(opts ...CompressorOption) *Compressor {
+	cfg := compressorConfig{checksum: true}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	ctx := C.ZSTD_createCCtx()
 	if ctx == nil {
 		panic("zstd: ZSTD_createCCtx returned NULL (out of memory)")
@@ -57,7 +74,11 @@ func NewCompressor() *Compressor {
 		C.ZSTD_freeCCtx(ctx)
 		panic("zstd: set compression level: " + C.GoString(C.ZSTD_getErrorName(rc)))
 	}
-	if rc := C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_checksumFlag, 1); C.ZSTD_isError(rc) != 0 {
+	var flag C.int
+	if cfg.checksum {
+		flag = 1
+	}
+	if rc := C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_checksumFlag, flag); C.ZSTD_isError(rc) != 0 {
 		C.ZSTD_freeCCtx(ctx)
 		panic("zstd: set checksum flag: " + C.GoString(C.ZSTD_getErrorName(rc)))
 	}

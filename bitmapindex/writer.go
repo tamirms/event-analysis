@@ -192,7 +192,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 
 	if numWorkers <= 1 {
 		// Serial path.
-		enc := zstd.NewCompressor()
+		enc := zstd.NewCompressor(zstd.WithoutChecksum())
 		defer enc.Close()
 		for i := range totalKeys {
 			if err := prepareBitmap(i, enc); err != nil {
@@ -217,7 +217,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				enc := zstd.NewCompressor()
+				enc := zstd.NewCompressor(zstd.WithoutChecksum())
 				defer enc.Close()
 
 				for i := range ch {
