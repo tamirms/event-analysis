@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tamir/events-analysis/bitmapindex"
+	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/eventstore"
 )
 
@@ -87,31 +88,46 @@ func TestBitmapIndexIntegration(t *testing.T) {
 	}
 	defer er.Close()
 
+	allFields := []bitmapindex.Field{
+		bitmapindex.FieldContractID,
+		bitmapindex.FieldTopic0,
+		bitmapindex.FieldTopic1,
+		bitmapindex.FieldTopic2,
+		bitmapindex.FieldTopic3,
+	}
+
 	// Count unique keys per field by scanning all events.
 	fieldKeys := make([]map[string]struct{}, len(allFields))
 	for i := range allFields {
 		fieldKeys[i] = make(map[string]struct{})
 	}
 
-	for event, err := range er.ReadEvents(0, er.EventCount()) {
+	var ev event.Event
+	for data, err := range er.ReadEvents(0, er.EventCount()) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i, f := range allFields {
-			key := extractKey(event, f)
-			if key != nil {
-				fieldKeys[i][string(key)] = struct{}{}
+		if err := event.Unmarshal(data, &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.ContractID != nil {
+			fieldKeys[0][string(ev.ContractID)] = struct{}{}
+		}
+		for i, topic := range ev.Topics {
+			if i >= 4 {
+				break
 			}
+			fieldKeys[1+i][string(topic)] = struct{}{}
 		}
 	}
 
 	// Verify per-field key counts against known dataset values.
-	expectedFieldCounts := map[field]int{
-		fieldContractID: 8358,
-		fieldTopic0:     172,
-		fieldTopic1:     401110,
-		fieldTopic2:     176309,
-		fieldTopic3:     7112,
+	expectedFieldCounts := map[bitmapindex.Field]int{
+		bitmapindex.FieldContractID: 8358,
+		bitmapindex.FieldTopic0:     172,
+		bitmapindex.FieldTopic1:     401110,
+		bitmapindex.FieldTopic2:     176309,
+		bitmapindex.FieldTopic3:     7112,
 	}
 
 	totalKeys := 0
@@ -129,13 +145,15 @@ func TestBitmapIndexIntegration(t *testing.T) {
 
 	// Spot-check: find the dominant contract ID and verify bitmap cardinality.
 	contractCounts := make(map[string]uint64, 10000)
-	for event, err := range er.ReadEvents(0, er.EventCount()) {
+	for data, err := range er.ReadEvents(0, er.EventCount()) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cid := extractKey(event, fieldContractID)
-		if cid != nil {
-			contractCounts[string(cid)]++
+		if err := event.Unmarshal(data, &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.ContractID != nil {
+			contractCounts[string(ev.ContractID)]++
 		}
 	}
 
@@ -149,7 +167,7 @@ func TestBitmapIndexIntegration(t *testing.T) {
 	}
 	t.Logf("dominant contract: %d events", maxCount)
 
-	bm, err := r.Lookup(composeKey([]byte(maxContract), fieldContractID))
+	bm, err := r.Lookup(bitmapindex.FieldContractID, []byte(maxContract))
 	if err != nil {
 		t.Fatalf("Lookup dominant contract: %v", err)
 	}

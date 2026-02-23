@@ -15,10 +15,10 @@ type ReadAtCloser interface {
 }
 
 const (
-	magic         = 0x534C4348
-	version       = 1
-	groupInterval = 128
-	trailerSize   = 32
+	magic     = 0x534C4348 // "SLCH"
+	version   = 1
+	groupSize = 128
+	trailerSize = 32
 )
 
 // Trailer holds the parsed trailer fields.

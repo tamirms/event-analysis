@@ -6,17 +6,20 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
-	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
 
+	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/packfile"
 	"github.com/tamir/events-analysis/zstd"
 )
+
+const defaultBatchSize = 128
 
 // WriterOptions configures Writer behavior.
 type WriterOptions struct {
@@ -37,14 +40,33 @@ func NewWriter(opts WriterOptions) *Writer {
 	if bs <= 0 {
 		bs = defaultBatchSize
 	}
+	if bs > 65535 {
+		bs = 65535
+	}
+	hint := opts.CapacityHint
+	if hint < 0 {
+		hint = 0
+	}
 	return &Writer{
-		bitmaps:   make(map[[16]byte]*roaring.Bitmap, opts.CapacityHint),
+		bitmaps:   make(map[[16]byte]*roaring.Bitmap, hint),
 		batchSize: bs,
 	}
 }
 
-// Add records that the event at ordinal has the given key.
-func (w *Writer) Add(ordinal uint32, key []byte) {
+// Add indexes all fields of ev (ContractID and up to 4 topics) under the given ordinal.
+func (w *Writer) Add(ev *event.Event, id uint32) {
+	var buf [256]byte
+	if ev.ContractID != nil {
+		w.add(id, composeKey(buf[:0], ev.ContractID, FieldContractID))
+	}
+	topicCount := min(len(ev.Topics), int(fieldCount)-int(FieldTopic0))
+	for i := range topicCount {
+		w.add(id, composeKey(buf[:0], ev.Topics[i], FieldTopic0+Field(i)))
+	}
+}
+
+// add records that the event at ordinal has the given composed key.
+func (w *Writer) add(ordinal uint32, key []byte) {
 	var hk [16]byte
 	streamhash.PreHashInPlace(key, hk[:])
 	bm := w.bitmaps[hk]
@@ -56,7 +78,7 @@ func (w *Writer) Add(ordinal uint32, key []byte) {
 }
 
 // Finish builds the MPHF and packfile, writing them to the given paths.
-func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
+func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err error) {
 	totalKeys := len(w.bitmaps)
 	if totalKeys == 0 {
 		return fmt.Errorf("bitmapindex: no keys to index")
@@ -78,6 +100,14 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 	if err != nil {
 		return fmt.Errorf("bitmapindex: create MPHF builder: %w", err)
 	}
+
+	// Cleanup partial MPHF file on any subsequent failure.
+	defer func() {
+		if err != nil {
+			os.Remove(mphfPath)
+		}
+	}()
+
 	for _, hk := range sortedKeys {
 		if err := builder.AddKey(hk[:], 0); err != nil {
 			builder.Close()
@@ -93,6 +123,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 	if err != nil {
 		return fmt.Errorf("bitmapindex: open MPHF for ranking: %w", err)
 	}
+	defer idx.Close()
 
 	type rankedEntry struct {
 		fingerprint [4]byte
@@ -103,7 +134,6 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 	for _, hk := range sortedKeys {
 		rank, err := idx.Query(hk[:])
 		if err != nil {
-			idx.Close()
 			return fmt.Errorf("bitmapindex: query MPHF for rank: %w", err)
 		}
 		ranked[rank] = rankedEntry{
@@ -111,7 +141,6 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 			bitmap:      w.bitmaps[hk],
 		}
 	}
-	idx.Close()
 
 	// Free the original map — bitmaps are now owned by ranked[].
 	w.bitmaps = nil
@@ -135,8 +164,12 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 		numWorkers = totalKeys
 	}
 
+	prepCtx, prepCancel := context.WithCancel(ctx)
+	defer prepCancel()
+
 	var wg sync.WaitGroup
-	var firstErr atomic.Pointer[error]
+	var errOnce sync.Once
+	var firstErr error
 	for range numWorkers {
 		wg.Add(1)
 		go func() {
@@ -145,18 +178,27 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 			defer enc.Close()
 
 			for i := range ch {
+				if prepCtx.Err() != nil {
+					return
+				}
 				entry := &ranked[i]
 				entry.bitmap.RunOptimize()
 				raw, err := entry.bitmap.ToBytes()
 				if err != nil {
-					firstErr.CompareAndSwap(nil, &err)
+					errOnce.Do(func() { firstErr = err })
+					prepCancel()
 					return
 				}
 				entry.bitmap = nil // free bitmap memory
 
 				pb := preparedBitmap{fingerprint: entry.fingerprint}
 				if len(raw) >= 256 {
-					compressed := enc.Encode(raw)
+					compressed, encErr := enc.Encode(raw)
+					if encErr != nil {
+						errOnce.Do(func() { firstErr = encErr })
+						prepCancel()
+						return
+					}
 					if len(compressed) < len(raw) {
 						pb.flags = flagCompressed
 						pb.data = make([]byte, len(compressed))
@@ -172,8 +214,8 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) error {
 	}
 	wg.Wait()
 
-	if ep := firstErr.Load(); ep != nil {
-		return fmt.Errorf("bitmapindex: record preparation: %w", *ep)
+	if firstErr != nil {
+		return fmt.Errorf("bitmapindex: record preparation: %w", firstErr)
 	}
 
 	// Group into batch records and write to packfile.

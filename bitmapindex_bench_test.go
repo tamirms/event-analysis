@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tamir/events-analysis/bitmapindex"
+	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/eventstore"
 )
 
@@ -25,9 +26,8 @@ var (
 )
 
 type bitmapSampleKey struct {
-	field   field  // local type from bitmap_helpers_test.go
-	key     []byte // raw key for RocksDB
-	mphfKey []byte // pre-composed key for MPHF (key || field_byte)
+	Field bitmapindex.Field
+	Key   []byte
 }
 
 func setupBitmapBenchData(b *testing.B) {
@@ -129,31 +129,52 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 	}
 	defer er.Close()
 
-	seen := make(map[string]struct{}, 10000)
+	type fieldKey struct {
+		field bitmapindex.Field
+		key   string
+	}
+	seen := make(map[fieldKey]struct{}, 10000)
 	sampleCount := min(50000, er.EventCount())
 
-	for event, err := range er.ReadEvents(0, sampleCount) {
+	var ev event.Event
+	for data, err := range er.ReadEvents(0, sampleCount) {
 		if err != nil {
 			return fmt.Errorf("read event for sampling: %w", err)
 		}
-		for _, f := range allFields {
-			key := extractKey(event, f)
-			if key == nil {
+		if err := event.Unmarshal(data, &ev); err != nil {
+			return fmt.Errorf("unmarshal event for sampling: %w", err)
+		}
+
+		// Extract all fields from the parsed event.
+		type candidate struct {
+			f   bitmapindex.Field
+			key []byte
+		}
+		var candidates [5]candidate
+		n := 0
+		if ev.ContractID != nil {
+			candidates[n] = candidate{bitmapindex.FieldContractID, ev.ContractID}
+			n++
+		}
+		for i, topic := range ev.Topics {
+			if i >= 4 {
+				break
+			}
+			candidates[n] = candidate{bitmapindex.FieldTopic0 + bitmapindex.Field(i), topic}
+			n++
+		}
+
+		for _, c := range candidates[:n] {
+			fk := fieldKey{field: c.f, key: string(c.key)}
+			if _, ok := seen[fk]; ok {
 				continue
 			}
-			// Deduplicate by field+key.
-			dedup := string(append([]byte{byte(f)}, key...))
-			if _, ok := seen[dedup]; ok {
-				continue
-			}
-			seen[dedup] = struct{}{}
-			// Copy key since event slices are reused by iterator.
-			keyCopy := make([]byte, len(key))
-			copy(keyCopy, key)
+			seen[fk] = struct{}{}
+			keyCopy := make([]byte, len(c.key))
+			copy(keyCopy, c.key)
 			bitmapSampleKeys = append(bitmapSampleKeys, bitmapSampleKey{
-				field:   f,
-				key:     keyCopy,
-				mphfKey: composeKey(keyCopy, f),
+				Field: c.f,
+				Key:   keyCopy,
 			})
 		}
 	}
@@ -179,7 +200,7 @@ func BenchmarkBitmapMPHFLookup(b *testing.B) {
 
 	for i := range b.N {
 		k := keys[i%len(keys)]
-		bm, err := r.Lookup(k.mphfKey)
+		bm, err := r.Lookup(k.Field, k.Key)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -201,7 +222,7 @@ func BenchmarkBitmapRocksDBLookup(b *testing.B) {
 
 	for i := range b.N {
 		k := keys[i%len(keys)]
-		bm, err := r.Lookup(k.field, k.key)
+		bm, err := r.Lookup(k.Field, k.Key)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -227,7 +248,7 @@ func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
 			k := keys[rng.Intn(len(keys))]
-			bm, err := r.Lookup(k.mphfKey)
+			bm, err := r.Lookup(k.Field, k.Key)
 			if err != nil {
 				b.Error(err)
 				return
@@ -250,12 +271,13 @@ func BenchmarkBitmapMPHFLookupKeys15(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 
 	// Pre-generate batches of 15 keys.
-	type batch [15][]byte
+	type batch [15]bitmapindex.FieldKey
 	const numBatches = 1024
 	batches := make([]batch, numBatches)
 	for i := range batches {
 		for j := range 15 {
-			batches[i][j] = keys[rng.Intn(len(keys))].mphfKey
+			k := keys[rng.Intn(len(keys))]
+			batches[i][j] = bitmapindex.FieldKey{Field: k.Field, Key: k.Key}
 		}
 	}
 
@@ -288,7 +310,7 @@ func BenchmarkBitmapRocksDBParallel15(b *testing.B) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
 			k := keys[rng.Intn(len(keys))]
-			bm, err := r.Lookup(k.field, k.key)
+			bm, err := r.Lookup(k.Field, k.Key)
 			if err != nil {
 				b.Error(err)
 				return

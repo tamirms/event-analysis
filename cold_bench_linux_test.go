@@ -11,7 +11,6 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
 	"golang.org/x/sys/unix"
 )
@@ -105,32 +104,12 @@ func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
 
 func BenchmarkColdPackfileReadIndices1(b *testing.B)   { benchColdPackfileReadIndices(b, 1) }
 func BenchmarkColdPackfileReadIndices4(b *testing.B)   { benchColdPackfileReadIndices(b, 4) }
-func BenchmarkColdPackfileReadIndices(b *testing.B)    { benchColdPackfileReadIndices(b, 8) }
+func BenchmarkColdPackfileReadIndices8(b *testing.B)   { benchColdPackfileReadIndices(b, 8) }
 func BenchmarkColdPackfileReadIndices16(b *testing.B)  { benchColdPackfileReadIndices(b, 16) }
 func BenchmarkColdPackfileReadIndices32(b *testing.B)  { benchColdPackfileReadIndices(b, 32) }
 func BenchmarkColdPackfileReadIndices64(b *testing.B)  { benchColdPackfileReadIndices(b, 64) }
 func BenchmarkColdPackfileReadIndices128(b *testing.B) { benchColdPackfileReadIndices(b, 128) }
 
-// openOptimizedRocksDB opens a RocksDB with all applicable optimizations for
-// scattered point reads: skipped stats/size checks, no block cache.
-func openOptimizedRocksDB(path string) (*grocksdb.DB, *grocksdb.Options, error) {
-	opts := grocksdb.NewDefaultOptions()
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetNoBlockCache(true)
-	bbto.SetFormatVersion(5)
-	opts.SetBlockBasedTableFactory(bbto)
-	bbto.Destroy()
-	opts.SetSkipStatsUpdateOnDBOpen(true)
-	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
-	opts.SetMaxFileOpeningThreads(1)
-	opts.SetDisableAutoCompactions(true)
-	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
-	if err != nil {
-		opts.Destroy()
-		return nil, nil, err
-	}
-	return db, opts, nil
-}
 
 func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	setupBenchData(b)
@@ -153,7 +132,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 		binary.BigEndian.PutUint32(keys[i], uint32(idx))
 	}
 
-	ro := rocksMultiGetReadOpts()
+	ro := newBenchReadOptions()
 	ro.SetAsyncIO(true)
 	defer ro.Destroy()
 
@@ -164,7 +143,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 		}
 		b.StartTimer()
 
-		db, dbOpts, err := openOptimizedRocksDB(rdbPath)
+		db, dbOpts, err := openReadOnlyRocksDB(rdbPath)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -177,7 +156,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	}
 }
 
-func BenchmarkColdRocksDBReadIndices(b *testing.B)   { benchColdRocksDBReadIndices(b, 1) }
+func BenchmarkColdRocksDBReadIndices1(b *testing.B)  { benchColdRocksDBReadIndices(b, 1) }
 func BenchmarkColdRocksDBReadIndices8(b *testing.B)  { benchColdRocksDBReadIndices(b, 8) }
 func BenchmarkColdRocksDBReadIndices32(b *testing.B) { benchColdRocksDBReadIndices(b, 32) }
 func BenchmarkColdRocksDBReadIndices64(b *testing.B) { benchColdRocksDBReadIndices(b, 64) }

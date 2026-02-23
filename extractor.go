@@ -7,6 +7,8 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/tamir/events-analysis/event"
 )
 
 const MainnetPassphrase = "Public Global Stellar Network ; September 2015"
@@ -14,7 +16,7 @@ const MainnetPassphrase = "Public Global Stellar Network ; September 2015"
 // ExtractEvents extracts non-diagnostic events from decompressed LedgerCloseMeta XDR bytes.
 // The events slice is reused across calls — pass the previous result back in to avoid allocations.
 // The returned slice is only valid until the next call.
-func ExtractEvents(ledgerXDR []byte, events []IngestEvent) ([]IngestEvent, error) {
+func ExtractEvents(ledgerXDR []byte, events []event.Event) ([]event.Event, error) {
 	events = events[:0]
 
 	var lcm xdr.LedgerCloseMeta
@@ -57,43 +59,11 @@ func ExtractEvents(ledgerXDR []byte, events []IngestEvent) ([]IngestEvent, error
 			if ev.Event.Type == xdr.ContractEventTypeDiagnostic {
 				continue
 			}
-
-			var contractID []byte
-			var topics [][]byte
-			var dataBytes []byte
-
-			if ev.Event.ContractId != nil {
-				contractID = ev.Event.ContractId[:]
+			parsed, err := makeEventFromXDR(ev.Event, txHash, ledgerSeq, uint32(tx.Index), 0xFFFF, uint16(eventIndex), ledgerCloseTime, txSuccessful)
+			if err != nil {
+				return events, err
 			}
-			if ev.Event.Body.V == 0 {
-				body := ev.Event.Body.MustV0()
-				for _, topic := range body.Topics {
-					topicBytes, err := topic.MarshalBinary()
-					if err != nil {
-						return events, fmt.Errorf("failed to marshal topic: %w", err)
-					}
-					topics = append(topics, topicBytes)
-				}
-				var err error
-				dataBytes, err = body.Data.MarshalBinary()
-				if err != nil {
-					return events, fmt.Errorf("failed to marshal event data: %w", err)
-				}
-			}
-
-			events = append(events, IngestEvent{
-				LedgerSequence:   ledgerSeq,
-				TransactionIndex: uint32(tx.Index),
-				OperationIndex:   0xFFFF,
-				EventIndex:       uint16(eventIndex),
-				ContractID:       contractID,
-				Topics:           topics,
-				TxHash:           txHash,
-				EventType:        int(ev.Event.Type),
-				DataBytes:        dataBytes,
-				LedgerClosedAt:   ledgerCloseTime,
-				Successful:       txSuccessful,
-			})
+			events = append(events, parsed)
 		}
 
 		// Operation-level events
@@ -102,46 +72,56 @@ func ExtractEvents(ledgerXDR []byte, events []IngestEvent) ([]IngestEvent, error
 				if ev.Type == xdr.ContractEventTypeDiagnostic {
 					continue
 				}
-
-				var contractID []byte
-				var topics [][]byte
-				var dataBytes []byte
-
-				if ev.ContractId != nil {
-					contractID = ev.ContractId[:]
+				parsed, err := makeEventFromXDR(ev, txHash, ledgerSeq, uint32(tx.Index), uint16(opIndex), uint16(eventIndex), ledgerCloseTime, txSuccessful)
+				if err != nil {
+					return events, err
 				}
-				if ev.Body.V == 0 {
-					body := ev.Body.MustV0()
-					for _, topic := range body.Topics {
-						topicBytes, err := topic.MarshalBinary()
-						if err != nil {
-							return events, fmt.Errorf("failed to marshal topic: %w", err)
-						}
-						topics = append(topics, topicBytes)
-					}
-					var err error
-					dataBytes, err = body.Data.MarshalBinary()
-					if err != nil {
-						return events, fmt.Errorf("failed to marshal event data: %w", err)
-					}
-				}
-
-				events = append(events, IngestEvent{
-					LedgerSequence:   ledgerSeq,
-					TransactionIndex: uint32(tx.Index),
-					OperationIndex:   uint16(opIndex),
-					EventIndex:       uint16(eventIndex),
-					ContractID:       contractID,
-					Topics:           topics,
-					TxHash:           txHash,
-					EventType:        int(ev.Type),
-					DataBytes:        dataBytes,
-					LedgerClosedAt:   ledgerCloseTime,
-					Successful:       txSuccessful,
-				})
+				events = append(events, parsed)
 			}
 		}
 	}
 
 	return events, nil
+}
+
+func makeEventFromXDR(xdrEvent xdr.ContractEvent, txHash []byte,
+	ledgerSeq uint32, txIdx uint32, opIdx uint16, eventIdx uint16,
+	closeTime time.Time, successful bool) (event.Event, error) {
+
+	var contractID []byte
+	var topics [][]byte
+	var dataBytes []byte
+
+	if xdrEvent.ContractId != nil {
+		contractID = xdrEvent.ContractId[:]
+	}
+	if xdrEvent.Body.V == 0 {
+		body := xdrEvent.Body.MustV0()
+		for _, topic := range body.Topics {
+			topicBytes, err := topic.MarshalBinary()
+			if err != nil {
+				return event.Event{}, fmt.Errorf("failed to marshal topic: %w", err)
+			}
+			topics = append(topics, topicBytes)
+		}
+		var err error
+		dataBytes, err = body.Data.MarshalBinary()
+		if err != nil {
+			return event.Event{}, fmt.Errorf("failed to marshal event data: %w", err)
+		}
+	}
+
+	return event.Event{
+		LedgerSequence:   ledgerSeq,
+		TransactionIndex: txIdx,
+		OperationIndex:   opIdx,
+		EventIndex:       eventIdx,
+		ContractID:       contractID,
+		Topics:           topics,
+		TxHash:           txHash,
+		EventType:        event.Type(xdrEvent.Type),
+		DataBytes:        dataBytes,
+		LedgerClosedAt:   closeTime,
+		Successful:       successful,
+	}, nil
 }

@@ -49,7 +49,7 @@ func (bb *blockBuf) decode(data []byte, n int, noCompress bool) error {
 		bb.decompressed = decoded
 	}
 	var err error
-	bb.sizes, bb.padded, _, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
+	bb.sizes, bb.padded, err = decodeBlock(bb.decompressed, n, bb.sizes, bb.padded)
 	if err != nil {
 		return err
 	}
@@ -162,23 +162,23 @@ func (r *Reader) eventsInBlock(blockIdx int) int {
 }
 
 // decodeBlock parses the trailing FOR index from a decompressed block.
-// Returns event sizes, the reusable padded scratch buffer, and the byte
-// offset where event data ends. Callers must reassign both sizes and padded
-// from the return values to benefit from buffer reuse.
-func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, []byte, int, error) {
+// Returns event sizes and the reusable padded scratch buffer.
+// Callers must reassign both sizes and padded from the return values
+// to benefit from buffer reuse.
+func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, []byte, error) {
 	if len(raw) < 6 { // minimum: 1 event byte + 4B min + 1B W
-		return sizes, padded, 0, fmt.Errorf("eventstore: block too small (%d bytes)", len(raw))
+		return sizes, padded, fmt.Errorf("eventstore: block too small (%d bytes)", len(raw))
 	}
 
 	w := raw[len(raw)-1] // W is the last byte
 	if w > 32 {
-		return sizes, padded, 0, fmt.Errorf("eventstore: invalid FOR width %d in block (max 32)", w)
+		return sizes, padded, fmt.Errorf("eventstore: invalid FOR width %d in block (max 32)", w)
 	}
 	packSize := (int(w)*n + 7) / 8
 	indexSize := 4 + packSize + 1 // min(4) + packed + W(1)
 
 	if indexSize > len(raw) {
-		return sizes, padded, 0, fmt.Errorf("eventstore: index size %d exceeds block size %d", indexSize, len(raw))
+		return sizes, padded, fmt.Errorf("eventstore: index size %d exceeds block size %d", indexSize, len(raw))
 	}
 
 	indexStart := len(raw) - indexSize
@@ -203,10 +203,10 @@ func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, []
 		sum += int(s)
 	}
 	if sum != dataEnd {
-		return sizes, padded, 0, fmt.Errorf("eventstore: size sum %d != data end %d", sum, dataEnd)
+		return sizes, padded, fmt.Errorf("eventstore: size sum %d != data end %d", sum, dataEnd)
 	}
 
-	return sizes, padded, dataEnd, nil
+	return sizes, padded, nil
 }
 
 // ReadEvent reads a single event by global index.
@@ -303,11 +303,11 @@ type indicesWork struct {
 
 // blockRange maps a block to its slice of requested indices.
 // Since indices are sorted, all indices for a given block are contiguous
-// in the original indices slice — represented as [idxStart, idxEnd).
+// in the original indices slice — represented as [inputStart, inputEnd).
 type blockRange struct {
-	blockIdx int
-	idxStart int // start index into indices[]
-	idxEnd   int // end index into indices[]
+	blockIdx   int
+	inputStart int // start index into indices[]
+	inputEnd   int // end index into indices[]
 }
 
 func (w *indicesWork) reset(n int) {
@@ -351,14 +351,14 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			blkIdx := idx / r.blockN
 			if blkIdx != prevBlockIdx {
 				if len(w.blocks) > 0 {
-					w.blocks[len(w.blocks)-1].idxEnd = i
+					w.blocks[len(w.blocks)-1].inputEnd = i
 				}
-				w.blocks = append(w.blocks, blockRange{blockIdx: blkIdx, idxStart: i})
+				w.blocks = append(w.blocks, blockRange{blockIdx: blkIdx, inputStart: i})
 				prevBlockIdx = blkIdx
 			}
 		}
 		if len(w.blocks) > 0 {
-			w.blocks[len(w.blocks)-1].idxEnd = len(indices)
+			w.blocks[len(w.blocks)-1].inputEnd = len(indices)
 		}
 
 		// Phase 2: fixed worker pool, each worker steals blocks via atomic counter.
@@ -432,7 +432,7 @@ func (r *Reader) processBlock(w *indicesWork, bi int, indices []int, bb *blockBu
 	if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx), r.noCompress); err != nil {
 		return err
 	}
-	for j := blk.idxStart; j < blk.idxEnd; j++ {
+	for j := blk.inputStart; j < blk.inputEnd; j++ {
 		w.events[j] = bb.event(indices[j] % r.blockN)
 	}
 	return nil

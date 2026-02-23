@@ -16,21 +16,10 @@ import (
 )
 
 // openNoCompRocksDB opens a RocksDB for read-only access with no block cache.
-// Returns db, opts, and a cleanup function that closes/destroys all resources.
+// Returns db and a cleanup function that closes/destroys all resources.
 func openNoCompRocksDB(path string) (*grocksdb.DB, func(), error) {
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetSkipStatsUpdateOnDBOpen(true)
-	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
-	opts.SetMaxFileOpeningThreads(1)
-	opts.SetDisableAutoCompactions(true)
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetNoBlockCache(true)
-	bbto.SetFormatVersion(5)
-	opts.SetBlockBasedTableFactory(bbto)
-	bbto.Destroy()
-	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
+	db, opts, err := openReadOnlyRocksDB(path)
 	if err != nil {
-		opts.Destroy()
 		return nil, nil, err
 	}
 	cleanup := func() {

@@ -10,7 +10,7 @@ import (
 
 const (
 	readBufSize  = 1 << 20     // 1MB
-	specReadSize = 256 * 1024 // 256KB speculative read for Open
+	speculativeReadSize = 256 * 1024 // 256KB speculative read for Open
 )
 
 var readBufPool = sync.Pool{
@@ -57,19 +57,19 @@ func Open(path string) (*Reader, error) {
 		return nil, ErrSize
 	}
 
-	// Speculative read: last min(specReadSize, fileSize) bytes.
-	specSize := int64(specReadSize)
-	if specSize > fileSize {
-		specSize = fileSize
+	// Speculative read: last min(speculativeReadSize, fileSize) bytes.
+	speculativeSize := int64(speculativeReadSize)
+	if speculativeSize > fileSize {
+		speculativeSize = fileSize
 	}
-	specOff := fileSize - specSize
-	specBuf := make([]byte, specSize)
-	if _, err := f.ReadAt(specBuf, specOff); err != nil {
+	speculativeOff := fileSize - speculativeSize
+	speculativeBuf := make([]byte, speculativeSize)
+	if _, err := f.ReadAt(speculativeBuf, speculativeOff); err != nil {
 		return nil, err
 	}
 
-	// Parse trailer from last 32 bytes of specBuf.
-	tb := specBuf[len(specBuf)-trailerSize:]
+	// Parse trailer from last 32 bytes of speculativeBuf.
+	tb := speculativeBuf[len(speculativeBuf)-trailerSize:]
 
 	m := binary.LittleEndian.Uint32(tb[0:])
 	if m != magic {
@@ -93,26 +93,26 @@ func Open(path string) (*Reader, error) {
 		return nil, ErrSize
 	}
 
-	// Tail = index + metadata + trailer. Check if specBuf captured it all.
+	// Tail = index + metadata + trailer. Check if speculativeBuf captured it all.
 	tailSize := int64(indexSize) + int64(metadataSize) + int64(trailerSize)
 
 	var indexBuf []byte
 	var metadata []byte
 
-	if tailSize <= specSize {
-		// Everything is in specBuf — no additional reads needed.
-		tailStart := len(specBuf) - int(tailSize)
+	if tailSize <= speculativeSize {
+		// Everything is in speculativeBuf — no additional reads needed.
+		tailStart := len(speculativeBuf) - int(tailSize)
 
 		indexBuf = make([]byte, indexSize+7) // +7 for safe 8-byte overshoot
-		copy(indexBuf, specBuf[tailStart:tailStart+indexSize])
+		copy(indexBuf, speculativeBuf[tailStart:tailStart+indexSize])
 
 		if metadataSize > 0 {
 			metadata = make([]byte, metadataSize)
 			metaStart := tailStart + indexSize
-			copy(metadata, specBuf[metaStart:metaStart+metadataSize])
+			copy(metadata, speculativeBuf[metaStart:metaStart+metadataSize])
 		}
 	} else {
-		// Index + metadata too large for specBuf — single fallback read.
+		// Index + metadata too large for speculativeBuf — single fallback read.
 		readSize := indexSize + metadataSize
 		buf := make([]byte, readSize+7) // +7 for safe 8-byte overshoot in DecodeGroup
 		if readSize > 0 {
@@ -157,7 +157,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
 	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
 	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
-	maxRecords := maxGroups * groupInterval
+	maxRecords := maxGroups * groupSize
 	if recordCount > maxRecords {
 		return nil, fmt.Errorf("%w: recordCount %d implausible for indexSize %d", ErrCorrupt, recordCount, indexSize)
 	}
@@ -174,13 +174,13 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	pos := 0
 	offset := int64(0)
 
-	groupCount := (recordCount + groupInterval - 1) / groupInterval
+	groupCount := (recordCount + groupSize - 1) / groupSize
 
 	var values []uint32
 	for g := range groupCount {
-		limit := groupInterval
-		if g == groupCount-1 && recordCount%groupInterval != 0 {
-			limit = recordCount % groupInterval
+		limit := groupSize
+		if g == groupCount-1 && recordCount%groupSize != 0 {
+			limit = recordCount % groupSize
 		}
 
 		if pos > payloadLen {

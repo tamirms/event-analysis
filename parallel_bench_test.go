@@ -178,17 +178,7 @@ func dirSize(path string) int64 {
 
 func openRocksDB(b *testing.B) *grocksdb.DB {
 	b.Helper()
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetSkipStatsUpdateOnDBOpen(true)
-	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
-	opts.SetMaxFileOpeningThreads(1)
-	opts.SetDisableAutoCompactions(true)
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetNoBlockCache(true)
-	bbto.SetFormatVersion(5)
-	opts.SetBlockBasedTableFactory(bbto)
-	bbto.Destroy()
-	db, err := grocksdb.OpenDbForReadOnly(opts, rocksDBPath, false)
+	db, opts, err := openReadOnlyRocksDB(rocksDBPath)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -196,14 +186,6 @@ func openRocksDB(b *testing.B) *grocksdb.DB {
 	return db
 }
 
-// rocksReadOpts returns ReadOptions with checksum verification disabled,
-// matching packfile which relies on zstd's built-in content checksum only.
-func rocksReadOpts() *grocksdb.ReadOptions {
-	ro := grocksdb.NewDefaultReadOptions()
-	ro.SetVerifyChecksums(false)
-	ro.SetFillCache(false)
-	return ro
-}
 
 // --- Sequential read benchmarks ---
 
@@ -236,7 +218,7 @@ func BenchmarkRocksDBSeqRead(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := rocksReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	it := db.NewIterator(ro)
@@ -287,7 +269,7 @@ func BenchmarkRocksDBRandomRead(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := rocksReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	rng := rand.New(rand.NewSource(42))
@@ -343,7 +325,7 @@ func BenchmarkRocksDBParallelRead(b *testing.B) {
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		ro := rocksReadOpts()
+		ro := newBenchReadOptions()
 		defer ro.Destroy()
 
 		rng := rand.New(rand.NewSource(rand.Int63()))
@@ -394,7 +376,7 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := rocksReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	batchSize := min(128, totalEvents)
@@ -458,7 +440,7 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	db := openRocksDB(b)
 	defer db.Close()
 
-	ro := rocksReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	it := db.NewIterator(ro)
@@ -592,14 +574,6 @@ func BenchmarkPackfileReadEventSeq50(b *testing.B) {
 
 // rocksDBParallelMultiGet splits keys across goroutines for parallel I/O,
 // matching packfile ReadIndices' internal goroutine parallelism.
-// rocksMultiGetReadOpts returns a shared ReadOptions for scattered reads.
-func rocksMultiGetReadOpts() *grocksdb.ReadOptions {
-	ro := grocksdb.NewDefaultReadOptions()
-	ro.SetVerifyChecksums(false)
-	ro.SetFillCache(false)
-	return ro
-}
-
 func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, ro *grocksdb.ReadOptions, keys [][]byte, concurrency int) {
 	b.Helper()
 	if concurrency <= 1 || len(keys) < concurrency {
@@ -652,7 +626,7 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 	defer db.Close()
 
 	cf := db.GetDefaultColumnFamily()
-	ro := rocksMultiGetReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	const numIndices = 50
@@ -708,7 +682,7 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	defer db.Close()
 
 	cf := db.GetDefaultColumnFamily()
-	ro := rocksMultiGetReadOpts()
+	ro := newBenchReadOptions()
 	defer ro.Destroy()
 
 	const numIndices = 50

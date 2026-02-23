@@ -11,7 +11,10 @@ func TestRoundTrip(t *testing.T) {
 	data := make([]byte, 10000)
 	rand.Read(data)
 
-	compressed := Encode(data)
+	compressed, err := Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 
 	decompressed, err := Decode(nil, compressed)
 	if err != nil {
@@ -26,11 +29,14 @@ func TestCorruptData(t *testing.T) {
 	data := make([]byte, 1000)
 	rand.Read(data)
 
-	compressed := Encode(data)
+	compressed, err := Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 
 	// Truncate to half — should always fail.
 	truncated := compressed[:len(compressed)/2]
-	_, err := Decode(nil, truncated)
+	_, err = Decode(nil, truncated)
 	if err == nil {
 		t.Fatal("Decode of truncated data should fail")
 	}
@@ -51,11 +57,11 @@ func TestCorruptData(t *testing.T) {
 // output without touching C code (which would SIGSEGV on a nil pointer).
 func TestEmptyInput(t *testing.T) {
 	// Encode
-	if got := Encode(nil); got != nil {
-		t.Fatalf("Encode(nil) = %v, want nil", got)
+	if got, err := Encode(nil); err != nil || got != nil {
+		t.Fatalf("Encode(nil) = %v, %v, want nil, nil", got, err)
 	}
-	if got := Encode([]byte{}); got != nil {
-		t.Fatalf("Encode([]byte{}) = %v, want nil", got)
+	if got, err := Encode([]byte{}); err != nil || got != nil {
+		t.Fatalf("Encode([]byte{}) = %v, %v, want nil, nil", got, err)
 	}
 
 	// Decode with nil dst
@@ -85,7 +91,10 @@ func TestEmptyInput(t *testing.T) {
 // TestOneByte exercises the minimum-size input boundary.
 func TestOneByte(t *testing.T) {
 	data := []byte{0x42}
-	compressed := Encode(data)
+	compressed, err := Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	if len(compressed) == 0 {
 		t.Fatal("Encode of 1 byte returned empty")
 	}
@@ -120,12 +129,14 @@ func TestContextReuse(t *testing.T) {
 
 	var dst []byte
 	for i, data := range payloads {
-		compressed := c.Encode(data)
+		compressed, err := c.Encode(data)
+		if err != nil {
+			t.Fatalf("iteration %d: Encode: %v", i, err)
+		}
 		// Copy compressed data before next Encode overwrites scratch.
 		saved := make([]byte, len(compressed))
 		copy(saved, compressed)
 
-		var err error
 		dst, err = d.Decode(dst, saved)
 		if err != nil {
 			t.Fatalf("iteration %d: Decode: %v", i, err)
@@ -146,7 +157,10 @@ func TestScratchAliasing(t *testing.T) {
 	data1 := make([]byte, 4096)
 	rand.Read(data1)
 
-	out1 := c.Encode(data1)
+	out1, err := c.Encode(data1)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	saved := make([]byte, len(out1))
 	copy(saved, out1)
 
@@ -162,7 +176,10 @@ func TestScratchAliasing(t *testing.T) {
 	// Second encode with different data reuses scratch.
 	data2 := make([]byte, 8192)
 	rand.Read(data2)
-	out2 := c.Encode(data2)
+	out2, err := c.Encode(data2)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 
 	// out1 and out2 should share the same backing array (scratch).
 	// Verify by checking that out1's pointer falls within scratch bounds.
@@ -183,7 +200,10 @@ func TestScratchAliasing(t *testing.T) {
 func TestDstBufferReuse(t *testing.T) {
 	data := make([]byte, 5000)
 	rand.Read(data)
-	compressed := Encode(data)
+	compressed, err := Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 
 	// Pre-allocate dst larger than needed.
 	dst := make([]byte, 0, 10000)
@@ -221,7 +241,10 @@ func TestCloseIdempotent(t *testing.T) {
 func TestChecksumDetectsBitFlip(t *testing.T) {
 	data := make([]byte, 4096)
 	rand.Read(data)
-	compressed := Encode(data)
+	compressed, err := Encode(data)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 
 	// Zstd frame layout: 4B magic + frame header + blocks + 4B checksum.
 	// Flip a bit in the middle of the compressed data (block area),
@@ -234,7 +257,7 @@ func TestChecksumDetectsBitFlip(t *testing.T) {
 	flipIdx := len(corrupted) / 2
 	corrupted[flipIdx] ^= 0x01
 
-	_, err := Decode(nil, corrupted)
+	_, err = Decode(nil, corrupted)
 	if err == nil {
 		t.Fatal("Decode should fail on bit-flipped payload (checksum mismatch)")
 	}
@@ -266,11 +289,14 @@ func TestConcurrentInstances(t *testing.T) {
 
 			var dst []byte
 			for range iterations {
-				compressed := c.Encode(payloads[g])
+				compressed, err := c.Encode(payloads[g])
+				if err != nil {
+					t.Errorf("goroutine %d: Encode: %v", g, err)
+					return
+				}
 				saved := make([]byte, len(compressed))
 				copy(saved, compressed)
 
-				var err error
 				dst, err = d.Decode(dst, saved)
 				if err != nil {
 					t.Errorf("goroutine %d: Decode: %v", g, err)
@@ -287,17 +313,15 @@ func TestConcurrentInstances(t *testing.T) {
 }
 
 // TestEncodeAfterClose verifies that calling Encode on a closed Compressor
-// panics cleanly instead of passing a nil C pointer (which would SIGSEGV).
+// returns an error instead of passing a nil C pointer (which would SIGSEGV).
 func TestEncodeAfterClose(t *testing.T) {
 	c := NewCompressor()
 	c.Close()
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("Encode on closed Compressor should panic")
-		}
-	}()
-	c.Encode([]byte("should panic"))
+	_, err := c.Encode([]byte("should error"))
+	if err == nil {
+		t.Fatal("Encode on closed Compressor should return error")
+	}
 }
 
 // TestDecodeAfterClose verifies that calling Decode on a closed Decompressor

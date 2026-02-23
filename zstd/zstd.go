@@ -66,12 +66,12 @@ func NewCompressor() *Compressor {
 
 // Encode compresses data, reusing internal buffers.
 // The returned slice is valid until the next call to Encode.
-func (c *Compressor) Encode(data []byte) []byte {
+func (c *Compressor) Encode(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil
+		return nil, nil
 	}
 	if c.ctx == nil {
-		panic("zstd: Encode called on closed Compressor")
+		return nil, fmt.Errorf("zstd: Encode called on closed Compressor")
 	}
 	bound := int(C.ZSTD_compressBound(C.size_t(len(data))))
 	if cap(c.scratch) < bound {
@@ -84,9 +84,9 @@ func (c *Compressor) Encode(data []byte) []byte {
 		unsafe.Pointer(&c.scratch[0]), C.size_t(bound),
 		unsafe.Pointer(&data[0]), C.size_t(len(data)))
 	if C.ZSTD_isError(n) != 0 {
-		panic("zstd: zstd compress: " + C.GoString(C.ZSTD_getErrorName(n)))
+		return nil, fmt.Errorf("zstd: compress: %s", C.GoString(C.ZSTD_getErrorName(n)))
 	}
-	return c.scratch[:int(n)]
+	return c.scratch[:int(n)], nil
 }
 
 // Close frees the compression context.
@@ -99,17 +99,20 @@ func (c *Compressor) Close() {
 
 // Encode compresses data with zstd level 3 and content checksum.
 // Allocates per call. Use Compressor for hot paths.
-func Encode(data []byte) []byte {
+func Encode(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil
+		return nil, nil
 	}
 	c := NewCompressor()
 	defer c.Close()
-	out := c.Encode(data)
+	out, err := c.Encode(data)
+	if err != nil {
+		return nil, err
+	}
 	// Copy since the slice is backed by c.scratch.
 	result := make([]byte, len(out))
 	copy(result, out)
-	return result
+	return result, nil
 }
 
 // Decompressor holds a reusable zstd decompression context.

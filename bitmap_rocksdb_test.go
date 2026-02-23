@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/linxGnu/grocksdb"
 
 	"github.com/tamir/events-analysis/bitmapindex"
+	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/eventstore"
 )
 
@@ -30,22 +32,23 @@ func buildRocksDBFromEventStore(ctx context.Context, storePath, dbPath string) e
 
 	// Phase 1: Stream events, build bitmaps in memory.
 	type compositeKey struct {
-		field field
+		field bitmapindex.Field
 		key   string // stored as string for map key
 	}
 	bitmaps := make(map[compositeKey]*roaring.Bitmap, 600_000)
 
 	ordinal := uint32(0)
-	for event, err := range er.ReadEvents(0, er.EventCount()) {
+	var ev event.Event
+	for data, err := range er.ReadEvents(0, er.EventCount()) {
 		if err != nil {
 			return fmt.Errorf("bitmapindex: read event %d: %w", ordinal, err)
 		}
-		for _, f := range allFields {
-			key := extractKey(event, f)
-			if key == nil {
-				continue
-			}
-			ck := compositeKey{field: f, key: string(key)}
+		if err := event.Unmarshal(data, &ev); err != nil {
+			return fmt.Errorf("bitmapindex: unmarshal event %d: %w", ordinal, err)
+		}
+
+		if ev.ContractID != nil {
+			ck := compositeKey{field: bitmapindex.FieldContractID, key: string(ev.ContractID)}
 			bm := bitmaps[ck]
 			if bm == nil {
 				bm = roaring.New()
@@ -53,6 +56,19 @@ func buildRocksDBFromEventStore(ctx context.Context, storePath, dbPath string) e
 			}
 			bm.Add(ordinal)
 		}
+		for i, topic := range ev.Topics {
+			if i >= 4 {
+				break
+			}
+			ck := compositeKey{field: bitmapindex.FieldTopic0 + bitmapindex.Field(i), key: string(topic)}
+			bm := bitmaps[ck]
+			if bm == nil {
+				bm = roaring.New()
+				bitmaps[ck] = bm
+			}
+			bm.Add(ordinal)
+		}
+
 		ordinal++
 	}
 
@@ -72,7 +88,7 @@ func buildRocksDBFromEventStore(ctx context.Context, storePath, dbPath string) e
 	bitmaps = nil // free map
 
 	sort.Slice(entries, func(i, j int) bool {
-		return string(entries[i].compositeKey) < string(entries[j].compositeKey)
+		return bytes.Compare(entries[i].compositeKey, entries[j].compositeKey) < 0
 	})
 
 	// Phase 3: Write SST file via SSTFileWriter.
@@ -165,7 +181,7 @@ type RocksDBReader struct {
 	opts *grocksdb.Options
 }
 
-// openRocksDB opens a RocksDB bitmap index for read-only access.
+// openRocksDBBitmap opens a RocksDB bitmap index for read-only access.
 func openRocksDBBitmap(dbPath string) (*RocksDBReader, error) {
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetSkipStatsUpdateOnDBOpen(true)
@@ -193,7 +209,7 @@ func openRocksDBBitmap(dbPath string) (*RocksDBReader, error) {
 
 // Lookup returns the roaring bitmap for the given field/key.
 // Returns ErrKeyNotFound if the key is not found.
-func (r *RocksDBReader) Lookup(f field, key []byte) (*roaring.Bitmap, error) {
+func (r *RocksDBReader) Lookup(f bitmapindex.Field, key []byte) (*roaring.Bitmap, error) {
 	// Construct composite key: field_byte || original_key.
 	compositeKey := make([]byte, 1+len(key))
 	compositeKey[0] = byte(f)

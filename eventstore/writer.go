@@ -21,8 +21,9 @@ type WriterOptions struct {
 }
 
 type blockResult struct {
-	blockID    uint32
-	compressed []byte
+	blockID uint32
+	data    []byte
+	err     error // set by compressWorker on failure
 }
 
 type Writer struct {
@@ -95,10 +96,14 @@ func (w *Writer) compressWorker() {
 	c := zstd.NewCompressor()
 	defer c.Close()
 	for work := range w.workCh {
-		compressed := c.Encode(work.compressed)
+		compressed, err := c.Encode(work.data)
+		if err != nil {
+			w.resultCh <- blockResult{blockID: work.blockID, err: fmt.Errorf("eventstore: compress block %d: %w", work.blockID, err)}
+			return
+		}
 		// Copy: compressed aliases c's scratch buffer, but must outlive
 		// until the writer goroutine consumes it.
-		work.compressed = append(work.compressed[:0], compressed...)
+		work.data = append(work.data[:0], compressed...)
 		w.resultCh <- work
 	}
 }
@@ -112,7 +117,14 @@ func (w *Writer) runWriter() {
 	nextBlockID := uint32(0)
 
 	for result := range w.resultCh {
-		pending[result.blockID] = result.compressed
+		if result.err != nil {
+			w.writerDone <- result.err
+			// Drain remaining results so compressors don't block.
+			for range w.resultCh {
+			}
+			return
+		}
+		pending[result.blockID] = result.data
 
 		// Drain all consecutive ready blocks in order.
 		for data, ok := pending[nextBlockID]; ok; data, ok = pending[nextBlockID] {
@@ -170,13 +182,17 @@ func (w *Writer) flush() error {
 			if w.compressor == nil {
 				w.compressor = zstd.NewCompressor()
 			}
-			block = w.compressor.Encode(block)
+			var err error
+			block, err = w.compressor.Encode(block)
+			if err != nil {
+				return err
+			}
 		}
 		return w.pw.Append(block)
 	}
 
 	// Send to streaming compress pipeline.
-	w.workCh <- blockResult{blockID: w.nextBlockID, compressed: block}
+	w.workCh <- blockResult{blockID: w.nextBlockID, data: block}
 	w.nextBlockID++
 	return nil
 }

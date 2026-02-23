@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -690,14 +691,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 			for idx := range m {
 				indices = append(indices, idx)
 			}
-			// sort
-			for i := range indices {
-				for j := i + 1; j < len(indices); j++ {
-					if indices[j] < indices[i] {
-						indices[i], indices[j] = indices[j], indices[i]
-					}
-				}
-			}
+			slices.Sort(indices)
 
 			j := 0
 			for ev, err := range r.ReadIndices(context.Background(), indices) {

@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"sync"
+
+	"github.com/tamir/events-analysis/event"
 )
 
 // --- Shared data loading (used by all benchmarks) ---
@@ -133,7 +135,7 @@ func loadEventsFromSource() error {
 	fmt.Printf("loading events from %d ledgers...\n", numLedgers)
 
 	flat := make([]byte, 0, 512*1024)
-	var eventBuf []IngestEvent
+	var eventBuf []event.Event
 
 	for i := range numLedgers {
 		if i > 0 && i%2000 == 0 {
@@ -148,7 +150,7 @@ func loadEventsFromSource() error {
 			continue
 		}
 		for idx := range eventBuf {
-			flat = AppendBinaryEvent(flat[:0], &eventBuf[idx])
+			flat = event.Marshal(flat[:0], &eventBuf[idx])
 			eventCopy := make([]byte, len(flat))
 			copy(eventCopy, flat)
 			allEvents = append(allEvents, eventCopy)

@@ -21,7 +21,12 @@ import (
 	"github.com/tamir/events-analysis/zstd"
 )
 
-const defaultConcurrency = 8
+var ErrKeyNotFound = errors.New("bitmapindex: key not found")
+
+const (
+	defaultConcurrency = 8
+	knownFlags         uint16 = 0
+)
 
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*Reader)
@@ -107,10 +112,10 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 	if flags&^knownFlags != 0 {
 		return nil, fmt.Errorf("bitmapindex: unknown metadata flags: %04x", flags)
 	}
-	if totalKeys <= 0 {
+	if totalKeys == 0 {
 		return nil, fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", totalKeys)
 	}
-	if batchSize <= 0 {
+	if batchSize == 0 {
 		return nil, fmt.Errorf("bitmapindex: invalid batchSize %d in metadata", batchSize)
 	}
 
@@ -135,40 +140,14 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 	return r, nil
 }
 
-// lookupBuf holds reusable buffers for batch reads and decompression.
-type lookupBuf struct {
-	rec       []byte
-	decompBuf []byte
-	dec       *zstd.Decompressor
-}
-
-var bufPool = sync.Pool{
-	New: func() any {
-		dec := zstd.NewDecompressor()
-		lb := &lookupBuf{
-			rec: make([]byte, 0, 32*1024),
-			dec: dec,
-		}
-		runtime.SetFinalizer(lb, func(b *lookupBuf) { b.dec.Close() })
-		return lb
-	},
-}
-
-func getBuf() *lookupBuf {
-	return bufPool.Get().(*lookupBuf)
-}
-
-func putBuf(b *lookupBuf) {
-	b.rec = b.rec[:0]
-	b.decompBuf = b.decompBuf[:0]
-	bufPool.Put(b)
-}
-
-// Lookup returns the roaring bitmap for the given key, or ErrKeyNotFound
+// Lookup returns the roaring bitmap for the given field/key, or ErrKeyNotFound
 // if the key is not in the index (fingerprint mismatch).
-func (r *Reader) Lookup(key []byte) (*roaring.Bitmap, error) {
+func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
+	var buf [256]byte
+	composed := composeKey(buf[:0], key, f)
+
 	var hk [16]byte
-	streamhash.PreHashInPlace(key, hk[:])
+	streamhash.PreHashInPlace(composed, hk[:])
 
 	rank, err := r.mphf.Query(hk[:])
 	if err != nil {
@@ -200,7 +179,7 @@ func (r *Reader) Lookup(key []byte) (*roaring.Bitmap, error) {
 // LookupKeys returns bitmaps for multiple keys with parallel I/O.
 // The returned slice is parallel to keys: nil entries indicate not-found keys.
 // Duplicate keys produce independent identical bitmaps.
-func (r *Reader) LookupKeys(ctx context.Context, keys [][]byte) ([]*roaring.Bitmap, error) {
+func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bitmap, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -216,9 +195,12 @@ func (r *Reader) LookupKeys(ctx context.Context, keys [][]byte) ([]*roaring.Bitm
 	}
 	var found []foundKey
 
+	var buf [256]byte
 	for i, key := range keys {
+		composed := composeKey(buf[:0], key.Key, key.Field)
+
 		var hk [16]byte
-		streamhash.PreHashInPlace(key, hk[:])
+		streamhash.PreHashInPlace(composed, hk[:])
 
 		rank, err := r.mphf.Query(hk[:])
 		if err != nil {
@@ -343,6 +325,37 @@ func (r *Reader) Close() error {
 	mErr := r.mphf.Close()
 	pErr := r.pack.Close()
 	return errors.Join(mErr, pErr)
+}
+
+// --- Internal helpers ---
+
+// lookupBuf holds reusable buffers for batch reads and decompression.
+type lookupBuf struct {
+	rec       []byte
+	decompBuf []byte
+	dec       *zstd.Decompressor
+}
+
+var bufPool = sync.Pool{
+	New: func() any {
+		dec := zstd.NewDecompressor()
+		lb := &lookupBuf{
+			rec: make([]byte, 0, 32*1024),
+			dec: dec,
+		}
+		runtime.SetFinalizer(lb, func(b *lookupBuf) { b.dec.Close() })
+		return lb
+	},
+}
+
+func getBuf() *lookupBuf {
+	return bufPool.Get().(*lookupBuf)
+}
+
+func putBuf(b *lookupBuf) {
+	b.rec = b.rec[:0]
+	b.decompBuf = b.decompBuf[:0]
+	bufPool.Put(b)
 }
 
 // batchRecord holds parsed offsets into a CRC-verified batch record.

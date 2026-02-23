@@ -75,7 +75,10 @@ func BenchmarkZstdCgoCompress(b *testing.B) {
 	var dst []byte
 	for range b.N {
 		for _, blk := range zstdBlocks {
-			out := c.Encode(blk)
+			out, err := c.Encode(blk)
+			if err != nil {
+				b.Fatal(err)
+			}
 			dst = append(dst[:0], out...)
 		}
 	}
@@ -112,7 +115,10 @@ func BenchmarkZstdCgoDecompress(b *testing.B) {
 	c := zstd.NewCompressor()
 	compressed := make([][]byte, len(zstdBlocks))
 	for i, blk := range zstdBlocks {
-		out := c.Encode(blk)
+		out, err := c.Encode(blk)
+		if err != nil {
+			b.Fatal(err)
+		}
 		compressed[i] = make([]byte, len(out))
 		copy(compressed[i], out)
 	}
@@ -194,7 +200,11 @@ func benchCgoCompressParallel(b *testing.B, workers int) {
 				defer c.Close()
 				var dst []byte
 				for i := range ch {
-					out := c.Encode(zstdBlocks[i])
+					out, err := c.Encode(zstdBlocks[i])
+					if err != nil {
+						b.Error(err)
+						return
+					}
 					dst = append(dst[:0], out...)
 				}
 				_ = dst
@@ -255,7 +265,10 @@ func benchCgoDecompressParallel(b *testing.B, workers int) {
 	c := zstd.NewCompressor()
 	compressed := make([][]byte, len(zstdBlocks))
 	for i, blk := range zstdBlocks {
-		out := c.Encode(blk)
+		out, err := c.Encode(blk)
+		if err != nil {
+			b.Fatal(err)
+		}
 		compressed[i] = make([]byte, len(out))
 		copy(compressed[i], out)
 	}
@@ -400,7 +413,10 @@ func TestZstdCompressionRatio(t *testing.T) {
 	c := zstd.NewCompressor()
 	var rcTotal int64
 	for _, blk := range blocks {
-		out := c.Encode(blk)
+		out, err := c.Encode(blk)
+		if err != nil {
+			t.Fatal(err)
+		}
 		rcTotal += int64(len(out))
 	}
 	c.Close()
