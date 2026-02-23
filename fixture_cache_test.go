@@ -10,12 +10,17 @@ import (
 
 const fixtureDir = "testdata/fixtures"
 
+// fixtureFormatVersion is bumped when the on-disk format changes (e.g., bitmapindex metadata).
+// Fixtures auto-invalidate when the version in meta.json doesn't match.
+const fixtureFormatVersion = 2
+
 type fixtureMeta struct {
 	SourceDataMtime  time.Time `json:"source_data_mtime"`
 	SourceIndexMtime time.Time `json:"source_index_mtime"`
 	TotalEvents      int       `json:"total_events"`
 	TotalRawBytes    int       `json:"total_raw_bytes"`
 	GeneratedAt      time.Time `json:"generated_at"`
+	FormatVersion    int       `json:"format_version,omitempty"`
 }
 
 func ensureFixtureDir() error {
@@ -65,6 +70,9 @@ func fixturesStale() bool {
 	if err != nil {
 		return true
 	}
+	if meta.FormatVersion != fixtureFormatVersion {
+		return true
+	}
 	return !dataStat.ModTime().Equal(meta.SourceDataMtime) ||
 		!indexStat.ModTime().Equal(meta.SourceIndexMtime)
 }
@@ -110,5 +118,6 @@ func buildMeta() (*fixtureMeta, error) {
 		TotalEvents:      len(allEvents),
 		TotalRawBytes:    totalRawBytes,
 		GeneratedAt:      time.Now(),
+		FormatVersion:    fixtureFormatVersion,
 	}, nil
 }

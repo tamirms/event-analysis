@@ -44,8 +44,8 @@ func TestBitmapIndexIntegration(t *testing.T) {
 
 	// Reuse cached bitmap index if not stale.
 	needsBuild := true
-	if _, err := os.Stat(mphfPath); err == nil {
-		if _, err := os.Stat(dataPath); err == nil {
+	if _, err := os.Stat(dataPath); err == nil {
+		if _, err := os.Stat(mphfPath); err == nil {
 			if !fixturesStale() {
 				t.Log("using cached bitmap index fixtures")
 				needsBuild = false
@@ -70,9 +70,11 @@ func TestBitmapIndexIntegration(t *testing.T) {
 	dataInfo, _ := os.Stat(dataPath)
 	t.Logf("MPHF: %d bytes (%.1f KB)", mphfInfo.Size(), float64(mphfInfo.Size())/1024)
 	t.Logf("Packfile: %d bytes (%.1f MB)", dataInfo.Size(), float64(dataInfo.Size())/(1024*1024))
+	t.Logf("Total: %d bytes (%.1f MB)", mphfInfo.Size()+dataInfo.Size(),
+		float64(mphfInfo.Size()+dataInfo.Size())/(1024*1024))
 
 	// Open and verify.
-	r, err := bitmapindex.Open(mphfPath, dataPath, bitmapindex.WithExpectedLookups(100))
+	r, err := bitmapindex.Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -158,8 +160,9 @@ func TestBitmapIndexIntegration(t *testing.T) {
 	}
 
 	fmt.Printf("\n=== Bitmap Index Stats ===\n")
-	fmt.Printf("MPHF file: %.1f KB\n", float64(mphfInfo.Size())/1024)
-	fmt.Printf("Packfile:  %.1f MB\n", float64(dataInfo.Size())/(1024*1024))
+	fmt.Printf("MPHF: %.1f KB\n", float64(mphfInfo.Size())/1024)
+	fmt.Printf("Packfile: %.1f MB\n", float64(dataInfo.Size())/(1024*1024))
+	fmt.Printf("Total: %.1f MB\n", float64(mphfInfo.Size()+dataInfo.Size())/(1024*1024))
 	fmt.Printf("Total keys: %d\n", totalKeys)
 	fmt.Printf("Dominant contract bitmap cardinality: %d\n", card)
 }

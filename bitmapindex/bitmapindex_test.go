@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func TestRoundTrip(t *testing.T) {
 	mintKey := ComposeKey([]byte("mint"), 0x01)               // "mint, field 1"
 
 	// Build index.
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	w.Add(0, keyA)
 	w.Add(1, keyA)
 	w.Add(3, keyA)
@@ -44,7 +45,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	// Open and query.
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(10))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -93,7 +94,7 @@ func TestNonMemberLookup(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build a small index with one key.
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	w.Add(0, ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -123,7 +124,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	// Add many ordinals to a single key to trigger compression (>= 256 bytes serialized).
 	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	for i := uint32(0); i < 5000; i++ {
@@ -140,7 +141,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(10))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestConcurrentLookups(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build an index with several keys.
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	keys := make([][]byte, 20)
 	for i := range keys {
 		raw := make([]byte, 32)
@@ -195,7 +196,7 @@ func TestConcurrentLookups(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(100))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -238,7 +239,7 @@ func TestManyKeys(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	const numKeys = 1000
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	keys := make([][]byte, numKeys)
 	for i := range keys {
 		raw := make([]byte, 32)
@@ -255,7 +256,7 @@ func TestManyKeys(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(numKeys))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -290,7 +291,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	raw := bytes.Repeat([]byte{0x42}, 32)
 	// Same raw key, different discriminators, different ordinals.
 	w.Add(10, ComposeKey(raw, 0x00))
@@ -304,7 +305,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(10))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -337,7 +338,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build a small index.
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	w.Add(0, key)
 	w.Add(1, key)
@@ -362,7 +363,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	pack.Close()
 
 	// Verify it works before corruption.
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(10))
+	r, err := Open(mphfPath, dataPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -376,28 +377,29 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	r.Close()
 
 	// Corrupt a byte in the record's data (after fingerprint, before CRC).
-	// The record layout is: [4B fingerprint][1B flags][N data][4B CRC32C].
+	// The batch record layout is: [2B count][fingerprints][flags][sizes][data][4B CRC32C].
 	// Corrupt the flags byte so CRC won't match.
-	data, err := os.ReadFile(dataPath)
+	fileData, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
 	// Find the first occurrence of the record in the file by searching for the
 	// first fingerprintSize bytes followed by the exact record content.
-	recIdx := bytes.Index(data, rec[:fingerprintSize+1])
+	recIdx := bytes.Index(fileData, rec[:fingerprintSize+1])
 	if recIdx < 0 {
 		t.Fatal("could not find record in packfile")
 	}
 	// Flip the flags byte.
-	data[recIdx+fingerprintSize] ^= 0xFF
+	fileData[recIdx+fingerprintSize] ^= 0xFF
 
-	corruptedPath := filepath.Join(dir, "corrupted.bitmaps")
-	if err := os.WriteFile(corruptedPath, data, 0644); err != nil {
+	corruptedDataPath := filepath.Join(dir, "corrupted.bitmaps")
+	if err := os.WriteFile(corruptedDataPath, fileData, 0644); err != nil {
 		t.Fatalf("write corrupted file: %v", err)
 	}
 
-	r, err = Open(mphfPath, corruptedPath, WithExpectedLookups(10))
+	// Use original MPHF with corrupted data file.
+	r, err = Open(mphfPath, corruptedDataPath)
 	if err != nil {
 		t.Fatalf("Open corrupted: %v", err)
 	}
@@ -440,7 +442,7 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter()
+	w := NewWriter(WriterOptions{})
 	key := ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)
 	w.Add(0, key)
 
@@ -472,4 +474,450 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 	if storedCRC != computedCRC {
 		t.Errorf("CRC32C mismatch: stored=%08x computed=%08x", storedCRC, computedCRC)
 	}
+}
+
+// --- LookupKeys tests ---
+
+// buildTestIndex builds a small index in dir with the given keys, each mapped
+// to ordinal = its index position. Returns mphf and data paths.
+func buildTestIndex(t *testing.T, dir string, keys [][]byte, opts WriterOptions) (string, string) {
+	t.Helper()
+	mphfPath := filepath.Join(dir, "index.mphf")
+	dataPath := filepath.Join(dir, "index.bitmaps")
+
+	w := NewWriter(opts)
+	for i, key := range keys {
+		w.Add(uint32(i), key)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	return mphfPath, dataPath
+}
+
+func TestLookupKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	keys := make([][]byte, 50)
+	for i := range keys {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// Look up a subset of keys.
+	query := [][]byte{keys[0], keys[10], keys[49]}
+	ctx := context.Background()
+	results, err := r.LookupKeys(ctx, query)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+
+	if len(results) != len(query) {
+		t.Fatalf("results length: got %d, want %d", len(results), len(query))
+	}
+
+	for i, bm := range results {
+		if bm == nil {
+			t.Errorf("result[%d] is nil", i)
+			continue
+		}
+		arr := bm.ToArray()
+		var wantOrd uint32
+		switch i {
+		case 0:
+			wantOrd = 0
+		case 1:
+			wantOrd = 10
+		case 2:
+			wantOrd = 49
+		}
+		if len(arr) != 1 || arr[0] != wantOrd {
+			t.Errorf("result[%d]: got %v, want [%d]", i, arr, wantOrd)
+		}
+	}
+}
+
+func TestLookupKeysAllNotFound(t *testing.T) {
+	dir := t.TempDir()
+
+	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// Query with keys that don't exist.
+	query := [][]byte{
+		ComposeKey(bytes.Repeat([]byte{0xAA}, 32), 0x00),
+		ComposeKey(bytes.Repeat([]byte{0xBB}, 32), 0x00),
+		ComposeKey(bytes.Repeat([]byte{0xCC}, 32), 0x00),
+	}
+	results, err := r.LookupKeys(context.Background(), query)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+
+	for i, bm := range results {
+		if bm != nil {
+			t.Errorf("result[%d] should be nil for not-found key", i)
+		}
+	}
+}
+
+func TestLookupKeysMixedBatches(t *testing.T) {
+	dir := t.TempDir()
+
+	// Use small batch size so keys span multiple batches.
+	const numKeys = 200
+	keys := make([][]byte, numKeys)
+	for i := range keys {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		binary.BigEndian.PutUint32(raw[28:], uint32(i*7919))
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{BatchSize: 16})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// Mix found and not-found keys from different batches.
+	nonExistent := ComposeKey(bytes.Repeat([]byte{0xFF}, 32), 0x00)
+	query := [][]byte{keys[0], nonExistent, keys[50], keys[150], nonExistent}
+
+	results, err := r.LookupKeys(context.Background(), query)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+
+	if len(results) != 5 {
+		t.Fatalf("results length: got %d, want 5", len(results))
+	}
+
+	// keys[0] → ordinal 0
+	if results[0] == nil || !results[0].Contains(0) {
+		t.Errorf("result[0]: expected bitmap containing 0")
+	}
+	// not-found
+	if results[1] != nil {
+		t.Errorf("result[1]: expected nil for not-found key")
+	}
+	// keys[50] → ordinal 50
+	if results[2] == nil || !results[2].Contains(50) {
+		t.Errorf("result[2]: expected bitmap containing 50")
+	}
+	// keys[150] → ordinal 150
+	if results[3] == nil || !results[3].Contains(150) {
+		t.Errorf("result[3]: expected bitmap containing 150")
+	}
+	// not-found
+	if results[4] != nil {
+		t.Errorf("result[4]: expected nil for not-found key")
+	}
+}
+
+func TestLookupKeysBatchCoalescing(t *testing.T) {
+	dir := t.TempDir()
+
+	// Use batch size 128 (default) — 10 keys will all land in the same batch.
+	const numKeys = 10
+	keys := make([][]byte, numKeys)
+	for i := range keys {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// All keys should be in one batch — LookupKeys reads it once.
+	results, err := r.LookupKeys(context.Background(), keys)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+
+	for i, bm := range results {
+		if bm == nil {
+			t.Errorf("result[%d] is nil", i)
+			continue
+		}
+		if !bm.Contains(uint32(i)) {
+			t.Errorf("result[%d]: expected to contain %d", i, i)
+		}
+	}
+}
+
+func TestLookupKeysSingleBatch(t *testing.T) {
+	dir := t.TempDir()
+
+	// 5 keys, batch size 128 → all in batch 0.
+	keys := make([][]byte, 5)
+	for i := range keys {
+		raw := make([]byte, 32)
+		raw[0] = byte(i + 1)
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	results, err := r.LookupKeys(context.Background(), keys)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+
+	for i, bm := range results {
+		if bm == nil {
+			t.Errorf("result[%d] is nil", i)
+			continue
+		}
+		if bm.GetCardinality() != 1 {
+			t.Errorf("result[%d]: cardinality got %d, want 1", i, bm.GetCardinality())
+		}
+	}
+}
+
+func TestLookupKeysConcurrent(t *testing.T) {
+	dir := t.TempDir()
+
+	const numKeys = 100
+	keys := make([][]byte, numKeys)
+	for i := range keys {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each goroutine queries a different subset.
+			start := g * (numKeys / goroutines)
+			end := start + numKeys/goroutines
+			query := keys[start:end]
+
+			results, err := r.LookupKeys(context.Background(), query)
+			if err != nil {
+				errs <- err
+				return
+			}
+			for i, bm := range results {
+				if bm == nil {
+					errs <- bytes.ErrTooLarge
+					return
+				}
+				if !bm.Contains(uint32(start + i)) {
+					errs <- bytes.ErrTooLarge
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent LookupKeys error: %v", err)
+		}
+	}
+}
+
+func TestLookupKeysEmpty(t *testing.T) {
+	dir := t.TempDir()
+
+	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// nil input
+	results, err := r.LookupKeys(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("LookupKeys(nil): %v", err)
+	}
+	if results != nil {
+		t.Errorf("LookupKeys(nil): got %v, want nil", results)
+	}
+
+	// empty input
+	results, err = r.LookupKeys(context.Background(), [][]byte{})
+	if err != nil {
+		t.Fatalf("LookupKeys(empty): %v", err)
+	}
+	if results != nil {
+		t.Errorf("LookupKeys(empty): got %v, want nil", results)
+	}
+}
+
+func TestCustomBatchSize(t *testing.T) {
+	dir := t.TempDir()
+
+	const numKeys = 100
+	keys := make([][]byte, numKeys)
+	for i := range keys {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		keys[i] = ComposeKey(raw, 0x00)
+	}
+
+	// Use non-default batch size.
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{BatchSize: 16})
+
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer r.Close()
+
+	// Verify batch size was stored and read back.
+	if r.batchSize != 16 {
+		t.Errorf("batchSize: got %d, want 16", r.batchSize)
+	}
+
+	// Verify all keys round-trip correctly.
+	for i, key := range keys {
+		bm, err := r.Lookup(key)
+		if err != nil {
+			t.Fatalf("Lookup key %d: %v", i, err)
+		}
+		arr := bm.ToArray()
+		if len(arr) != 1 || arr[0] != uint32(i) {
+			t.Errorf("key %d: got %v, want [%d]", i, arr, i)
+		}
+	}
+
+	// Also verify via LookupKeys.
+	results, err := r.LookupKeys(context.Background(), keys)
+	if err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+	for i, bm := range results {
+		if bm == nil {
+			t.Errorf("LookupKeys result[%d] is nil", i)
+			continue
+		}
+		if !bm.Contains(uint32(i)) {
+			t.Errorf("LookupKeys result[%d]: missing ordinal %d", i, i)
+		}
+	}
+}
+
+func TestMetadataValidation(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a valid index first.
+	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	// Verify it opens cleanly.
+	r, err := Open(mphfPath, dataPath)
+	if err != nil {
+		t.Fatalf("Open valid: %v", err)
+	}
+	r.Close()
+
+	// Create a packfile with missing metadata.
+	noMetaPath := filepath.Join(dir, "nometa.bitmaps")
+	pw, err := packfile.Create(noMetaPath, packfile.WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No SetMetadata call — metadata will be nil/empty.
+	pw.Append([]byte{0x01, 0x00}) // dummy record
+	pw.Finish()
+
+	_, err = Open(mphfPath, noMetaPath)
+	if err == nil {
+		t.Fatal("expected error for missing metadata")
+	}
+	t.Logf("missing metadata: %v", err)
+}
+
+func TestMetadataFlags(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a valid index first to get a valid MPHF.
+	keys := [][]byte{ComposeKey(bytes.Repeat([]byte{0x01}, 32), 0x00)}
+	mphfPath, dataPath := buildTestIndex(t, dir, keys, WriterOptions{})
+
+	// Read the valid packfile and tamper with metadata flags.
+	pack, err := packfile.Open(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := pack.Metadata()
+	rec, err := pack.ReadRecordInto(0, nil)
+	pack.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set unknown flags.
+	binary.LittleEndian.PutUint16(meta[6:8], 0xFFFF)
+
+	// Write a new packfile with the tampered metadata.
+	tamperedPath := filepath.Join(dir, "tampered.bitmaps")
+	pw, err := packfile.Create(tamperedPath, packfile.WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pw.SetMetadata(meta)
+	pw.Append(rec)
+	pw.Finish()
+
+	_, err = Open(mphfPath, tamperedPath)
+	if err == nil {
+		t.Fatal("expected error for unknown flags")
+	}
+	t.Logf("unknown flags: %v", err)
 }

@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tamirms/streamhash"
-
 	"github.com/tamir/events-analysis/bitmapindex"
 	"github.com/tamir/events-analysis/eventstore"
 )
@@ -108,20 +106,12 @@ func doBitmapSetup() error {
 	mphfInfo, _ := os.Stat(bitmapMPHFPath)
 	dataInfo, _ := os.Stat(bitmapDataPath)
 	rocksSize := dirSize(bitmapRocksDBPath)
-	mphfTotal := mphfInfo.Size() + dataInfo.Size()
 
 	fmt.Printf("bitmap bench: MPHF %s + packfile %s = %s total\n",
 		fmtKB(float64(mphfInfo.Size())),
 		fmtKB(float64(dataInfo.Size())),
-		fmtKB(float64(mphfTotal)))
+		fmtKB(float64(mphfInfo.Size()+dataInfo.Size())))
 	fmt.Printf("bitmap bench: RocksDB %s\n", fmtKB(float64(rocksSize)))
-
-	// Report MPHF stats.
-	stats, err := streamhash.GetStats(bitmapMPHFPath)
-	if err == nil {
-		fmt.Printf("bitmap bench: MPHF stats: %d keys, %.2f bits/key\n",
-			stats.NumKeys, stats.BitsPerKey)
-	}
 
 	// Report build times.
 	fmt.Printf("bitmap bench: MPHF+packfile built in %v\n", mphfBuildTime)
@@ -178,8 +168,7 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 func BenchmarkBitmapMPHFLookup(b *testing.B) {
 	setupBitmapBenchData(b)
 
-	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath,
-		bitmapindex.WithExpectedLookups(b.N))
+	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -225,8 +214,7 @@ func BenchmarkBitmapRocksDBLookup(b *testing.B) {
 func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 	setupBitmapBenchData(b)
 
-	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath,
-		bitmapindex.WithExpectedLookups(15))
+	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -247,6 +235,41 @@ func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 			_ = bm
 		}
 	})
+}
+
+func BenchmarkBitmapMPHFLookupKeys15(b *testing.B) {
+	setupBitmapBenchData(b)
+
+	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer r.Close()
+
+	keys := bitmapSampleKeys
+	rng := rand.New(rand.NewSource(42))
+
+	// Pre-generate batches of 15 keys.
+	type batch [15][]byte
+	const numBatches = 1024
+	batches := make([]batch, numBatches)
+	for i := range batches {
+		for j := range 15 {
+			batches[i][j] = keys[rng.Intn(len(keys))].mphfKey
+		}
+	}
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	for i := range b.N {
+		bt := &batches[i%numBatches]
+		results, err := r.LookupKeys(ctx, bt[:])
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = results
+	}
 }
 
 func BenchmarkBitmapRocksDBParallel15(b *testing.B) {
