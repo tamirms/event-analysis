@@ -24,7 +24,7 @@ import (
 var ErrKeyNotFound = errors.New("bitmapindex: key not found")
 
 const (
-	defaultConcurrency = 8
+	defaultConcurrency        = 8
 	knownFlags         uint16 = 0
 )
 
@@ -144,7 +144,7 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 // if the key is not in the index (fingerprint mismatch).
 func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 	var buf [256]byte
-	composed := composeKey(buf[:0], key, f)
+	composed := composeKey(buf[:0], f, key)
 
 	var hk [16]byte
 	streamhash.PreHashInPlace(composed, hk[:])
@@ -197,7 +197,7 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 
 	var buf [256]byte
 	for i, key := range keys {
-		composed := composeKey(buf[:0], key.Key, key.Field)
+		composed := composeKey(buf[:0], key.Field, key.Key)
 
 		var hk [16]byte
 		streamhash.PreHashInPlace(composed, hk[:])

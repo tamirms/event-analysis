@@ -4,6 +4,7 @@ package bitmapindex
 type Field byte
 
 const (
+	_                     = iota
 	FieldContractID Field = iota
 	FieldTopic0
 	FieldTopic1
@@ -20,7 +21,7 @@ type FieldKey struct {
 
 // composeKey appends key and byte(f) into dst, returning the result slice.
 // Callers can use a stack-allocated [256]byte to avoid heap allocation.
-func composeKey(dst []byte, key []byte, f Field) []byte {
+func composeKey(dst []byte, f Field, key []byte) []byte {
 	needed := len(key) + 1
 	if cap(dst) >= needed {
 		dst = dst[:needed]

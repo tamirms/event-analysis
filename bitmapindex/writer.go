@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
-	"runtime"
 	"sort"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
+	"golang.org/x/exp/maps"
 
 	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/packfile"
@@ -25,13 +26,15 @@ const defaultBatchSize = 128
 type WriterOptions struct {
 	BatchSize    int // bitmaps per packfile record; 0 → 128
 	CapacityHint int // pre-sizes internal map; 0 → no hint
+	Concurrency  int // parallel compression goroutines; 0 or 1 → serial
 }
 
 // Writer accumulates (ordinal, key) tuples and builds an MPHF+packfile index.
 // Not safe for concurrent use — all calls to Add must be serialized.
 type Writer struct {
-	bitmaps   map[[16]byte]*roaring.Bitmap
-	batchSize int
+	bitmaps     map[[16]byte]*roaring.Bitmap
+	batchSize   int
+	concurrency int
 }
 
 // NewWriter creates a new bitmap index writer.
@@ -47,9 +50,14 @@ func NewWriter(opts WriterOptions) *Writer {
 	if hint < 0 {
 		hint = 0
 	}
+	conc := opts.Concurrency
+	if conc < 1 {
+		conc = 1
+	}
 	return &Writer{
-		bitmaps:   make(map[[16]byte]*roaring.Bitmap, hint),
-		batchSize: bs,
+		bitmaps:     make(map[[16]byte]*roaring.Bitmap, hint),
+		batchSize:   bs,
+		concurrency: conc,
 	}
 }
 
@@ -57,16 +65,16 @@ func NewWriter(opts WriterOptions) *Writer {
 func (w *Writer) Add(ev *event.Event, id uint32) {
 	var buf [256]byte
 	if ev.ContractID != nil {
-		w.add(id, composeKey(buf[:0], ev.ContractID, FieldContractID))
+		w.add(composeKey(buf[:0], FieldContractID, ev.ContractID), id)
 	}
 	topicCount := min(len(ev.Topics), int(fieldCount)-int(FieldTopic0))
 	for i := range topicCount {
-		w.add(id, composeKey(buf[:0], ev.Topics[i], FieldTopic0+Field(i)))
+		w.add(composeKey(buf[:0], FieldTopic0+Field(i), ev.Topics[i]), id)
 	}
 }
 
 // add records that the event at ordinal has the given composed key.
-func (w *Writer) add(ordinal uint32, key []byte) {
+func (w *Writer) add(key []byte, ordinal uint32) {
 	var hk [16]byte
 	streamhash.PreHashInPlace(key, hk[:])
 	bm := w.bitmaps[hk]
@@ -85,10 +93,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 	}
 
 	// Collect and sort MPHF keys.
-	sortedKeys := make([][16]byte, 0, totalKeys)
-	for mk := range w.bitmaps {
-		sortedKeys = append(sortedKeys, mk)
-	}
+	sortedKeys := maps.Keys(w.bitmaps)
 	sort.Slice(sortedKeys, func(i, j int) bool {
 		return bytes.Compare(sortedKeys[i][:], sortedKeys[j][:]) < 0
 	})
@@ -110,8 +115,10 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 
 	for _, hk := range sortedKeys {
 		if err := builder.AddKey(hk[:], 0); err != nil {
-			builder.Close()
-			return fmt.Errorf("bitmapindex: add key to MPHF: %w", err)
+			return errors.Join(
+				fmt.Errorf("bitmapindex: add key to MPHF: %w", err),
+				builder.Close(),
+			)
 		}
 	}
 	if err := builder.Finish(); err != nil {
@@ -145,7 +152,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 	// Free the original map — bitmaps are now owned by ranked[].
 	w.bitmaps = nil
 
-	// Parallel per-bitmap preparation (RunOptimize + serialize + compress).
+	// Per-bitmap preparation (RunOptimize + serialize + compress).
 	type preparedBitmap struct {
 		fingerprint [4]byte
 		flags       byte
@@ -153,69 +160,83 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 	}
 	prepared := make([]preparedBitmap, totalKeys)
 
-	ch := make(chan int, totalKeys)
-	for i := range totalKeys {
-		ch <- i
+	prepareBitmap := func(i int, enc *zstd.Compressor) error {
+		entry := &ranked[i]
+		entry.bitmap.RunOptimize()
+		raw, err := entry.bitmap.ToBytes()
+		if err != nil {
+			return err
+		}
+		entry.bitmap = nil // free bitmap memory
+
+		pb := preparedBitmap{fingerprint: entry.fingerprint}
+		if len(raw) >= 256 {
+			compressed, encErr := enc.Encode(raw)
+			if encErr != nil {
+				return encErr
+			}
+			if len(compressed) < len(raw) {
+				pb.flags = flagCompressed
+				pb.data = make([]byte, len(compressed))
+				copy(pb.data, compressed)
+				prepared[i] = pb
+				return nil
+			}
+		}
+		pb.data = raw
+		prepared[i] = pb
+		return nil
 	}
-	close(ch)
 
-	numWorkers := runtime.NumCPU()
-	if numWorkers > totalKeys {
-		numWorkers = totalKeys
-	}
+	numWorkers := min(w.concurrency, totalKeys)
 
-	prepCtx, prepCancel := context.WithCancel(ctx)
-	defer prepCancel()
+	if numWorkers <= 1 {
+		// Serial path.
+		enc := zstd.NewCompressor()
+		defer enc.Close()
+		for i := range totalKeys {
+			if err := prepareBitmap(i, enc); err != nil {
+				return fmt.Errorf("bitmapindex: record preparation: %w", err)
+			}
+		}
+	} else {
+		// Parallel path.
+		ch := make(chan int, totalKeys)
+		for i := range totalKeys {
+			ch <- i
+		}
+		close(ch)
 
-	var wg sync.WaitGroup
-	var errOnce sync.Once
-	var firstErr error
-	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			enc := zstd.NewCompressor()
-			defer enc.Close()
+		prepCtx, prepCancel := context.WithCancel(ctx)
+		defer prepCancel()
 
-			for i := range ch {
-				if prepCtx.Err() != nil {
-					return
-				}
-				entry := &ranked[i]
-				entry.bitmap.RunOptimize()
-				raw, err := entry.bitmap.ToBytes()
-				if err != nil {
-					errOnce.Do(func() { firstErr = err })
-					prepCancel()
-					return
-				}
-				entry.bitmap = nil // free bitmap memory
+		var wg sync.WaitGroup
+		var errOnce sync.Once
+		var firstErr error
+		for range numWorkers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				enc := zstd.NewCompressor()
+				defer enc.Close()
 
-				pb := preparedBitmap{fingerprint: entry.fingerprint}
-				if len(raw) >= 256 {
-					compressed, encErr := enc.Encode(raw)
-					if encErr != nil {
-						errOnce.Do(func() { firstErr = encErr })
+				for i := range ch {
+					if prepCtx.Err() != nil {
+						return
+					}
+					if err := prepareBitmap(i, enc); err != nil {
+						errOnce.Do(func() { firstErr = err })
 						prepCancel()
 						return
 					}
-					if len(compressed) < len(raw) {
-						pb.flags = flagCompressed
-						pb.data = make([]byte, len(compressed))
-						copy(pb.data, compressed)
-						prepared[i] = pb
-						continue
-					}
 				}
-				pb.data = raw
-				prepared[i] = pb
-			}
-		}()
-	}
-	wg.Wait()
+			}()
+		}
+		wg.Wait()
 
-	if firstErr != nil {
-		return fmt.Errorf("bitmapindex: record preparation: %w", firstErr)
+		if firstErr != nil {
+			return fmt.Errorf("bitmapindex: record preparation: %w", firstErr)
+		}
 	}
 
 	// Group into batch records and write to packfile.
@@ -279,8 +300,10 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 		batchBuf = binary.LittleEndian.AppendUint32(batchBuf, crc)
 
 		if err := pw.Append(batchBuf); err != nil {
-			pw.Abort()
-			return fmt.Errorf("bitmapindex: append batch %d: %w", b, err)
+			return errors.Join(
+				fmt.Errorf("bitmapindex: append batch %d: %w", b, err),
+				pw.Abort(),
+			)
 		}
 
 		// Free prepared data for this batch.
