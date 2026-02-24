@@ -24,10 +24,7 @@ import (
 // because RocksDB benefits from field-prefix grouping for sorted scans, while MPHF
 // only needs collision avoidance via the trailing discriminator.
 func buildRocksDBFromEventStore(ctx context.Context, storePath, dbPath string) error {
-	er, err := eventstore.Open(storePath)
-	if err != nil {
-		return fmt.Errorf("bitmapindex: open eventstore: %w", err)
-	}
+	er := eventstore.Open(storePath)
 	defer er.Close()
 
 	// Phase 1: Stream events, build bitmaps in memory.
@@ -39,7 +36,11 @@ func buildRocksDBFromEventStore(ctx context.Context, storePath, dbPath string) e
 
 	ordinal := uint32(0)
 	var ev event.Event
-	for data, err := range er.ReadEvents(0, er.EventCount()) {
+	ec, err := er.EventCount()
+	if err != nil {
+		return fmt.Errorf("bitmapindex: event count: %w", err)
+	}
+	for data, err := range er.ReadEvents(0, ec) {
 		if err != nil {
 			return fmt.Errorf("bitmapindex: read event %d: %w", ordinal, err)
 		}

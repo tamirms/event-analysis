@@ -46,25 +46,98 @@ func WithExpectedLookups(n int) ReaderOption {
 }
 
 // WithConcurrency sets the max parallel goroutines for LookupKeys.
-// Default is 8.
+// Values less than 1 are clamped to 1. Default is 8.
 func WithConcurrency(n int) ReaderOption {
 	return func(cfg *readerConfig) { cfg.concurrency = n }
 }
 
+type mphfResult struct {
+	idx *streamhash.Index
+	err error
+}
+
 // Reader provides point lookups from an MPHF+packfile bitmap index.
 // Thread-safe for concurrent Lookup and LookupKeys calls after Open.
+//
+// Open returns immediately; MPHF loading and packfile opening happen
+// in background goroutines. Each dependency is waited on at the exact
+// point it's needed in the query path.
 type Reader struct {
-	mphf        *streamhash.Index
-	pack        *packfile.Reader
-	batchSize   int // from metadata
-	concurrency int // for LookupKeys worker pool
+	pack        *packfile.Reader // from packfile.Open (non-blocking)
+	concurrency int
+
+	// MPHF — loaded async:
+	mphfCh    <-chan mphfResult
+	mphfOnce  sync.Once
+	mphfIndex *streamhash.Index
+	mphfErr   error
+
+	// Packfile metadata — validated on first access:
+	packOnce  sync.Once
+	batchSize int
+	packErr   error
+
+	// Idempotent close:
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *Reader) waitMPHF() (*streamhash.Index, error) {
+	r.mphfOnce.Do(func() {
+		res := <-r.mphfCh
+		r.mphfIndex = res.idx
+		r.mphfErr = res.err
+	})
+	return r.mphfIndex, r.mphfErr
+}
+
+func (r *Reader) waitPackfile() error {
+	r.packOnce.Do(func() {
+		meta, err := r.pack.Metadata() // blocks on packfile.waitOpen
+		if err != nil {
+			r.packErr = err
+			return
+		}
+		if len(meta) < metadataSize {
+			r.packErr = fmt.Errorf("bitmapindex: metadata too short: %d bytes (want >= %d)", len(meta), metadataSize)
+			return
+		}
+
+		totalKeys := int(binary.LittleEndian.Uint32(meta[0:4]))
+		r.batchSize = int(binary.LittleEndian.Uint16(meta[4:6]))
+		flags := binary.LittleEndian.Uint16(meta[6:8])
+
+		if flags&^knownFlags != 0 {
+			r.packErr = fmt.Errorf("bitmapindex: unknown metadata flags: %04x", flags)
+			return
+		}
+		if totalKeys == 0 {
+			r.packErr = fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", totalKeys)
+			return
+		}
+		if r.batchSize == 0 {
+			r.packErr = fmt.Errorf("bitmapindex: invalid batchSize %d in metadata", r.batchSize)
+			return
+		}
+
+		rc, err := r.pack.RecordCount()
+		if err != nil {
+			r.packErr = err
+			return
+		}
+		expectedBatches := (totalKeys + r.batchSize - 1) / r.batchSize
+		if expectedBatches != rc {
+			r.packErr = fmt.Errorf("bitmapindex: metadata says %d keys / %d batchSize = %d batches, but packfile has %d records",
+				totalKeys, r.batchSize, expectedBatches, rc)
+		}
+	})
+	return r.packErr
 }
 
 // Open opens a two-file bitmap index for querying.
-// mphfPath is the streamhash MPHF file, dataPath is the packfile
-// with batch bitmap records. Both files are opened in parallel
-// so the wall-clock cost is a single IOP even on cold cache.
-func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error) {
+// Returns immediately; MPHF loading and packfile opening happen in
+// background goroutines. Close must always be called.
+func Open(mphfPath, dataPath string, opts ...ReaderOption) *Reader {
 	cfg := readerConfig{concurrency: defaultConcurrency}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -73,137 +146,94 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 		cfg.concurrency = 1
 	}
 
-	type mphfResult struct {
-		idx *streamhash.Index
-		err error
-	}
 	mphfCh := make(chan mphfResult, 1)
 	go func() {
-		f, err := os.Open(mphfPath)
-		if err != nil {
-			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: open MPHF: %w", err)}
-			return
-		}
-
-		// Decide whether to prefetch (sequential read into memory) or mmap
-		// (on-demand page faults). When expected lookups exceed the number of
-		// 256KB I/Os needed to read the full file, prefetching amortises to
-		// less than one random IOP per lookup and is strictly better.
-		stat, err := f.Stat()
-		if err != nil {
-			f.Close()
-			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: stat MPHF: %w", err)}
-			return
-		}
-		const ebsIOPSize = 256 * 1024
-		readIOPs := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize
-		prefetch := int64(cfg.expectedLookups)+1 > readIOPs
-
-		var idx *streamhash.Index
-		if prefetch {
-			data, readErr := io.ReadAll(f)
-			closeErr := f.Close()
-			if readErr != nil {
-				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: read MPHF: %w", readErr)}
-				return
+		// Single send point: loadMPHF returns the result, panic recovery
+		// overrides it. Exactly one value is sent regardless of outcome.
+		var result mphfResult
+		defer func() {
+			if rv := recover(); rv != nil {
+				if result.idx != nil {
+					result.idx.Close()
+				}
+				result = mphfResult{err: fmt.Errorf("bitmapindex: panic in MPHF load: %v", rv)}
 			}
-			if closeErr != nil {
-				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: close MPHF: %w", closeErr)}
-				return
-			}
-			idx, err = streamhash.OpenBytes(data)
-		} else {
-			idx, err = streamhash.OpenFile(f)
-			closeErr := f.Close()
-			if err != nil {
-				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: mmap MPHF: %w", err)}
-				return
-			}
-			if closeErr != nil {
-				idx.Close()
-				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: close MPHF: %w", closeErr)}
-				return
-			}
-		}
-		if err != nil {
-			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: parse MPHF: %w", err)}
-			return
-		}
-		mphfCh <- mphfResult{idx: idx}
+			mphfCh <- result
+		}()
+		result = loadMPHF(mphfPath, cfg.expectedLookups)
 	}()
-
-	pack, packErr := packfile.Open(dataPath)
-	res := <-mphfCh
-
-	// Handle open errors.
-	if packErr != nil {
-		if res.idx != nil {
-			res.idx.Close()
-		}
-		return nil, fmt.Errorf("bitmapindex: open packfile: %w", packErr)
-	}
-	if res.err != nil {
-		pack.Close()
-		return nil, res.err
-	}
-
-	// Both resources open. Defer cleanup for any subsequent validation error.
-	defer func() {
-		if err != nil {
-			res.idx.Close()
-			pack.Close()
-		}
-	}()
-
-	// Parse and validate metadata.
-	meta := pack.Metadata()
-	if len(meta) < metadataSize {
-		return nil, fmt.Errorf("bitmapindex: metadata too short: %d bytes (want >= %d)", len(meta), metadataSize)
-	}
-
-	totalKeys := int(binary.LittleEndian.Uint32(meta[0:4]))
-	batchSize := int(binary.LittleEndian.Uint16(meta[4:6]))
-	flags := binary.LittleEndian.Uint16(meta[6:8])
-
-	if flags&^knownFlags != 0 {
-		return nil, fmt.Errorf("bitmapindex: unknown metadata flags: %04x", flags)
-	}
-	if totalKeys == 0 {
-		return nil, fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", totalKeys)
-	}
-	if batchSize == 0 {
-		return nil, fmt.Errorf("bitmapindex: invalid batchSize %d in metadata", batchSize)
-	}
-
-	expectedBatches := (totalKeys + batchSize - 1) / batchSize
-	if expectedBatches != pack.RecordCount() {
-		return nil, fmt.Errorf("bitmapindex: metadata says %d keys / %d batchSize = %d batches, but packfile has %d records",
-			totalKeys, batchSize, expectedBatches, pack.RecordCount())
-	}
 
 	return &Reader{
-		mphf:        res.idx,
-		pack:        pack,
-		batchSize:   batchSize,
+		pack:        packfile.Open(dataPath), // non-blocking
 		concurrency: cfg.concurrency,
-	}, nil
+		mphfCh:      mphfCh,
+	}
+}
+
+// loadMPHF performs all synchronous I/O for loading the MPHF index.
+// The file is closed via defer on all paths (including panics).
+func loadMPHF(path string, expectedLookups int) mphfResult {
+	f, err := os.Open(path)
+	if err != nil {
+		return mphfResult{err: fmt.Errorf("bitmapindex: open MPHF: %w", err)}
+	}
+	defer f.Close()
+
+	// Decide whether to prefetch (sequential read into memory) or mmap
+	// (on-demand page faults). When expected lookups exceed the number of
+	// 256KB I/Os needed to read the full file, prefetching amortises to
+	// less than one random IOP per lookup and is strictly better.
+	stat, err := f.Stat()
+	if err != nil {
+		return mphfResult{err: fmt.Errorf("bitmapindex: stat MPHF: %w", err)}
+	}
+	const ebsIOPSize = 256 * 1024
+	readIOPs := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize
+	prefetch := int64(expectedLookups)+1 > readIOPs
+
+	var idx *streamhash.Index
+	if prefetch {
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return mphfResult{err: fmt.Errorf("bitmapindex: read MPHF: %w", err)}
+		}
+		idx, err = streamhash.OpenBytes(data)
+		if err != nil {
+			return mphfResult{err: fmt.Errorf("bitmapindex: parse MPHF: %w", err)}
+		}
+	} else {
+		idx, err = streamhash.OpenFile(f)
+		if err != nil {
+			return mphfResult{err: fmt.Errorf("bitmapindex: mmap MPHF: %w", err)}
+		}
+	}
+	return mphfResult{idx: idx}
 }
 
 // Lookup returns the roaring bitmap for the given field/key, or ErrKeyNotFound
 // if the key is not in the index (fingerprint mismatch).
 func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
+	mphf, err := r.waitMPHF() // wait for MPHF only
+	if err != nil {
+		return nil, err
+	}
+
 	var buf [256]byte
 	composed := composeKey(buf[:0], f, key)
 
 	var hk [16]byte
 	streamhash.PreHashInPlace(composed, hk[:])
 
-	rank, err := r.mphf.Query(hk[:])
+	rank, err := mphf.Query(hk[:])
 	if err != nil {
 		if errors.Is(err, streamerrors.ErrNotFound) || errors.Is(err, streamerrors.ErrFingerprintMismatch) {
 			return nil, ErrKeyNotFound
 		}
 		return nil, fmt.Errorf("bitmapindex: MPHF query: %w", err)
+	}
+
+	if err := r.waitPackfile(); err != nil { // NOW wait for packfile
+		return nil, err
 	}
 
 	batchIdx := int(rank) / r.batchSize
@@ -233,16 +263,22 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		return nil, nil
 	}
 
+	mphf, err := r.waitMPHF() // wait for MPHF only
+	if err != nil {
+		return nil, err
+	}
+
 	out := make([]*roaring.Bitmap, len(keys))
 
-	// MPHF query all keys and group by batch index.
+	// MPHF query all keys — packfile may still be loading during this phase.
 	type foundKey struct {
 		outIdx   int
 		hk       [16]byte
+		rank     uint64
 		batchIdx int
 		localIdx int
 	}
-	var found []foundKey
+	found := make([]foundKey, 0, len(keys))
 
 	var buf [256]byte
 	for i, key := range keys {
@@ -251,7 +287,7 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		var hk [16]byte
 		streamhash.PreHashInPlace(composed, hk[:])
 
-		rank, err := r.mphf.Query(hk[:])
+		rank, err := mphf.Query(hk[:])
 		if err != nil {
 			if errors.Is(err, streamerrors.ErrNotFound) || errors.Is(err, streamerrors.ErrFingerprintMismatch) {
 				continue
@@ -260,15 +296,24 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		}
 
 		found = append(found, foundKey{
-			outIdx:   i,
-			hk:       hk,
-			batchIdx: int(rank) / r.batchSize,
-			localIdx: int(rank) % r.batchSize,
+			outIdx: i,
+			hk:     hk,
+			rank:   rank,
 		})
 	}
 
 	if len(found) == 0 {
 		return out, nil
+	}
+
+	if err := r.waitPackfile(); err != nil { // NOW wait for packfile
+		return nil, err
+	}
+
+	// Decompose ranks using batchSize now that packfile metadata is ready.
+	for i := range found {
+		found[i].batchIdx = int(found[i].rank) / r.batchSize
+		found[i].localIdx = int(found[i].rank) % r.batchSize
 	}
 
 	// Sort by batch index so keys hitting the same batch are adjacent.
@@ -310,12 +355,14 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		go func() {
 			defer wg.Done()
 			lb := getBuf()
-			defer putBuf(lb)
 			defer func() {
 				if rv := recover(); rv != nil {
+					// Don't return lb to pool — CGO decompressor may be in invalid state.
 					errOnce.Do(func() { firstErr = fmt.Errorf("bitmapindex: panic in LookupKeys worker: %v", rv) })
 					cancel()
+					return
 				}
+				putBuf(lb)
 			}()
 
 			for {
@@ -369,11 +416,21 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 	return out, nil
 }
 
-// Close releases all resources.
+// Close releases all resources. Safe to call multiple times.
+// Must always be called, even if no query methods were called.
 func (r *Reader) Close() error {
-	mErr := r.mphf.Close()
-	pErr := r.pack.Close()
-	return errors.Join(mErr, pErr)
+	r.closeOnce.Do(func() {
+		r.mphfOnce.Do(func() {
+			res := <-r.mphfCh
+			r.mphfIndex = res.idx
+			r.mphfErr = res.err
+		})
+		if r.mphfIndex != nil {
+			r.closeErr = r.mphfIndex.Close()
+		}
+		r.closeErr = errors.Join(r.closeErr, r.pack.Close())
+	})
+	return r.closeErr
 }
 
 // --- Internal helpers ---

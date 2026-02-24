@@ -192,13 +192,10 @@ func openRocksDB(b *testing.B) *grocksdb.DB {
 func BenchmarkPackfileSeqRead(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	b.SetBytes(int64(totalRawBytes))
 	b.ResetTimer()
 
@@ -243,13 +240,10 @@ func BenchmarkRocksDBSeqRead(b *testing.B) {
 func BenchmarkPackfileRandomRead(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
 
@@ -293,13 +287,10 @@ func BenchmarkRocksDBRandomRead(b *testing.B) {
 func BenchmarkPackfileParallelRead(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
@@ -350,10 +341,7 @@ func BenchmarkRocksDBParallelRead(b *testing.B) {
 func BenchmarkPackfileReadBatch128(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
 	batchSize := min(128, totalEvents)
@@ -412,13 +400,10 @@ func BenchmarkRocksDBReadBatch128(b *testing.B) {
 func BenchmarkPackfileRangeScan128(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	const scanLen = 128
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
@@ -491,13 +476,10 @@ func generateScatteredIndices(rng *rand.Rand, n, total int) []int {
 func BenchmarkPackfileReadIndices(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	// 50 scattered indices per call — typical query fan-out
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
@@ -517,13 +499,10 @@ func BenchmarkPackfileReadIndices(b *testing.B) {
 func BenchmarkPackfileReadEventParallel50(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
@@ -549,13 +528,10 @@ func BenchmarkPackfileReadEventParallel50(b *testing.B) {
 func BenchmarkPackfileReadEventSeq50(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
@@ -650,13 +626,10 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 func BenchmarkPackfileParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	const numIndices = 50
 	b.ResetTimer()
 
@@ -713,10 +686,7 @@ func BenchmarkPackfileOpen(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		r, err := eventstore.Open(eventstorePath)
-		if err != nil {
-			b.Fatal(err)
-		}
+		r := eventstore.Open(eventstorePath)
 		r.Close()
 	}
 }

@@ -154,11 +154,11 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// Packfile sequential
 	{
-		er, err := eventstore.Open(packPath)
+		er := eventstore.Open(packPath)
+		n, err := er.EventCount()
 		if err != nil {
 			t.Fatal(err)
 		}
-		n := er.EventCount()
 
 		times := make([]float64, seqRuns)
 		for r := range seqRuns {
@@ -229,10 +229,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// Packfile point reads
 	{
-		er, err := eventstore.Open(packPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		er := eventstore.Open(packPath)
 
 		times := make([]float64, pointRuns)
 		for r := range pointRuns {
@@ -301,11 +298,11 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// Packfile scattered reads via ReadIndices
 	{
-		er, err := eventstore.Open(packPath)
+		er := eventstore.Open(packPath)
+		n, err := er.EventCount()
 		if err != nil {
 			t.Fatal(err)
 		}
-		n := er.EventCount()
 
 		times := make([]float64, scatteredRuns)
 		for r := range scatteredRuns {
@@ -390,11 +387,11 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// Packfile range scan
 	{
-		er, err := eventstore.Open(packPath)
+		er := eventstore.Open(packPath)
+		n, err := er.EventCount()
 		if err != nil {
 			t.Fatal(err)
 		}
-		n := er.EventCount()
 
 		times := make([]float64, rangeScanRuns)
 		for r := range rangeScanRuns {

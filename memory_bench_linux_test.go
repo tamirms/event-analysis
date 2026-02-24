@@ -137,11 +137,9 @@ func BenchmarkPackfileSeqReadMemory(b *testing.B) {
 	var peakDelta int64
 	for range b.N {
 		peakDelta = peakRssAnonDelta(func() {
-			er, err := eventstore.Open(eventstorePath)
-			if err != nil {
-				b.Fatal(err)
-			}
-			for ev, err := range er.ReadEvents(0, er.EventCount()) {
+			er := eventstore.Open(eventstorePath)
+			ec, _ := er.EventCount()
+			for ev, err := range er.ReadEvents(0, ec) {
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -156,13 +154,10 @@ func BenchmarkPackfileSeqReadMemory(b *testing.B) {
 func benchPackfileReadIndicesMemory(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
-	er, err := eventstore.Open(eventstorePath, eventstore.WithConcurrency(concurrency))
-	if err != nil {
-		b.Fatal(err)
-	}
+	er := eventstore.Open(eventstorePath, eventstore.WithConcurrency(concurrency))
 	defer er.Close()
 
-	n := er.EventCount()
+	n, _ := er.EventCount()
 	const numIndices = 1000
 	rng := rand.New(rand.NewSource(42))
 	indices := generateScatteredIndices(rng, numIndices, n)

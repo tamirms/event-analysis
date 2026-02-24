@@ -82,11 +82,12 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		}
 
 		// Open via packfile to get trailer info.
-		pr, err := packfile.Open(esPath)
+		pr := packfile.Open(esPath)
+		trailer, err := pr.Trailer()
 		if err != nil {
+			pr.Close()
 			t.Fatal(err)
 		}
-		trailer := pr.Trailer()
 		pr.Close()
 
 		fi, err := os.Stat(esPath)

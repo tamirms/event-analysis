@@ -47,14 +47,15 @@ func TestRoundTrip(t *testing.T) {
 	events := makeEvents(500, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 500 {
-		t.Fatalf("EventCount = %d, want 500", r.EventCount())
+	if ec != 500 {
+		t.Fatalf("EventCount = %d, want 500", ec)
 	}
 
 	for i, want := range events {
@@ -74,14 +75,15 @@ func TestPartialLastBatch(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 300 {
-		t.Fatalf("EventCount = %d, want 300", r.EventCount())
+	if ec != 300 {
+		t.Fatalf("EventCount = %d, want 300", ec)
 	}
 
 	for i, want := range events {
@@ -100,10 +102,7 @@ func TestReadEventsFullRange(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	j := 0
@@ -126,10 +125,7 @@ func TestReadEventsPartialRange(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	// Read events 120-200 (crosses block boundary at 128)
@@ -153,10 +149,7 @@ func TestReadEventsEarlyBreak(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	j := 0
@@ -180,10 +173,7 @@ func TestReadEventsEmpty(t *testing.T) {
 	events := makeEvents(10, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	j := 0
@@ -203,10 +193,7 @@ func TestReadIndicesScattered(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	// Indices spanning multiple blocks
@@ -231,10 +218,7 @@ func TestReadIndicesDuplicatesPanic(t *testing.T) {
 	events := makeEvents(100, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	defer func() {
@@ -242,7 +226,8 @@ func TestReadIndicesDuplicatesPanic(t *testing.T) {
 			t.Fatal("expected panic for duplicate indices")
 		}
 	}()
-	r.ReadIndices(context.Background(), []int{5, 5, 10})
+	for range r.ReadIndices(context.Background(), []int{5, 5, 10}) {
+	}
 }
 
 func TestReadIndicesUnsortedPanic(t *testing.T) {
@@ -250,10 +235,7 @@ func TestReadIndicesUnsortedPanic(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	defer func() {
@@ -261,7 +243,8 @@ func TestReadIndicesUnsortedPanic(t *testing.T) {
 			t.Fatal("expected panic for unsorted indices")
 		}
 	}()
-	r.ReadIndices(context.Background(), []int{10, 5, 20})
+	for range r.ReadIndices(context.Background(), []int{10, 5, 20}) {
+	}
 }
 
 func TestReadIndicesEarlyBreak(t *testing.T) {
@@ -269,10 +252,7 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 	events := makeEvents(300, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	before := runtime.NumGoroutine()
@@ -309,14 +289,15 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 func TestEmptyStore(t *testing.T) {
 	path := writeTestStore(t, nil, DefaultBlockSize)
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 0 {
-		t.Fatalf("EventCount = %d, want 0", r.EventCount())
+	if ec != 0 {
+		t.Fatalf("EventCount = %d, want 0", ec)
 	}
 
 	_, err = r.ReadEvent(0)
@@ -330,13 +311,10 @@ func TestOutOfRange(t *testing.T) {
 	events := makeEvents(10, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
-	_, err = r.ReadEvent(-1)
+	_, err := r.ReadEvent(-1)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadEvent(-1): got %v, want ErrIndexRange", err)
 	}
@@ -357,10 +335,7 @@ func TestReadEventsPanic(t *testing.T) {
 	events := makeEvents(10, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	assertPanics := func(name string, f func()) {
@@ -373,9 +348,9 @@ func TestReadEventsPanic(t *testing.T) {
 		f()
 	}
 
-	assertPanics("negative start", func() { r.ReadEvents(-1, 1) })
-	assertPanics("negative count", func() { r.ReadEvents(0, -1) })
-	assertPanics("out of range", func() { r.ReadEvents(5, 10) })
+	assertPanics("negative start", func() { for range r.ReadEvents(-1, 1) {} })
+	assertPanics("negative count", func() { for range r.ReadEvents(0, -1) {} })
+	assertPanics("out of range", func() { for range r.ReadEvents(5, 10) {} })
 }
 
 func TestSingleEvent(t *testing.T) {
@@ -383,10 +358,7 @@ func TestSingleEvent(t *testing.T) {
 	events := makeEvents(1, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	got, err := r.ReadEvent(0)
@@ -403,14 +375,15 @@ func TestSmallBlockSize(t *testing.T) {
 	events := makeEvents(20, rng)
 	path := writeTestStore(t, events, 3) // 3 events per block
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 20 {
-		t.Fatalf("EventCount = %d, want 20", r.EventCount())
+	if ec != 20 {
+		t.Fatalf("EventCount = %d, want 20", ec)
 	}
 
 	for i, want := range events {
@@ -482,14 +455,15 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 	}
 
 	// Verify parallel output reads back correctly.
-	r, err := Open(parallelPath)
+	r := Open(parallelPath)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 500 {
-		t.Fatalf("EventCount = %d, want 500", r.EventCount())
+	if ec != 500 {
+		t.Fatalf("EventCount = %d, want 500", ec)
 	}
 	for i, want := range events {
 		got, err := r.ReadEvent(i)
@@ -521,14 +495,15 @@ func TestNoCompressionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 500 {
-		t.Fatalf("EventCount = %d, want 500", r.EventCount())
+	if ec != 500 {
+		t.Fatalf("EventCount = %d, want 500", ec)
 	}
 
 	// Verify via ReadEvent (point reads).
@@ -544,7 +519,7 @@ func TestNoCompressionRoundTrip(t *testing.T) {
 
 	// Verify via ReadEvents (sequential range).
 	i := 0
-	for got, err := range r.ReadEvents(0, r.EventCount()) {
+	for got, err := range r.ReadEvents(0, 500) {
 		if err != nil {
 			t.Fatalf("ReadEvents at %d: %v", i, err)
 		}
@@ -573,10 +548,7 @@ func TestReadIndicesAllFromSingleBlock(t *testing.T) {
 	events := makeEvents(200, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	// All indices from the first block
@@ -604,10 +576,7 @@ func TestReadIndicesEmpty(t *testing.T) {
 	events := makeEvents(10, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	j := 0
@@ -628,14 +597,15 @@ func TestExactBlockMultiple(t *testing.T) {
 	events := makeEvents(256, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	ec, err := r.EventCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.EventCount() != 256 {
-		t.Fatalf("EventCount = %d, want 256", r.EventCount())
+	if ec != 256 {
+		t.Fatalf("EventCount = %d, want 256", ec)
 	}
 
 	// Verify last event
@@ -668,10 +638,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 	events := makeEvents(500, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	var wg sync.WaitGroup
@@ -723,10 +690,7 @@ func TestReadIndicesPreCanceled(t *testing.T) {
 	events := makeEvents(100, rng)
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -756,10 +720,7 @@ func TestUniformSizeEvents(t *testing.T) {
 	}
 	path := writeTestStore(t, events, DefaultBlockSize)
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	for i, want := range events {
@@ -770,5 +731,25 @@ func TestUniformSizeEvents(t *testing.T) {
 		if !bytes.Equal(got, want) {
 			t.Fatalf("ReadEvent(%d): data mismatch", i)
 		}
+	}
+}
+
+func TestOpenBadPath(t *testing.T) {
+	r := Open("/nonexistent/path/to/store.events")
+	defer r.Close()
+
+	_, err := r.ReadEvent(0)
+	if err == nil {
+		t.Fatal("expected error for bad path")
+	}
+}
+
+func TestEventCountBadPath(t *testing.T) {
+	r := Open("/nonexistent/path/to/store.events")
+	defer r.Close()
+
+	_, err := r.EventCount()
+	if err == nil {
+		t.Fatal("expected error for bad path")
 	}
 }

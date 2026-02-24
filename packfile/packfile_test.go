@@ -42,14 +42,15 @@ func TestRoundTrip(t *testing.T) {
 	records := makeRecords(500, 1024)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != len(records) {
-		t.Fatalf("RecordCount = %d, want %d", r.RecordCount(), len(records))
+	if rc != len(records) {
+		t.Fatalf("RecordCount = %d, want %d", rc, len(records))
 	}
 
 	for i, want := range records {
@@ -66,14 +67,15 @@ func TestRoundTrip(t *testing.T) {
 func TestEmptyFile(t *testing.T) {
 	path := writeTestPackfile(t, nil, WriterOptions{})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != 0 {
-		t.Fatalf("RecordCount = %d, want 0", r.RecordCount())
+	if rc != 0 {
+		t.Fatalf("RecordCount = %d, want 0", rc)
 	}
 
 	_, err = r.ReadRecordInto(0, nil)
@@ -86,14 +88,15 @@ func TestSingleRecord(t *testing.T) {
 	records := makeRecords(1, 256)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != 1 {
-		t.Fatalf("RecordCount = %d, want 1", r.RecordCount())
+	if rc != 1 {
+		t.Fatalf("RecordCount = %d, want 1", rc)
 	}
 
 	got, err := r.ReadRecordInto(0, nil)
@@ -110,14 +113,15 @@ func TestPartialLastGroup(t *testing.T) {
 	records := makeRecords(200, 512)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != 200 {
-		t.Fatalf("RecordCount = %d, want 200", r.RecordCount())
+	if rc != 200 {
+		t.Fatalf("RecordCount = %d, want 200", rc)
 	}
 
 	// Verify all records.
@@ -145,10 +149,7 @@ func TestLargeRecords(t *testing.T) {
 
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	// Point reads.
@@ -201,7 +202,9 @@ func TestIndexIntegrity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Open(corruptPath)
+	r := Open(corruptPath)
+	defer r.Close()
+	_, err = r.RecordCount()
 	if !errors.Is(err, ErrChecksum) {
 		t.Fatalf("Open corrupt index: got %v, want ErrChecksum", err)
 	}
@@ -225,7 +228,9 @@ func TestTrailerIntegrity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Open(corruptPath)
+	r := Open(corruptPath)
+	defer r.Close()
+	_, err = r.RecordCount()
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Open corrupt trailer: got %v, want ErrCorrupt", err)
 	}
@@ -235,10 +240,7 @@ func TestConcurrentReads(t *testing.T) {
 	records := makeRecords(100, 512)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	var wg sync.WaitGroup
@@ -271,10 +273,7 @@ func TestReadRecordsIterator(t *testing.T) {
 	records := makeRecords(50, 2048)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	// Full range.
@@ -401,14 +400,15 @@ func TestMetadataRoundTrip(t *testing.T) {
 	records := makeRecords(5, 100)
 	path := writeTestPackfile(t, records, WriterOptions{Metadata: meta})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	got, err := r.Metadata()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if !bytes.Equal(r.Metadata(), meta) {
-		t.Fatalf("Metadata mismatch: got %q, want %q", r.Metadata(), meta)
+	if !bytes.Equal(got, meta) {
+		t.Fatalf("Metadata mismatch: got %q, want %q", got, meta)
 	}
 }
 
@@ -424,10 +424,7 @@ func TestVariableSizeRecords(t *testing.T) {
 
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	for i, want := range records {
@@ -446,10 +443,7 @@ func TestUniformSizeRecords(t *testing.T) {
 	records := makeRecords(256, 1000)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	for i, want := range records {
@@ -467,13 +461,10 @@ func TestReadRecordOutOfRange(t *testing.T) {
 	records := makeRecords(5, 100)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
-	_, err = r.ReadRecordInto(-1, nil)
+	_, err := r.ReadRecordInto(-1, nil)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadRecord(-1): got %v, want ErrIndexRange", err)
 	}
@@ -493,10 +484,7 @@ func TestReadRecordsPanic(t *testing.T) {
 	records := makeRecords(5, 100)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := Open(path)
 	defer r.Close()
 
 	assertPanics := func(name string, f func()) {
@@ -509,9 +497,9 @@ func TestReadRecordsPanic(t *testing.T) {
 		f()
 	}
 
-	assertPanics("negative index", func() { r.ReadRecords(-1, 1) })
-	assertPanics("negative count", func() { r.ReadRecords(0, -1) })
-	assertPanics("out of range", func() { r.ReadRecords(3, 5) })
+	assertPanics("negative index", func() { for range r.ReadRecords(-1, 1) {} })
+	assertPanics("negative count", func() { for range r.ReadRecords(0, -1) {} })
+	assertPanics("out of range", func() { for range r.ReadRecords(3, 5) {} })
 }
 
 func TestSpeculativeReadFallback(t *testing.T) {
@@ -533,23 +521,32 @@ func TestSpeculativeReadFallback(t *testing.T) {
 
 	path := writeTestPackfile(t, records, WriterOptions{Metadata: []byte("large-index-test")})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != n {
-		t.Fatalf("RecordCount = %d, want %d", r.RecordCount(), n)
+	if rc != n {
+		t.Fatalf("RecordCount = %d, want %d", rc, n)
 	}
 
-	if !bytes.Equal(r.Metadata(), []byte("large-index-test")) {
+	meta, err := r.Metadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(meta, []byte("large-index-test")) {
 		t.Fatalf("Metadata mismatch")
 	}
 
 	// Verify the index actually exceeds speculative read size.
-	if r.Trailer().IndexSize <= 256*1024 {
-		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", r.Trailer().IndexSize)
+	trailer, err := r.Trailer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trailer.IndexSize <= 256*1024 {
+		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", trailer.IndexSize)
 	}
 
 	// Verify all records via ReadRecords iterator.
@@ -628,22 +625,31 @@ func TestSpeculativeReadFallbackNoMetadata(t *testing.T) {
 
 	path := writeTestPackfile(t, records, WriterOptions{})
 
-	r, err := Open(path)
+	r := Open(path)
+	defer r.Close()
+
+	rc, err := r.RecordCount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-
-	if r.RecordCount() != n {
-		t.Fatalf("RecordCount = %d, want %d", r.RecordCount(), n)
+	if rc != n {
+		t.Fatalf("RecordCount = %d, want %d", rc, n)
 	}
 
-	if len(r.Metadata()) != 0 {
-		t.Fatalf("Metadata should be empty, got %d bytes", len(r.Metadata()))
+	meta, err := r.Metadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta) != 0 {
+		t.Fatalf("Metadata should be empty, got %d bytes", len(meta))
 	}
 
-	if r.Trailer().IndexSize <= 256*1024 {
-		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", r.Trailer().IndexSize)
+	trailer, err := r.Trailer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trailer.IndexSize <= 256*1024 {
+		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", trailer.IndexSize)
 	}
 
 	// Spot-check records near group boundaries (128-record groups in FOR index).
@@ -655,5 +661,37 @@ func TestSpeculativeReadFallbackNoMetadata(t *testing.T) {
 		if !bytes.Equal(got, records[i]) {
 			t.Fatalf("ReadRecord(%d): data mismatch", i)
 		}
+	}
+}
+
+func TestOpenBadPath(t *testing.T) {
+	r := Open("/nonexistent/path/to/file.pack")
+	defer r.Close()
+
+	_, err := r.ReadRecordInto(0, nil)
+	if err == nil {
+		t.Fatal("expected error for bad path")
+	}
+}
+
+func TestCloseBeforeRead(t *testing.T) {
+	records := makeRecords(5, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDoubleClose(t *testing.T) {
+	records := makeRecords(5, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	err1 := r.Close()
+	err2 := r.Close()
+	if err1 != err2 {
+		t.Fatalf("double Close: first=%v, second=%v", err1, err2)
 	}
 }

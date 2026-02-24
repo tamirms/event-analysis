@@ -123,10 +123,7 @@ func doBitmapSetup() error {
 // loadBitmapSampleKeys scans the first 50K events from the eventstore to
 // extract real (field, key) pairs for benchmark lookups.
 func loadBitmapSampleKeys(eventstorePath string) error {
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		return fmt.Errorf("open eventstore for sampling: %w", err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
 	type fieldKey struct {
@@ -134,7 +131,11 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 		key   string
 	}
 	seen := make(map[fieldKey]struct{}, 10000)
-	sampleCount := min(50000, er.EventCount())
+	ec, err := er.EventCount()
+	if err != nil {
+		return fmt.Errorf("event count: %w", err)
+	}
+	sampleCount := min(50000, ec)
 
 	var ev event.Event
 	for data, err := range er.ReadEvents(0, sampleCount) {
@@ -189,10 +190,7 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 func BenchmarkBitmapMPHFLookup(b *testing.B) {
 	setupBitmapBenchData(b)
 
-	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
 	defer r.Close()
 
 	keys := bitmapSampleKeys
@@ -235,10 +233,7 @@ func BenchmarkBitmapRocksDBLookup(b *testing.B) {
 func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 	setupBitmapBenchData(b)
 
-	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
 	defer r.Close()
 
 	keys := bitmapSampleKeys
@@ -261,10 +256,7 @@ func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 func BenchmarkBitmapMPHFLookupKeys15(b *testing.B) {
 	setupBitmapBenchData(b)
 
-	r, err := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
-	if err != nil {
-		b.Fatal(err)
-	}
+	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
 	defer r.Close()
 
 	keys := bitmapSampleKeys

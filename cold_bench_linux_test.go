@@ -88,10 +88,7 @@ func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
 		}
 		b.StartTimer()
 
-		er, err := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
-		if err != nil {
-			b.Fatal(err)
-		}
+		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
 		for ev, err := range er.ReadIndices(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)

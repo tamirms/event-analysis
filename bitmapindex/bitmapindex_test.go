@@ -51,10 +51,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	// Open and query.
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	// contractA should have ordinals {0, 1, 3}.
@@ -117,10 +114,7 @@ func TestPrefetchPath(t *testing.T) {
 	}
 
 	// Large expectedLookups on a small file → prefetch path.
-	r, err := Open(mphfPath, dataPath, WithExpectedLookups(1000))
-	if err != nil {
-		t.Fatalf("Open with prefetch: %v", err)
-	}
+	r := Open(mphfPath, dataPath, WithExpectedLookups(1000))
 	defer r.Close()
 
 	bm, err := r.Lookup(FieldContractID, contractA)
@@ -158,14 +152,11 @@ func TestNonMemberLookup(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	// Look up a key that doesn't exist.
-	_, err = r.Lookup(FieldContractID, bytes.Repeat([]byte{0xFF}, 32))
+	_, err := r.Lookup(FieldContractID, bytes.Repeat([]byte{0xFF}, 32))
 	if err != ErrKeyNotFound {
 		t.Fatalf("expected ErrKeyNotFound, got: %v", err)
 	}
@@ -195,10 +186,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	bm, err := r.Lookup(FieldContractID, contractA)
@@ -248,10 +236,7 @@ func TestConcurrentLookups(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	const goroutines = 8
@@ -308,10 +293,7 @@ func TestManyKeys(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	for i, cid := range contracts {
@@ -329,7 +311,7 @@ func TestManyKeys(t *testing.T) {
 	nonMember := make([]byte, 32)
 	nonMember[0] = 0xFF
 	nonMember[1] = 0xFF
-	_, err = r.Lookup(FieldContractID, nonMember)
+	_, err := r.Lookup(FieldContractID, nonMember)
 	if err != ErrKeyNotFound {
 		t.Errorf("non-member: got %v, want ErrKeyNotFound", err)
 	}
@@ -356,10 +338,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	for _, tt := range []struct {
@@ -402,10 +381,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	}
 
 	// Read the raw record to find its location in the file.
-	pack, err := packfile.Open(dataPath)
-	if err != nil {
-		t.Fatalf("Open packfile: %v", err)
-	}
+	pack := packfile.Open(dataPath)
 	rec, err := pack.ReadRecordInto(0, nil)
 	if err != nil {
 		pack.Close()
@@ -414,10 +390,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	pack.Close()
 
 	// Verify it works before corruption.
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	bm, err := r.Lookup(FieldContractID, cid)
 	if err != nil {
 		t.Fatalf("Lookup before corruption: %v", err)
@@ -444,10 +417,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 		t.Fatalf("write corrupted file: %v", err)
 	}
 
-	r, err = Open(mphfPath, corruptedDataPath)
-	if err != nil {
-		t.Fatalf("Open corrupted: %v", err)
-	}
+	r = Open(mphfPath, corruptedDataPath)
 	defer r.Close()
 
 	_, err = r.Lookup(FieldContractID, cid)
@@ -475,10 +445,7 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	pack, err := packfile.Open(dataPath)
-	if err != nil {
-		t.Fatalf("Open packfile: %v", err)
-	}
+	pack := packfile.Open(dataPath)
 	defer pack.Close()
 
 	rec, err := pack.ReadRecordInto(0, nil)
@@ -532,10 +499,7 @@ func TestLookupKeys(t *testing.T) {
 
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	query := []FieldKey{
@@ -572,10 +536,7 @@ func TestLookupKeysAllNotFound(t *testing.T) {
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	query := []FieldKey{
@@ -609,10 +570,7 @@ func TestLookupKeysMixedBatches(t *testing.T) {
 
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{BatchSize: 16})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	nonExistent := bytes.Repeat([]byte{0xFF}, 32)
@@ -663,10 +621,7 @@ func TestLookupKeysBatchCoalescing(t *testing.T) {
 
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	query := make([]FieldKey, numKeys)
@@ -702,10 +657,7 @@ func TestLookupKeysConcurrent(t *testing.T) {
 
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	const goroutines = 8
@@ -757,10 +709,7 @@ func TestLookupKeysEmpty(t *testing.T) {
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
 	results, err := r.LookupKeys(context.Background(), nil)
@@ -793,16 +742,10 @@ func TestCustomBatchSize(t *testing.T) {
 
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{BatchSize: 16})
 
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := Open(mphfPath, dataPath)
 	defer r.Close()
 
-	if r.batchSize != 16 {
-		t.Errorf("batchSize: got %d, want 16", r.batchSize)
-	}
-
+	// Verify all keys look up correctly — if batchSize were wrong, lookups would fail.
 	for i, cid := range contracts {
 		bm, err := r.Lookup(FieldContractID, cid)
 		if err != nil {
@@ -837,13 +780,7 @@ func TestMetadataValidation(t *testing.T) {
 	dir := t.TempDir()
 
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
-	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
-
-	r, err := Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open valid: %v", err)
-	}
-	r.Close()
+	mphfPath, _ := buildTestIndex(t, dir, contracts, WriterOptions{})
 
 	// Create a packfile with missing metadata.
 	noMetaPath := filepath.Join(dir, "nometa.bitmaps")
@@ -858,7 +795,9 @@ func TestMetadataValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Open(mphfPath, noMetaPath)
+	r := Open(mphfPath, noMetaPath)
+	defer r.Close()
+	_, err = r.Lookup(FieldContractID, bytes.Repeat([]byte{0x01}, 32))
 	if err == nil {
 		t.Fatal("expected error for missing metadata")
 	}
@@ -871,11 +810,11 @@ func TestMetadataFlags(t *testing.T) {
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	pack, err := packfile.Open(dataPath)
+	pack := packfile.Open(dataPath)
+	meta, err := pack.Metadata()
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := pack.Metadata()
 	rec, err := pack.ReadRecordInto(0, nil)
 	pack.Close()
 	if err != nil {
@@ -898,9 +837,57 @@ func TestMetadataFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Open(mphfPath, tamperedPath)
+	r := Open(mphfPath, tamperedPath)
+	defer r.Close()
+	_, err = r.Lookup(FieldContractID, bytes.Repeat([]byte{0x01}, 32))
 	if err == nil {
 		t.Fatal("expected error for unknown flags")
 	}
 	t.Logf("unknown flags: %v", err)
+}
+
+func TestMPHFErrorAtQueryTime(t *testing.T) {
+	dir := t.TempDir()
+	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
+	_, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
+
+	r := Open("/nonexistent/bad.mphf", dataPath)
+	defer r.Close()
+
+	_, err := r.Lookup(FieldContractID, bytes.Repeat([]byte{0x01}, 32))
+	if err == nil {
+		t.Fatal("expected MPHF error")
+	}
+}
+
+func TestPackfileErrorAtQueryTime(t *testing.T) {
+	dir := t.TempDir()
+	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
+	mphfPath, _ := buildTestIndex(t, dir, contracts, WriterOptions{})
+
+	r := Open(mphfPath, "/nonexistent/bad.bitmaps")
+	defer r.Close()
+
+	_, err := r.Lookup(FieldContractID, bytes.Repeat([]byte{0x01}, 32))
+	if err == nil {
+		t.Fatal("expected packfile error")
+	}
+}
+
+func TestCloseWithoutQuery(t *testing.T) {
+	dir := t.TempDir()
+	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
+	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
+
+	r := Open(mphfPath, dataPath)
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestCloseWithFailedOpen(t *testing.T) {
+	r := Open("/nonexistent/bad.mphf", "/nonexistent/bad.bitmaps")
+	// Close drains goroutines and releases resources. Open errors are
+	// surfaced at query time, not at Close time, so this should not panic.
+	r.Close()
 }

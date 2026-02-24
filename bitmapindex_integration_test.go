@@ -75,17 +75,11 @@ func TestBitmapIndexIntegration(t *testing.T) {
 		float64(mphfInfo.Size()+dataInfo.Size())/(1024*1024))
 
 	// Open and verify.
-	r, err := bitmapindex.Open(mphfPath, dataPath)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	r := bitmapindex.Open(mphfPath, dataPath)
 	defer r.Close()
 
 	// Open eventstore for verification scans.
-	er, err := eventstore.Open(eventstorePath)
-	if err != nil {
-		t.Fatalf("open eventstore for verification: %v", err)
-	}
+	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 
 	allFields := []bitmapindex.Field{
@@ -103,7 +97,8 @@ func TestBitmapIndexIntegration(t *testing.T) {
 	}
 
 	var ev event.Event
-	for data, err := range er.ReadEvents(0, er.EventCount()) {
+	ec, _ := er.EventCount()
+	for data, err := range er.ReadEvents(0, ec) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,7 +140,8 @@ func TestBitmapIndexIntegration(t *testing.T) {
 
 	// Spot-check: find the dominant contract ID and verify bitmap cardinality.
 	contractCounts := make(map[string]uint64, 10000)
-	for data, err := range er.ReadEvents(0, er.EventCount()) {
+	ec, _ = er.EventCount()
+	for data, err := range er.ReadEvents(0, ec) {
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -75,69 +75,89 @@ func (bb *blockBuf) event(localIdx int) []byte {
 }
 
 type Reader struct {
-	pr          *packfile.Reader
-	nEvents     int
-	blockN      int
-	concurrency int
-	noCompress  bool // blocks stored uncompressed
+	pr          *packfile.Reader // from packfile.Open (non-blocking)
+	concurrency int              // from options, safe at construction time
+
+	// Deferred init:
+	once       sync.Once
+	nEvents    int
+	blockN     int
+	noCompress bool
+	openErr    error
 }
 
 type ReaderOption func(*Reader)
 
-// WithConcurrency sets the max parallel goroutines for ReadIndices. Default 8.
+// WithConcurrency sets the max parallel goroutines for ReadIndices.
+// Values less than 1 are clamped to 1. Default 8.
 func WithConcurrency(n int) ReaderOption {
 	return func(r *Reader) { r.concurrency = n }
 }
 
-// Open opens an eventstore for reading.
-func Open(path string, opts ...ReaderOption) (*Reader, error) {
-	pr, err := packfile.Open(path)
-	if err != nil {
-		return nil, err
-	}
+func (r *Reader) waitOpen() error {
+	r.once.Do(func() {
+		meta, err := r.pr.Metadata() // blocks on packfile ready
+		if err != nil {
+			r.openErr = err
+			return
+		}
+		if len(meta) < 12 {
+			r.openErr = fmt.Errorf("eventstore: invalid metadata length %d (want >= 12)", len(meta))
+			return
+		}
 
-	meta := pr.Metadata()
-	if len(meta) < 12 {
-		pr.Close()
-		return nil, fmt.Errorf("eventstore: invalid metadata length %d (want >= 12)", len(meta))
-	}
+		r.nEvents = int(binary.LittleEndian.Uint32(meta[0:]))
+		r.blockN = int(binary.LittleEndian.Uint32(meta[4:]))
+		flags := binary.LittleEndian.Uint32(meta[8:])
+		r.noCompress = flags&1 != 0
 
-	nEvents := int(binary.LittleEndian.Uint32(meta[0:]))
-	blockN := int(binary.LittleEndian.Uint32(meta[4:]))
-	flags := binary.LittleEndian.Uint32(meta[8:])
-	noCompress := flags&1 != 0
+		if r.blockN <= 0 {
+			r.openErr = fmt.Errorf("eventstore: invalid blockN %d in metadata", r.blockN)
+			return
+		}
 
-	if blockN <= 0 {
-		pr.Close()
-		return nil, fmt.Errorf("eventstore: invalid blockN %d in metadata", blockN)
-	}
+		// Cross-validate: number of blocks implied by nEvents must match packfile record count.
+		rc, err := r.pr.RecordCount()
+		if err != nil {
+			r.openErr = err
+			return
+		}
+		expectedBlocks := (r.nEvents + r.blockN - 1) / r.blockN
+		if r.nEvents == 0 {
+			expectedBlocks = 0
+		}
+		if expectedBlocks != rc {
+			r.openErr = fmt.Errorf("eventstore: metadata says %d events / %d blockN = %d blocks, but packfile has %d records",
+				r.nEvents, r.blockN, expectedBlocks, rc)
+		}
+	})
+	return r.openErr
+}
 
-	// Cross-validate: number of blocks implied by nEvents must match packfile record count.
-	expectedBlocks := (nEvents + blockN - 1) / blockN
-	if nEvents == 0 {
-		expectedBlocks = 0
-	}
-	if expectedBlocks != pr.RecordCount() {
-		pr.Close()
-		return nil, fmt.Errorf("eventstore: metadata says %d events / %d blockN = %d blocks, but packfile has %d records",
-			nEvents, blockN, expectedBlocks, pr.RecordCount())
-	}
-
+// Open opens an eventstore for reading. Returns immediately; all I/O
+// is deferred to the first method call that needs the result.
+// Close must always be called.
+func Open(path string, opts ...ReaderOption) *Reader {
 	r := &Reader{
-		pr:          pr,
-		nEvents:     nEvents,
-		blockN:      blockN,
-		noCompress:  noCompress,
+		pr:          packfile.Open(path), // non-blocking
 		concurrency: 8,
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
-	return r, nil
+	if r.concurrency < 1 {
+		r.concurrency = 1
+	}
+	return r
 }
 
 // EventCount returns the total number of events.
-func (r *Reader) EventCount() int { return r.nEvents }
+func (r *Reader) EventCount() (int, error) {
+	if err := r.waitOpen(); err != nil {
+		return 0, err
+	}
+	return r.nEvents, nil
+}
 
 // Close closes the underlying packfile.
 func (r *Reader) Close() error { return r.pr.Close() }
@@ -212,6 +232,10 @@ func decodeBlock(raw []byte, n int, sizes []uint32, padded []byte) ([]uint32, []
 // ReadEvent reads a single event by global index.
 // The caller owns the returned slice.
 func (r *Reader) ReadEvent(index int) ([]byte, error) {
+	if err := r.waitOpen(); err != nil {
+		return nil, err
+	}
+
 	if index < 0 || index >= r.nEvents {
 		return nil, ErrIndexRange
 	}
@@ -236,14 +260,19 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 // ReadEvents returns an iterator over count contiguous events starting at start.
 // Each yielded []byte is valid only until the next iteration.
 func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
-	if start < 0 || count < 0 || start > r.nEvents || count > r.nEvents-start {
-		panic(fmt.Sprintf("eventstore: ReadEvents(%d, %d) out of range [0, %d)",
-			start, count, r.nEvents))
-	}
-
 	return func(yield func([]byte, error) bool) {
 		if count == 0 {
 			return
+		}
+
+		if err := r.waitOpen(); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		if start < 0 || count < 0 || start > r.nEvents || count > r.nEvents-start {
+			panic(fmt.Sprintf("eventstore: ReadEvents(%d, %d) out of range [0, %d)",
+				start, count, r.nEvents))
 		}
 
 		firstBlock := start / r.blockN
@@ -325,21 +354,26 @@ func (w *indicesWork) reset(n int) {
 // index is out of [0, EventCount) or if indices are not sorted/unique.
 // Each yielded []byte is owned by the caller (copied out of pooled buffers).
 func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
-	// Validate bounds and sorted+unique invariant
-	for i, idx := range indices {
-		if idx < 0 || idx >= r.nEvents {
-			panic(fmt.Sprintf("eventstore: ReadIndices index %d out of range [0, %d)",
-				idx, r.nEvents))
-		}
-		if i > 0 && indices[i] <= indices[i-1] {
-			panic(fmt.Sprintf("eventstore: ReadIndices indices not sorted/unique at position %d: %d <= %d",
-				i, indices[i], indices[i-1]))
-		}
-	}
-
 	return func(yield func([]byte, error) bool) {
 		if len(indices) == 0 {
 			return
+		}
+
+		if err := r.waitOpen(); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		// Validate bounds and sorted+unique invariant
+		for i, idx := range indices {
+			if idx < 0 || idx >= r.nEvents {
+				panic(fmt.Sprintf("eventstore: ReadIndices index %d out of range [0, %d)",
+					idx, r.nEvents))
+			}
+			if i > 0 && indices[i] <= indices[i-1] {
+				panic(fmt.Sprintf("eventstore: ReadIndices indices not sorted/unique at position %d: %d <= %d",
+					i, indices[i], indices[i-1]))
+			}
 		}
 
 		w := &indicesWork{}
@@ -379,12 +413,14 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			go func() {
 				defer wg.Done()
 				bb := blockBufPool.Get().(*blockBuf)
-				defer blockBufPool.Put(bb)
 				defer func() {
 					if rv := recover(); rv != nil {
+						// Don't return bb to pool — CGO decompressor may be in invalid state.
 						errOnce.Do(func() { firstErr = fmt.Errorf("eventstore: panic in worker: %v", rv) })
 						cancel()
+						return
 					}
+					blockBufPool.Put(bb)
 				}()
 
 				for {

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	readBufSize  = 1 << 20     // 1MB
+	readBufSize         = 1 << 20  // 1MB
 	speculativeReadSize = 256 * 1024 // 256KB speculative read for Open
 )
 
@@ -20,25 +20,75 @@ var readBufPool = sync.Pool{
 	},
 }
 
-// Reader provides random access to records in a packfile.
-// Safe for concurrent use by multiple goroutines.
-type Reader struct {
+// openResult holds everything produced by doOpen.
+type openResult struct {
 	file      ReadAtCloser
 	trailer   Trailer
 	metadata  []byte
-	indexBase int64   // byte position where index section starts
-	offsets   []int64 // decoded absolute offsets, len = recordCount + 1
+	indexBase int64
+	offsets   []int64
+	err       error
 }
 
-// Open reads the trailer and full index, validates file integrity,
-// and returns a Reader ready for concurrent use.
+// Reader provides random access to records in a packfile.
+// Safe for concurrent use by multiple goroutines.
 //
-// Uses a speculative 256KB read from EOF to capture the trailer,
-// index, and metadata in a single syscall when they fit.
-func Open(path string) (*Reader, error) {
+// Open returns immediately; all file I/O runs in a background goroutine.
+// Public methods block (via waitOpen) until the goroutine completes.
+// Close must always be called to release resources.
+type Reader struct {
+	ch        <-chan openResult
+	once      sync.Once
+	closeOnce sync.Once
+	file      ReadAtCloser
+	trailer   Trailer
+	metadata  []byte
+	indexBase int64
+	offsets   []int64
+	openErr   error
+	closeErr  error
+}
+
+// drain receives the goroutine result and populates all Reader fields.
+func (r *Reader) drain() {
+	res := <-r.ch
+	r.file = res.file
+	r.trailer = res.trailer
+	r.metadata = res.metadata
+	r.indexBase = res.indexBase
+	r.offsets = res.offsets
+	r.openErr = res.err
+}
+
+// waitOpen blocks until the background Open goroutine has finished.
+func (r *Reader) waitOpen() error {
+	r.once.Do(r.drain)
+	return r.openErr
+}
+
+// Open returns a Reader immediately. All file I/O (open, stat, speculative
+// read, trailer parse, index decode) runs in a background goroutine.
+// Open never fails; errors are deferred to the first method that needs
+// the result. Close must always be called.
+func Open(path string) *Reader {
+	ch := make(chan openResult, 1)
+	go func() {
+		defer func() {
+			if rv := recover(); rv != nil {
+				ch <- openResult{err: fmt.Errorf("packfile: panic in Open: %v", rv)}
+			}
+		}()
+		ch <- doOpen(path)
+	}()
+	return &Reader{ch: ch}
+}
+
+// doOpen performs all synchronous I/O for opening a packfile.
+// On error it closes the file and returns openResult{err: ...}.
+func doOpen(path string) openResult {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return openResult{err: err}
 	}
 	cleanup := true
 	defer func() {
@@ -49,12 +99,12 @@ func Open(path string) (*Reader, error) {
 
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return openResult{err: err}
 	}
 	fileSize := fi.Size()
 
 	if fileSize < trailerSize {
-		return nil, ErrSize
+		return openResult{err: ErrSize}
 	}
 
 	// Speculative read: last min(speculativeReadSize, fileSize) bytes.
@@ -65,7 +115,7 @@ func Open(path string) (*Reader, error) {
 	speculativeOff := fileSize - speculativeSize
 	speculativeBuf := make([]byte, speculativeSize)
 	if _, err := f.ReadAt(speculativeBuf, speculativeOff); err != nil {
-		return nil, err
+		return openResult{err: err}
 	}
 
 	// Parse trailer from last 32 bytes of speculativeBuf.
@@ -73,11 +123,11 @@ func Open(path string) (*Reader, error) {
 
 	m := binary.LittleEndian.Uint32(tb[0:])
 	if m != magic {
-		return nil, ErrMagic
+		return openResult{err: ErrMagic}
 	}
 	v := tb[4]
 	if v != version {
-		return nil, ErrVersion
+		return openResult{err: ErrVersion}
 	}
 	recordCount := int(binary.LittleEndian.Uint32(tb[6:]))
 	indexSize := int(binary.LittleEndian.Uint32(tb[10:]))
@@ -85,12 +135,12 @@ func Open(path string) (*Reader, error) {
 	storedTrailerCRC := binary.LittleEndian.Uint32(tb[18:])
 
 	if storedTrailerCRC != crc32c(tb[0:18]) {
-		return nil, ErrChecksum
+		return openResult{err: ErrChecksum}
 	}
 
 	indexBase := fileSize - int64(trailerSize) - int64(metadataSize) - int64(indexSize)
 	if indexBase < 0 {
-		return nil, ErrSize
+		return openResult{err: ErrSize}
 	}
 
 	// Tail = index + metadata + trailer. Check if speculativeBuf captured it all.
@@ -117,7 +167,7 @@ func Open(path string) (*Reader, error) {
 		buf := make([]byte, readSize+7) // +7 for safe 8-byte overshoot in DecodeGroup
 		if readSize > 0 {
 			if _, err := f.ReadAt(buf[:readSize], indexBase); err != nil {
-				return nil, err
+				return openResult{err: err}
 			}
 		}
 
@@ -130,11 +180,11 @@ func Open(path string) (*Reader, error) {
 
 	offsets, err := decodeIndex(indexBuf, recordCount, indexSize, indexBase)
 	if err != nil {
-		return nil, err
+		return openResult{err: err}
 	}
 
 	cleanup = false
-	return &Reader{
+	return openResult{
 		file: f,
 		trailer: Trailer{
 			Version:         v,
@@ -146,7 +196,7 @@ func Open(path string) (*Reader, error) {
 		metadata:  metadata,
 		indexBase: indexBase,
 		offsets:   offsets,
-	}, nil
+	}
 }
 
 func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([]int64, error) {
@@ -222,6 +272,9 @@ func (r *Reader) resolveOffsetPair(index int) (start, end int64, err error) {
 // Data integrity for individual records must be provided by an upper
 // layer (e.g. zstd content checksums in the eventstore package).
 func (r *Reader) ReadRecordInto(index int, buf []byte) ([]byte, error) {
+	if err := r.waitOpen(); err != nil {
+		return buf, err
+	}
 	start, end, err := r.resolveOffsetPair(index)
 	if err != nil {
 		return buf, err
@@ -243,14 +296,19 @@ func (r *Reader) ReadRecordInto(index int, buf []byte) ([]byte, error) {
 // Each yielded []byte is valid only until the next iteration —
 // copy if you need to retain it. Safe to break early. Thread-safe.
 func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
-	if index < 0 || count < 0 || index+count > int(r.trailer.RecordCount) {
-		panic(fmt.Sprintf("packfile: ReadRecords(%d, %d) out of range [0, %d)",
-			index, count, r.trailer.RecordCount))
-	}
-
 	return func(yield func([]byte, error) bool) {
 		if count == 0 {
 			return
+		}
+
+		if err := r.waitOpen(); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		if index < 0 || count < 0 || index+count > int(r.trailer.RecordCount) {
+			panic(fmt.Sprintf("packfile: ReadRecords(%d, %d) out of range [0, %d)",
+				index, count, r.trailer.RecordCount))
 		}
 
 		bp := readBufPool.Get().(*[]byte)
@@ -307,26 +365,42 @@ func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
 }
 
 // RecordCount returns the number of records in the packfile.
-func (r *Reader) RecordCount() int {
-	return int(r.trailer.RecordCount)
+func (r *Reader) RecordCount() (int, error) {
+	if err := r.waitOpen(); err != nil {
+		return 0, err
+	}
+	return int(r.trailer.RecordCount), nil
 }
 
 // Trailer returns the parsed trailer.
-func (r *Reader) Trailer() Trailer {
-	return r.trailer
+func (r *Reader) Trailer() (Trailer, error) {
+	if err := r.waitOpen(); err != nil {
+		return Trailer{}, err
+	}
+	return r.trailer, nil
 }
 
 // Metadata returns a copy of the opaque metadata stored in the packfile.
-func (r *Reader) Metadata() []byte {
+func (r *Reader) Metadata() ([]byte, error) {
+	if err := r.waitOpen(); err != nil {
+		return nil, err
+	}
 	if r.metadata == nil {
-		return nil
+		return nil, nil
 	}
 	out := make([]byte, len(r.metadata))
 	copy(out, r.metadata)
-	return out
+	return out, nil
 }
 
-// Close closes the underlying file.
+// Close releases all resources. Safe to call multiple times.
+// Must always be called, even if no query methods were called.
 func (r *Reader) Close() error {
-	return r.file.Close()
+	r.closeOnce.Do(func() {
+		r.once.Do(r.drain) // drain goroutine, populate all fields
+		if r.file != nil {
+			r.closeErr = r.file.Close()
+		}
+	})
+	return r.closeErr
 }

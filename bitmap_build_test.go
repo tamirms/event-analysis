@@ -12,17 +12,18 @@ import (
 // buildBitmapFromEventStore streams all events from the given eventstore and builds
 // an MPHF+packfile bitmap index.
 func buildBitmapFromEventStore(ctx context.Context, storePath, mphfPath, dataPath string) error {
-	er, err := eventstore.Open(storePath)
-	if err != nil {
-		return fmt.Errorf("bitmapindex: open eventstore: %w", err)
-	}
+	er := eventstore.Open(storePath)
 	defer er.Close()
 
 	w := bitmapindex.NewWriter(bitmapindex.WriterOptions{CapacityHint: 600_000})
 
 	ordinal := uint32(0)
 	var ev event.Event
-	for data, err := range er.ReadEvents(0, er.EventCount()) {
+	ec, err := er.EventCount()
+	if err != nil {
+		return fmt.Errorf("bitmapindex: event count: %w", err)
+	}
+	for data, err := range er.ReadEvents(0, ec) {
 		if err != nil {
 			return fmt.Errorf("bitmapindex: read event %d: %w", ordinal, err)
 		}
