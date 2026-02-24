@@ -188,8 +188,8 @@ func loadMPHF(path string, expectedLookups int) mphfResult {
 		return mphfResult{err: fmt.Errorf("bitmapindex: stat MPHF: %w", err)}
 	}
 	const ebsIOPSize = 256 * 1024
-	readIOPs := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize
-	prefetch := int64(expectedLookups)+1 > readIOPs
+	iopsToReadAll := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize // ceil(fileSize / ebsIOPSize)
+	prefetch := int64(expectedLookups)+1 > iopsToReadAll
 
 	var idx *streamhash.Index
 	if prefetch {
