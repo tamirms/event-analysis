@@ -29,12 +29,26 @@ const (
 )
 
 // ReaderOption configures Reader behavior.
-type ReaderOption func(*Reader)
+type ReaderOption func(*readerConfig)
+
+type readerConfig struct {
+	expectedLookups int // drives MPHF prefetch decision; 0 → always mmap
+	concurrency     int // max goroutines for LookupKeys
+}
+
+// WithExpectedLookups hints how many lookups will be performed.
+// When the expected lookups exceed the number of 256KB I/Os needed to
+// read the full MPHF, Open reads it entirely into memory (one sequential
+// read). Otherwise it mmaps the file for on-demand page faults.
+// Default (0) always mmaps.
+func WithExpectedLookups(n int) ReaderOption {
+	return func(cfg *readerConfig) { cfg.expectedLookups = n }
+}
 
 // WithConcurrency sets the max parallel goroutines for LookupKeys.
 // Default is 8.
 func WithConcurrency(n int) ReaderOption {
-	return func(r *Reader) { r.concurrency = n }
+	return func(cfg *readerConfig) { cfg.concurrency = n }
 }
 
 // Reader provides point lookups from an MPHF+packfile bitmap index.
@@ -51,6 +65,14 @@ type Reader struct {
 // with batch bitmap records. Both files are opened in parallel
 // so the wall-clock cost is a single IOP even on cold cache.
 func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error) {
+	cfg := readerConfig{concurrency: defaultConcurrency}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.concurrency < 1 {
+		cfg.concurrency = 1
+	}
+
 	type mphfResult struct {
 		idx *streamhash.Index
 		err error
@@ -62,13 +84,47 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: open MPHF: %w", err)}
 			return
 		}
-		data, err := io.ReadAll(f)
-		f.Close()
+
+		// Decide whether to prefetch (sequential read into memory) or mmap
+		// (on-demand page faults). When expected lookups exceed the number of
+		// 256KB I/Os needed to read the full file, prefetching amortises to
+		// less than one random IOP per lookup and is strictly better.
+		stat, err := f.Stat()
 		if err != nil {
-			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: read MPHF: %w", err)}
+			f.Close()
+			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: stat MPHF: %w", err)}
 			return
 		}
-		idx, err := streamhash.OpenBytes(data)
+		const ebsIOPSize = 256 * 1024
+		readIOPs := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize
+		prefetch := int64(cfg.expectedLookups)+1 > readIOPs
+
+		var idx *streamhash.Index
+		if prefetch {
+			data, readErr := io.ReadAll(f)
+			closeErr := f.Close()
+			if readErr != nil {
+				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: read MPHF: %w", readErr)}
+				return
+			}
+			if closeErr != nil {
+				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: close MPHF: %w", closeErr)}
+				return
+			}
+			idx, err = streamhash.OpenBytes(data)
+		} else {
+			idx, err = streamhash.OpenFile(f)
+			closeErr := f.Close()
+			if err != nil {
+				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: mmap MPHF: %w", err)}
+				return
+			}
+			if closeErr != nil {
+				idx.Close()
+				mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: close MPHF: %w", closeErr)}
+				return
+			}
+		}
 		if err != nil {
 			mphfCh <- mphfResult{err: fmt.Errorf("bitmapindex: parse MPHF: %w", err)}
 			return
@@ -125,19 +181,12 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) (_ *Reader, err error
 			totalKeys, batchSize, expectedBatches, pack.RecordCount())
 	}
 
-	r := &Reader{
+	return &Reader{
 		mphf:        res.idx,
 		pack:        pack,
 		batchSize:   batchSize,
-		concurrency: defaultConcurrency,
-	}
-	for _, opt := range opts {
-		opt(r)
-	}
-	if r.concurrency < 1 {
-		r.concurrency = 1
-	}
-	return r, nil
+		concurrency: cfg.concurrency,
+	}, nil
 }
 
 // Lookup returns the roaring bitmap for the given field/key, or ErrKeyNotFound
