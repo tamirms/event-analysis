@@ -173,7 +173,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 	contractA := bytes.Repeat([]byte{0x01}, 32)
 	contractB := bytes.Repeat([]byte{0x02}, 32)
 	// Add many ordinals to trigger compression (>= 256 bytes serialized).
-	for i := uint32(0); i < 5000; i++ {
+	for i := range uint32(5000) {
 		w.Add(makeTestEvent(contractA), i)
 	}
 	// Add a second key for diversity.
@@ -327,9 +327,9 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	w := NewWriter(WriterOptions{})
 	raw := bytes.Repeat([]byte{0x42}, 32)
 	// Same 32-byte key as ContractID vs Topic0 vs Topic1.
-	w.Add(makeTestEvent(raw), 10)                     // ContractID
-	w.Add(makeTestEvent(nil, raw), 20)                 // Topic0
-	w.Add(makeTestEvent(nil, []byte("x"), raw), 30)    // Topic1
+	w.Add(makeTestEvent(raw), 10)                   // ContractID
+	w.Add(makeTestEvent(nil, raw), 20)              // Topic0
+	w.Add(makeTestEvent(nil, []byte("x"), raw), 30) // Topic1
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -665,9 +665,7 @@ func TestLookupKeysConcurrent(t *testing.T) {
 	errs := make(chan error, goroutines)
 
 	for g := range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			start := g * (numKeys / goroutines)
 			end := start + numKeys/goroutines
 			query := make([]FieldKey, end-start)
@@ -691,7 +689,7 @@ func TestLookupKeysConcurrent(t *testing.T) {
 				}
 			}
 			errs <- nil
-		}()
+		})
 	}
 
 	wg.Wait()

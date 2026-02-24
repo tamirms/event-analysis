@@ -64,7 +64,7 @@ func NewChunkReader(indexPath, dataPath string) (*ChunkReader, error) {
 	}
 
 	offsets := make([]uint64, numOffsets)
-	for i := 0; i < numOffsets; i++ {
+	for i := range numOffsets {
 		if offsetSize == 4 {
 			offsets[i] = uint64(binary.LittleEndian.Uint32(offsetsData[i*4 : i*4+4]))
 		} else {

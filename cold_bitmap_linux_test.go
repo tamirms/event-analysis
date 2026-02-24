@@ -36,7 +36,7 @@ func benchColdBitmapMPHF(b *testing.B, numLookups int) {
 		lookupKeys[i] = rng.Intn(len(keys))
 	}
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropFileCache(mphfPath); err != nil {
 			b.Fatal(err)
@@ -87,7 +87,7 @@ func benchColdBitmapMPHFLookupKeys(b *testing.B, numLookups int) {
 
 	ctx := context.Background()
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropFileCache(mphfPath); err != nil {
 			b.Fatal(err)
@@ -127,7 +127,7 @@ func benchColdBitmapRocksDBParallel(b *testing.B, numLookups int) {
 		lookupKeys[i] = rng.Intn(len(keys))
 	}
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropDirCache(rdbPath); err != nil {
 			b.Fatal(err)
@@ -143,9 +143,7 @@ func benchColdBitmapRocksDBParallel(b *testing.B, numLookups int) {
 		var errOnce sync.Once
 		var firstErr error
 		for _, ki := range lookupKeys {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				k := keys[ki]
 				bm, err := r.Lookup(k.Field, k.Key)
 				if err != nil {
@@ -153,7 +151,7 @@ func benchColdBitmapRocksDBParallel(b *testing.B, numLookups int) {
 					return
 				}
 				_ = bm
-			}()
+			})
 		}
 		wg.Wait()
 		if firstErr != nil {
@@ -182,7 +180,7 @@ func benchColdBitmapRocksDB(b *testing.B, numLookups int) {
 		lookupKeys[i] = rng.Intn(len(keys))
 	}
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropDirCache(rdbPath); err != nil {
 			b.Fatal(err)

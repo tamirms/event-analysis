@@ -98,10 +98,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 		// Compute intra-batch FOR-N overhead by manually encoding.
 		var totalFOR int64
 		for start := 0; start < numEvents; start += n {
-			end := start + n
-			if end > numEvents {
-				end = numEvents
-			}
+			end := min(start+n, numEvents)
 			sizes := make([]uint32, end-start)
 			for j := start; j < end; j++ {
 				sizes[j-start] = uint32(len(allEvents[j]))

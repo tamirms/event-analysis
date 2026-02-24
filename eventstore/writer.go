@@ -28,21 +28,21 @@ type blockResult struct {
 
 type Writer struct {
 	pw         *packfile.Writer
-	buf        []byte   // accumulates raw events for current block
-	sizes      []uint32 // event sizes in current block
-	total      int      // total events written
-	blockN     int      // events per block
-	closed     bool     // set by Finish or Abort
-	err        error    // sticky — once set, all subsequent ops fail
-	noCompress bool     // skip zstd compression
+	buf        []byte           // accumulates raw events for current block
+	sizes      []uint32         // event sizes in current block
+	total      int              // total events written
+	blockN     int              // events per block
+	closed     bool             // set by Finish or Abort
+	err        error            // sticky — once set, all subsequent ops fail
+	noCompress bool             // skip zstd compression
 	compressor *zstd.Compressor // for serial flush path
 
 	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
 	nextBlockID uint32
-	workCh      chan blockResult  // blockID + uncompressed → compress workers
-	resultCh    chan blockResult  // blockID + compressed → writer goroutine
-	writerDone  chan error        // writer signals completion (buffered, size 1)
+	workCh      chan blockResult // blockID + uncompressed → compress workers
+	resultCh    chan blockResult // blockID + compressed → writer goroutine
+	writerDone  chan error       // writer signals completion (buffered, size 1)
 }
 
 // Create starts writing a new eventstore at path.
@@ -74,11 +74,9 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 
 		var compressWg sync.WaitGroup
 		for range w.concurrency {
-			compressWg.Add(1)
-			go func() {
-				defer compressWg.Done()
+			compressWg.Go(func() {
 				w.compressWorker()
-			}()
+			})
 		}
 		// Close resultCh when all compressors finish, signaling the writer to drain and exit.
 		go func() {
@@ -216,9 +214,9 @@ func (w *Writer) Finish() error {
 
 	// Drain the streaming pipeline.
 	if w.workCh != nil {
-		close(w.workCh)        // signal compress workers to stop
-		err := <-w.writerDone  // wait for writer to finish
-		w.workCh = nil         // safe now — all workers have exited
+		close(w.workCh)       // signal compress workers to stop
+		err := <-w.writerDone // wait for writer to finish
+		w.workCh = nil        // safe now — all workers have exited
 		if err != nil {
 			w.err = err
 			return err

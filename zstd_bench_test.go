@@ -31,10 +31,7 @@ func buildZstdBlocks(b *testing.B) {
 		zstdBlocks = make([][]byte, numBlocks)
 		for i := range numBlocks {
 			start := i * blockN
-			end := start + blockN
-			if end > n {
-				end = n
-			}
+			end := min(start+blockN, n)
 			var size int
 			for _, ev := range allEvents[start:end] {
 				size += len(ev)
@@ -73,7 +70,7 @@ func BenchmarkZstdCgoCompress(b *testing.B) {
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	var dst []byte
-	for range b.N {
+	for b.Loop() {
 		for _, blk := range zstdBlocks {
 			out, err := c.Encode(blk)
 			if err != nil {
@@ -100,7 +97,7 @@ func BenchmarkZstdKlauspostCompress(b *testing.B) {
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	var dst []byte
-	for range b.N {
+	for b.Loop() {
 		for _, blk := range zstdBlocks {
 			dst = enc.EncodeAll(blk, dst[:0])
 		}
@@ -130,7 +127,7 @@ func BenchmarkZstdCgoDecompress(b *testing.B) {
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	var dst []byte
-	for range b.N {
+	for b.Loop() {
 		for _, comp := range compressed {
 			var err error
 			dst, err = d.Decode(dst, comp)
@@ -166,7 +163,7 @@ func BenchmarkZstdKlauspostDecompress(b *testing.B) {
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
 	var dst []byte
-	for range b.N {
+	for b.Loop() {
 		for _, comp := range compressed {
 			dst, err = dec.DecodeAll(comp, dst[:0])
 			if err != nil {
@@ -184,7 +181,7 @@ func benchCgoCompressParallel(b *testing.B, workers int) {
 
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		ch := make(chan int, len(zstdBlocks))
 		for i := range zstdBlocks {
 			ch <- i
@@ -231,7 +228,7 @@ func benchKlauspostCompressParallel(b *testing.B, workers int) {
 
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		ch := make(chan int, len(zstdBlocks))
 		for i := range zstdBlocks {
 			ch <- i
@@ -255,8 +252,8 @@ func benchKlauspostCompressParallel(b *testing.B, workers int) {
 	}
 }
 
-func BenchmarkZstdCgoCompressP8(b *testing.B) { benchCgoCompressParallel(b, 8) }
-func BenchmarkZstdKlauspostCompressP8(b *testing.B)   { benchKlauspostCompressParallel(b, 8) }
+func BenchmarkZstdCgoCompressP8(b *testing.B)       { benchCgoCompressParallel(b, 8) }
+func BenchmarkZstdKlauspostCompressP8(b *testing.B) { benchKlauspostCompressParallel(b, 8) }
 
 // --- Parallel decompress ---
 
@@ -276,7 +273,7 @@ func benchCgoDecompressParallel(b *testing.B, workers int) {
 
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		ch := make(chan int, len(compressed))
 		for i := range compressed {
 			ch <- i
@@ -341,7 +338,7 @@ func benchKlauspostDecompressParallel(b *testing.B, workers int) {
 
 	b.SetBytes(zstdTotalBytes())
 	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		ch := make(chan int, len(compressed))
 		for i := range compressed {
 			ch <- i
@@ -375,8 +372,8 @@ func benchKlauspostDecompressParallel(b *testing.B, workers int) {
 	}
 }
 
-func BenchmarkZstdCgoDecompressP8(b *testing.B) { benchCgoDecompressParallel(b, 8) }
-func BenchmarkZstdKlauspostDecompressP8(b *testing.B)   { benchKlauspostDecompressParallel(b, 8) }
+func BenchmarkZstdCgoDecompressP8(b *testing.B)       { benchCgoDecompressParallel(b, 8) }
+func BenchmarkZstdKlauspostDecompressP8(b *testing.B) { benchKlauspostDecompressParallel(b, 8) }
 
 // --- Compression ratio comparison ---
 
@@ -393,10 +390,7 @@ func TestZstdCompressionRatio(t *testing.T) {
 	var totalRaw int64
 	for i := range numBlocks {
 		start := i * blockN
-		end := start + blockN
-		if end > n {
-			end = n
-		}
+		end := min(start+blockN, n)
 		var size int
 		for _, ev := range allEvents[start:end] {
 			size += len(ev)

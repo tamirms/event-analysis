@@ -25,7 +25,7 @@ func readRssAnon() int64 {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if strings.HasPrefix(line, "RssAnon:") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
@@ -92,7 +92,7 @@ func benchPackfileWriteMemory(b *testing.B, concurrency int) {
 	ensureAllEvents(b)
 
 	var peakDelta int64
-	for range b.N {
+	for b.Loop() {
 		p := filepath.Join(b.TempDir(), "bench.events")
 		peakDelta = peakRssAnonDelta(func() {
 			ew, err := eventstore.Create(p, eventstore.WriterOptions{Concurrency: concurrency})
@@ -116,7 +116,7 @@ func benchRocksDBWriteMemory(b *testing.B, parallelComp int) {
 	ensureAllEvents(b)
 
 	var peakDelta int64
-	for range b.N {
+	for b.Loop() {
 		peakDelta = peakRssAnonDelta(func() {
 			rocksDBWriteCore(b, parallelComp)
 		})
@@ -135,7 +135,7 @@ func BenchmarkPackfileSeqReadMemory(b *testing.B) {
 	setupBenchData(b)
 
 	var peakDelta int64
-	for range b.N {
+	for b.Loop() {
 		peakDelta = peakRssAnonDelta(func() {
 			er := eventstore.Open(eventstorePath)
 			ec, _ := er.EventCount()
@@ -163,7 +163,7 @@ func benchPackfileReadIndicesMemory(b *testing.B, concurrency int) {
 	indices := generateScatteredIndices(rng, numIndices, n)
 
 	var peakDelta int64
-	for range b.N {
+	for b.Loop() {
 		peakDelta = peakRssAnonDelta(func() {
 			for ev, err := range er.ReadIndices(context.Background(), indices) {
 				if err != nil {

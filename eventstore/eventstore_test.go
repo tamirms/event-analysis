@@ -348,9 +348,18 @@ func TestReadEventsPanic(t *testing.T) {
 		f()
 	}
 
-	assertPanics("negative start", func() { for range r.ReadEvents(-1, 1) {} })
-	assertPanics("negative count", func() { for range r.ReadEvents(0, -1) {} })
-	assertPanics("out of range", func() { for range r.ReadEvents(5, 10) {} })
+	assertPanics("negative start", func() {
+		for range r.ReadEvents(-1, 1) {
+		}
+	})
+	assertPanics("negative count", func() {
+		for range r.ReadEvents(0, -1) {
+		}
+	})
+	assertPanics("out of range", func() {
+		for range r.ReadEvents(5, 10) {
+		}
+	})
 }
 
 func TestSingleEvent(t *testing.T) {
@@ -716,7 +725,7 @@ func TestUniformSizeEvents(t *testing.T) {
 	// All events same size — exercises W=1 path (clamped from 0)
 	events := make([][]byte, 200)
 	for i := range events {
-		events[i] = []byte(fmt.Sprintf("event-%04d-padding-data-here!", i))
+		events[i] = fmt.Appendf(nil, "event-%04d-padding-data-here!", i)
 	}
 	path := writeTestStore(t, events, DefaultBlockSize)
 

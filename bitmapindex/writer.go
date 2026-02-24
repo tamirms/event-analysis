@@ -51,14 +51,8 @@ func NewWriter(opts WriterOptions) *Writer {
 	if bs > maxBatchSize {
 		bs = maxBatchSize
 	}
-	hint := opts.CapacityHint
-	if hint < 0 {
-		hint = 0
-	}
-	conc := opts.Concurrency
-	if conc < 1 {
-		conc = 1
-	}
+	hint := max(opts.CapacityHint, 0)
+	conc := max(opts.Concurrency, 1)
 	return &Writer{
 		bitmaps:     make(map[[16]byte]*roaring.Bitmap, hint),
 		batchSize:   bs,
@@ -219,9 +213,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 		var errOnce sync.Once
 		var firstErr error
 		for range numWorkers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				enc := zstd.NewCompressor(zstd.WithoutChecksum())
 				defer enc.Close()
 
@@ -235,7 +227,7 @@ func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err err
 						return
 					}
 				}
-			}()
+			})
 		}
 		wg.Wait()
 

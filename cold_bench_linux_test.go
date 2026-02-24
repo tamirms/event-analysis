@@ -81,7 +81,7 @@ func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
 	rng := rand.New(rand.NewSource(42))
 	indices := coldScatteredIndices(rng, numReads, totalEvents, blockSize)
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropFileCache(esPath); err != nil {
 			b.Fatal(err)
@@ -133,7 +133,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	ro.SetAsyncIO(true)
 	defer ro.Destroy()
 
-	for range b.N {
+	for b.Loop() {
 		b.StopTimer()
 		if err := dropDirCache(rdbPath); err != nil {
 			b.Fatal(err)

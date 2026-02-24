@@ -81,10 +81,7 @@ func (w *Writer) Finish() (Trailer, error) {
 	var deltas []uint32
 	for g := 0; g*groupSize < recordCount; g++ {
 		base := g * groupSize
-		end := base + groupSize
-		if end > recordCount {
-			end = recordCount
-		}
+		end := min(base+groupSize, recordCount)
 
 		deltas = deltas[:0]
 		if cap(deltas) < end-base {

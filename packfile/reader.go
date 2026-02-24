@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	readBufSize         = 1 << 20  // 1MB
+	readBufSize         = 1 << 20    // 1MB
 	speculativeReadSize = 256 * 1024 // 256KB speculative read for Open
 )
 
@@ -108,10 +108,7 @@ func doOpen(path string) openResult {
 	}
 
 	// Speculative read: last min(speculativeReadSize, fileSize) bytes.
-	speculativeSize := int64(speculativeReadSize)
-	if speculativeSize > fileSize {
-		speculativeSize = fileSize
-	}
+	speculativeSize := min(int64(speculativeReadSize), fileSize)
 	speculativeOff := fileSize - speculativeSize
 	speculativeBuf := make([]byte, speculativeSize)
 	if _, err := f.ReadAt(speculativeBuf, speculativeOff); err != nil {
