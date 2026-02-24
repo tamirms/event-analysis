@@ -20,7 +20,12 @@ import (
 	"github.com/tamir/events-analysis/zstd"
 )
 
-const defaultBatchSize = 128
+const (
+	defaultBatchSize = 128
+	// maxBatchSize is the largest batch size the format supports.
+	// The batch record encodes the entry count as a uint16.
+	maxBatchSize = 1<<16 - 1
+)
 
 // WriterOptions configures Writer behavior.
 type WriterOptions struct {
@@ -43,8 +48,8 @@ func NewWriter(opts WriterOptions) *Writer {
 	if bs <= 0 {
 		bs = defaultBatchSize
 	}
-	if bs > 65535 {
-		bs = 65535
+	if bs > maxBatchSize {
+		bs = maxBatchSize
 	}
 	hint := opts.CapacityHint
 	if hint < 0 {
