@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -11,23 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
+	rocksdbES "github.com/tamir/events-analysis/eventstore/rocksdb"
 )
-
-// openNoCompRocksDB opens a RocksDB for read-only access with no block cache.
-// Returns db and a cleanup function that closes/destroys all resources.
-func openNoCompRocksDB(path string) (*grocksdb.DB, func(), error) {
-	db, opts, err := openReadOnlyRocksDB(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	cleanup := func() {
-		db.Close()
-		opts.Destroy()
-	}
-	return db, cleanup, nil
-}
 
 // TestReadThroughputNoCompression measures read throughput for packfile and
 // RocksDB with compression disabled, isolating raw I/O and decoding overhead.
@@ -82,63 +67,24 @@ func TestReadThroughputNoCompression(t *testing.T) {
 	}
 	defer os.RemoveAll(rocksDir)
 
-	sstFilePath := filepath.Join(rocksDir, "ingest.sst")
 	dbPath := filepath.Join(rocksDir, "rocks.db")
 	{
 		start := time.Now()
-
-		writeOpts := grocksdb.NewDefaultOptions()
-		writeOpts.SetCompression(grocksdb.NoCompression)
-		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		bbto.SetBlockSize(blockSize)
-		bbto.SetBlockSizeDeviation(100)
-		bbto.SetFormatVersion(5)
-		bbto.SetBlockRestartInterval(128)
-		writeOpts.SetBlockBasedTableFactory(bbto)
-		bbto.Destroy()
-
-		envOpts := grocksdb.NewDefaultEnvOptions()
-		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
-		if err := sfw.Open(sstFilePath); err != nil {
-			t.Fatal(err)
-		}
-		key := make([]byte, 4)
-		for i, ev := range allEvents {
-			binary.BigEndian.PutUint32(key, uint32(i))
-			if err := sfw.Add(key, ev); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := sfw.Finish(); err != nil {
-			t.Fatal(err)
-		}
-		sfw.Destroy()
-		envOpts.Destroy()
-		writeOpts.Destroy()
-
-		dbOpts := grocksdb.NewDefaultOptions()
-		dbOpts.SetCreateIfMissing(true)
-		dbOpts.SetCompression(grocksdb.NoCompression)
-		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		dbBbto.SetNoBlockCache(true)
-		dbBbto.SetBlockSize(blockSize)
-		dbBbto.SetFormatVersion(5)
-		dbOpts.SetBlockBasedTableFactory(dbBbto)
-		dbBbto.Destroy()
-
-		db, err := grocksdb.OpenDb(dbOpts, dbPath)
+		w, err := rocksdbES.Create(dbPath, rocksdbES.WriterOptions{
+			BlockSize:     blockSize,
+			NoCompression: true,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-		ingestOpts.SetMoveFiles(true)
-		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
+		for _, ev := range allEvents {
+			if err := w.Append(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Finish(); err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts.Destroy()
-		db.Close()
-		dbOpts.Destroy()
-
 		elapsed := time.Since(start)
 		rocksSize := dirSize(dbPath)
 		fmt.Printf("  RocksDB (no-comp) written: %s in %.2fs\n",
@@ -181,30 +127,24 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// RocksDB sequential
 	{
-		db, cleanup, err := openNoCompRocksDB(dbPath)
+		rr := rocksdbES.Open(dbPath)
+		n, err := rr.EventCount()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-
 		times := make([]float64, seqRuns)
 		for r := range seqRuns {
 			start := time.Now()
-			it := db.NewIterator(ro)
-			it.SeekToFirst()
-			for ; it.Valid(); it.Next() {
-				_ = it.ValueSlice().Data()
+			for ev, err := range rr.ReadEvents(0, n) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = ev
 			}
-			if err := it.Err(); err != nil {
-				t.Fatal(err)
-			}
-			it.Close()
 			times[r] = time.Since(start).Seconds()
 		}
-		ro.Destroy()
-		cleanup()
+		rr.Close()
 
 		sort.Float64s(times)
 		median := times[seqRuns/2]
@@ -254,31 +194,21 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// RocksDB point reads
 	{
-		db, cleanup, err := openNoCompRocksDB(dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		rr := rocksdbES.Open(dbPath)
 
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-
-		key := make([]byte, 4)
 		times := make([]float64, pointRuns)
 		for r := range pointRuns {
 			start := time.Now()
 			for _, idx := range pointIndices {
-				binary.BigEndian.PutUint32(key, uint32(idx))
-				val, err := db.GetPinned(ro, key)
+				ev, err := rr.ReadEvent(idx)
 				if err != nil {
 					t.Fatal(err)
 				}
-				_ = val.Data()
-				val.Destroy()
+				_ = ev
 			}
 			times[r] = time.Since(start).Seconds()
 		}
-		ro.Destroy()
-		cleanup()
+		rr.Close()
 
 		sort.Float64s(times)
 		median := times[pointRuns/2]
@@ -328,23 +258,9 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			median, usPerCall, scatteredIter, scatteredN, scatteredRuns)
 	}
 
-	// RocksDB scattered reads via BatchedMultiGetCF
+	// RocksDB scattered reads via ReadIndices
 	{
-		db, cleanup, err := openNoCompRocksDB(dbPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		cf := db.GetDefaultColumnFamily()
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-		ro.SetFillCache(false)
-
-		keys := make([][]byte, scatteredN)
-		keyBuf := make([]byte, scatteredN*4)
-		for i := range keys {
-			keys[i] = keyBuf[i*4 : i*4+4]
-		}
+		rr := rocksdbES.Open(dbPath)
 
 		times := make([]float64, scatteredRuns)
 		for r := range scatteredRuns {
@@ -352,22 +268,16 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			start := time.Now()
 			for range scatteredIter {
 				indices := generateScatteredIndices(rng, scatteredN, numEvents)
-				for i, idx := range indices {
-					binary.BigEndian.PutUint32(keys[i], uint32(idx))
+				for ev, err := range rr.ReadIndices(context.Background(), indices) {
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = ev
 				}
-				vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, v := range vals {
-					_ = v.Data()
-				}
-				vals.Destroy()
 			}
 			times[r] = time.Since(start).Seconds()
 		}
-		ro.Destroy()
-		cleanup()
+		rr.Close()
 
 		sort.Float64s(times)
 		median := times[scatteredRuns/2]
@@ -419,38 +329,28 @@ func TestReadThroughputNoCompression(t *testing.T) {
 
 	// RocksDB range scan
 	{
-		db, cleanup, err := openNoCompRocksDB(dbPath)
+		rr := rocksdbES.Open(dbPath)
+		n, err := rr.EventCount()
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		ro := grocksdb.NewDefaultReadOptions()
-		ro.SetVerifyChecksums(false)
-
-		it := db.NewIterator(ro)
-		key := make([]byte, 4)
 
 		times := make([]float64, rangeScanRuns)
 		for r := range rangeScanRuns {
 			rng := rand.New(rand.NewSource(77))
 			start := time.Now()
 			for range rangeScanIter {
-				off := rng.Intn(numEvents - rangeScanLen)
-				binary.BigEndian.PutUint32(key, uint32(off))
-				it.Seek(key)
-				for i := 0; i < rangeScanLen && it.Valid(); i++ {
-					_ = it.ValueSlice().Data()
-					it.Next()
+				off := rng.Intn(n - rangeScanLen)
+				for ev, err := range rr.ReadEvents(off, rangeScanLen) {
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = ev
 				}
 			}
 			times[r] = time.Since(start).Seconds()
 		}
-		if err := it.Err(); err != nil {
-			t.Fatal(err)
-		}
-		it.Close()
-		ro.Destroy()
-		cleanup()
+		rr.Close()
 
 		sort.Float64s(times)
 		median := times[rangeScanRuns/2]

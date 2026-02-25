@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tamir/events-analysis/bitmapindex"
+	rocksdbBI "github.com/tamir/events-analysis/bitmapindex/rocksdb"
 	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/eventstore"
 )
@@ -185,14 +186,10 @@ func loadBitmapSampleKeys(eventstorePath string) error {
 	return nil
 }
 
-// --- Single-key lookup benchmarks ---
+// --- Generic bitmap benchmark helpers ---
 
-func BenchmarkBitmapMPHFLookup(b *testing.B) {
-	setupBitmapBenchData(b)
-
-	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
-	defer r.Close()
-
+func benchBitmapLookup(b *testing.B, r bitmapindex.IndexReader) {
+	b.Helper()
 	keys := bitmapSampleKeys
 	b.ResetTimer()
 
@@ -206,36 +203,8 @@ func BenchmarkBitmapMPHFLookup(b *testing.B) {
 	}
 }
 
-func BenchmarkBitmapRocksDBLookup(b *testing.B) {
-	setupBitmapBenchData(b)
-
-	r, err := openRocksDBBitmap(bitmapRocksDBPath)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer r.Close()
-
-	keys := bitmapSampleKeys
-	b.ResetTimer()
-
-	for i := range b.N {
-		k := keys[i%len(keys)]
-		bm, err := r.Lookup(k.Field, k.Key)
-		if err != nil {
-			b.Fatal(err)
-		}
-		_ = bm
-	}
-}
-
-// --- Parallel lookup benchmarks ---
-
-func BenchmarkBitmapMPHFParallel15(b *testing.B) {
-	setupBitmapBenchData(b)
-
-	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
-	defer r.Close()
-
+func benchBitmapParallelLookup(b *testing.B, r bitmapindex.IndexReader) {
+	b.Helper()
 	keys := bitmapSampleKeys
 	b.ResetTimer()
 
@@ -252,6 +221,40 @@ func BenchmarkBitmapMPHFParallel15(b *testing.B) {
 		}
 	})
 }
+
+// --- Single-key lookup benchmarks ---
+
+func BenchmarkBitmapMPHFLookup(b *testing.B) {
+	setupBitmapBenchData(b)
+	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
+	defer r.Close()
+	benchBitmapLookup(b, r)
+}
+
+func BenchmarkBitmapRocksDBLookup(b *testing.B) {
+	setupBitmapBenchData(b)
+	r := rocksdbBI.Open(bitmapRocksDBPath)
+	defer r.Close()
+	benchBitmapLookup(b, r)
+}
+
+// --- Parallel lookup benchmarks ---
+
+func BenchmarkBitmapMPHFParallel15(b *testing.B) {
+	setupBitmapBenchData(b)
+	r := bitmapindex.Open(bitmapMPHFPath, bitmapDataPath)
+	defer r.Close()
+	benchBitmapParallelLookup(b, r)
+}
+
+func BenchmarkBitmapRocksDBParallel15(b *testing.B) {
+	setupBitmapBenchData(b)
+	r := rocksdbBI.Open(bitmapRocksDBPath)
+	defer r.Close()
+	benchBitmapParallelLookup(b, r)
+}
+
+// --- LookupKeys benchmark (MPHF-specific) ---
 
 func BenchmarkBitmapMPHFLookupKeys15(b *testing.B) {
 	setupBitmapBenchData(b)
@@ -284,30 +287,4 @@ func BenchmarkBitmapMPHFLookupKeys15(b *testing.B) {
 		}
 		_ = results
 	}
-}
-
-func BenchmarkBitmapRocksDBParallel15(b *testing.B) {
-	setupBitmapBenchData(b)
-
-	r, err := openRocksDBBitmap(bitmapRocksDBPath)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer r.Close()
-
-	keys := bitmapSampleKeys
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		rng := rand.New(rand.NewSource(rand.Int63()))
-		for pb.Next() {
-			k := keys[rng.Intn(len(keys))]
-			bm, err := r.Lookup(k.Field, k.Key)
-			if err != nil {
-				b.Error(err)
-				return
-			}
-			_ = bm
-		}
-	})
 }

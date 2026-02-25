@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -11,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
+	rocksdbES "github.com/tamir/events-analysis/eventstore/rocksdb"
 )
 
 var (
@@ -89,63 +88,21 @@ func doSetup() error {
 		return err
 	}
 
-	// Write RocksDB: individual events via SSTFileWriter.
-	key := make([]byte, 4)
-	sstFilePath := filepath.Join(fixtureDir, "rocks_ingest.sst")
-
-	sstWriteOpts := grocksdb.NewDefaultOptions()
-	sstWriteOpts.SetCompression(grocksdb.ZSTDCompression)
-	sstWriteOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
-	sstBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	sstBbto.SetBlockSize(rocksBlockSize)
-	sstBbto.SetBlockSizeDeviation(100)
-	sstBbto.SetFormatVersion(5)
-	sstBbto.SetBlockRestartInterval(128)
-	sstWriteOpts.SetBlockBasedTableFactory(sstBbto)
-	sstBbto.Destroy()
-
-	envOpts := grocksdb.NewDefaultEnvOptions()
-	sfw := grocksdb.NewSSTFileWriter(envOpts, sstWriteOpts)
-	if err := sfw.Open(sstFilePath); err != nil {
-		return fmt.Errorf("sst file writer open: %w", err)
+	// Write RocksDB eventstore via new package.
+	rw, err := rocksdbES.Create(rocksDBPath, rocksdbES.WriterOptions{
+		BlockSize: rocksBlockSize,
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb create: %w", err)
 	}
-	for i, ev := range allEvents {
-		binary.BigEndian.PutUint32(key, uint32(i))
-		if err := sfw.Add(key, ev); err != nil {
-			return fmt.Errorf("sst file writer add: %w", err)
+	for _, ev := range allEvents {
+		if err := rw.Append(ev); err != nil {
+			return fmt.Errorf("rocksdb append: %w", err)
 		}
 	}
-	if err := sfw.Finish(); err != nil {
-		return fmt.Errorf("sst file writer finish: %w", err)
+	if err := rw.Finish(); err != nil {
+		return fmt.Errorf("rocksdb finish: %w", err)
 	}
-	sfw.Destroy()
-	envOpts.Destroy()
-	sstWriteOpts.Destroy()
-
-	// Create DB and ingest the single SST file.
-	dbOpts := grocksdb.NewDefaultOptions()
-	dbOpts.SetCreateIfMissing(true)
-	dbOpts.SetCompression(grocksdb.ZSTDCompression)
-	dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	dbBbto.SetNoBlockCache(true)
-	dbBbto.SetBlockSize(rocksBlockSize)
-	dbOpts.SetBlockBasedTableFactory(dbBbto)
-	dbBbto.Destroy()
-
-	rdb, err := grocksdb.OpenDb(dbOpts, rocksDBPath)
-	if err != nil {
-		return fmt.Errorf("open rocksdb: %w", err)
-	}
-	ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-	ingestOpts.SetMoveFiles(true)
-	if err := rdb.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
-		rdb.Close()
-		return fmt.Errorf("rocksdb ingest: %w", err)
-	}
-	ingestOpts.Destroy()
-	rdb.Close()
-	dbOpts.Destroy()
-	os.Remove(sstFilePath) // clean up intermediate file
 
 	// Report sizes.
 	esInfo, _ := os.Stat(eventstorePath)
@@ -176,30 +133,15 @@ func dirSize(path string) int64 {
 	return total
 }
 
-func openRocksDB(b *testing.B) *grocksdb.DB {
-	b.Helper()
-	db, opts, err := openReadOnlyRocksDB(rocksDBPath)
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { opts.Destroy() })
-	return db
-}
-
 // --- Sequential read benchmarks ---
 
-func BenchmarkPackfileSeqRead(b *testing.B) {
-	setupBenchData(b)
-
-	er := eventstore.Open(eventstorePath)
-	defer er.Close()
-
-	n, _ := er.EventCount()
+func benchSeqRead(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
 	b.SetBytes(int64(totalRawBytes))
 	b.ResetTimer()
 
 	for b.Loop() {
-		for ev, err := range er.ReadEvents(0, n) {
+		for ev, err := range r.ReadEvents(0, n) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -208,47 +150,32 @@ func BenchmarkPackfileSeqRead(b *testing.B) {
 	}
 }
 
-func BenchmarkRocksDBSeqRead(b *testing.B) {
+func BenchmarkPackfileSeqRead(b *testing.B) {
 	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
-	it := db.NewIterator(ro)
-	defer it.Close()
-
-	b.SetBytes(int64(totalRawBytes))
-	b.ResetTimer()
-
-	for b.Loop() {
-		it.SeekToFirst()
-		for ; it.Valid(); it.Next() {
-			_ = it.ValueSlice().Data()
-		}
-		if err := it.Err(); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// --- Random point-read benchmarks ---
-
-func BenchmarkPackfileRandomRead(b *testing.B) {
-	setupBenchData(b)
-
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-
 	n, _ := er.EventCount()
+	benchSeqRead(b, er, n)
+}
+
+func BenchmarkRocksDBSeqRead(b *testing.B) {
+	setupBenchData(b)
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchSeqRead(b, r, n)
+}
+
+// --- Generic read benchmarks (via StoreReader interface) ---
+
+func benchRandomRead(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
 
 	for b.Loop() {
 		idx := rng.Intn(n)
-		ev, err := er.ReadEvent(idx)
+		ev, err := r.ReadEvent(idx)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -256,47 +183,32 @@ func BenchmarkPackfileRandomRead(b *testing.B) {
 	}
 }
 
-func BenchmarkRocksDBRandomRead(b *testing.B) {
-	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
+func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
+	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
-	key := make([]byte, 4)
 	b.ResetTimer()
 
 	for b.Loop() {
-		idx := rng.Intn(totalEvents)
-		binary.BigEndian.PutUint32(key, uint32(idx))
-		val, err := db.GetPinned(ro, key)
-		if err != nil {
-			b.Fatal(err)
+		indices := generateScatteredIndices(rng, numIndices, n)
+		for ev, err := range r.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
 		}
-		benchSink = val.Data()
-		val.Destroy()
 	}
 }
 
-// --- Parallel read benchmarks ---
-
-func BenchmarkPackfileParallelRead(b *testing.B) {
-	setupBenchData(b)
-
-	er := eventstore.Open(eventstorePath)
-	defer er.Close()
-
-	n, _ := er.EventCount()
+func benchParallelRead(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
 			idx := rng.Intn(n)
-			ev, err := er.ReadEvent(idx)
+			ev, err := r.ReadEvent(idx)
 			if err != nil {
 				b.Error(err)
 				return
@@ -306,49 +218,71 @@ func BenchmarkPackfileParallelRead(b *testing.B) {
 	})
 }
 
-func BenchmarkRocksDBParallelRead(b *testing.B) {
-	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
+func benchParallelReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
+	const numIndices = 50
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		ro := newBenchReadOptions()
-		defer ro.Destroy()
-
 		rng := rand.New(rand.NewSource(rand.Int63()))
-		key := make([]byte, 4)
-
 		for pb.Next() {
-			idx := rng.Intn(totalEvents)
-			binary.BigEndian.PutUint32(key, uint32(idx))
-			val, err := db.GetPinned(ro, key)
-			if err != nil {
-				b.Error(err)
-				return
+			indices := generateScatteredIndices(rng, numIndices, n)
+			for ev, err := range r.ReadIndices(context.Background(), indices) {
+				if err != nil {
+					b.Error(err)
+					return
+				}
+				_ = ev
 			}
-			_ = val.Data()
-			val.Destroy()
 		}
 	})
 }
 
-// --- Batch 128 benchmarks ---
+// --- Random point-read benchmarks ---
 
-func BenchmarkPackfileReadBatch128(b *testing.B) {
+func BenchmarkPackfileRandomRead(b *testing.B) {
 	setupBenchData(b)
-
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
+	n, _ := er.EventCount()
+	benchRandomRead(b, er, n)
+}
 
+func BenchmarkRocksDBRandomRead(b *testing.B) {
+	setupBenchData(b)
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchRandomRead(b, r, n)
+}
+
+// --- Parallel read benchmarks ---
+
+func BenchmarkPackfileParallelRead(b *testing.B) {
+	setupBenchData(b)
+	er := eventstore.Open(eventstorePath)
+	defer er.Close()
+	n, _ := er.EventCount()
+	benchParallelRead(b, er, n)
+}
+
+func BenchmarkRocksDBParallelRead(b *testing.B) {
+	setupBenchData(b)
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchParallelRead(b, r, n)
+}
+
+// --- Batch 128 benchmarks ---
+
+func benchReadBatch128(b *testing.B, r eventstore.StoreReader) {
+	b.Helper()
 	batchSize := min(128, totalEvents)
-
 	b.ResetTimer()
 
 	for b.Loop() {
-		for ev, err := range er.ReadEvents(0, batchSize) {
+		for ev, err := range r.ReadEvents(0, batchSize) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -357,59 +291,31 @@ func BenchmarkPackfileReadBatch128(b *testing.B) {
 	}
 }
 
+func BenchmarkPackfileReadBatch128(b *testing.B) {
+	setupBenchData(b)
+	er := eventstore.Open(eventstorePath)
+	defer er.Close()
+	benchReadBatch128(b, er)
+}
+
 func BenchmarkRocksDBReadBatch128(b *testing.B) {
 	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
-	batchSize := min(128, totalEvents)
-
-	it := db.NewIterator(ro)
-	defer it.Close()
-
-	key := make([]byte, 4)
-	b.ResetTimer()
-
-	for b.Loop() {
-		binary.BigEndian.PutUint32(key, uint32(0))
-		it.Seek(key)
-		if !it.Valid() {
-			b.Fatal("Seek(0): key not found")
-		}
-		_ = it.ValueSlice().Data()
-		for i := 1; i < batchSize; i++ {
-			it.Next()
-			if !it.Valid() {
-				b.Fatalf("Next at %d: unexpected end", i)
-			}
-			_ = it.ValueSlice().Data()
-		}
-	}
-	if err := it.Err(); err != nil {
-		b.Fatal(err)
-	}
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	benchReadBatch128(b, r)
 }
 
 // --- Range scan from random offset benchmarks ---
 
-func BenchmarkPackfileRangeScan128(b *testing.B) {
-	setupBenchData(b)
-
-	er := eventstore.Open(eventstorePath)
-	defer er.Close()
-
-	n, _ := er.EventCount()
+func benchRangeScan128(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
 	const scanLen = 128
 	rng := rand.New(rand.NewSource(42))
 	b.ResetTimer()
 
 	for b.Loop() {
 		start := rng.Intn(n - scanLen)
-		for ev, err := range er.ReadEvents(start, scanLen) {
+		for ev, err := range r.ReadEvents(start, scanLen) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -418,42 +324,20 @@ func BenchmarkPackfileRangeScan128(b *testing.B) {
 	}
 }
 
+func BenchmarkPackfileRangeScan128(b *testing.B) {
+	setupBenchData(b)
+	er := eventstore.Open(eventstorePath)
+	defer er.Close()
+	n, _ := er.EventCount()
+	benchRangeScan128(b, er, n)
+}
+
 func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
-	it := db.NewIterator(ro)
-	defer it.Close()
-
-	const scanLen = 128
-	rng := rand.New(rand.NewSource(42))
-	key := make([]byte, 4)
-	b.ResetTimer()
-
-	for b.Loop() {
-		start := rng.Intn(totalEvents - scanLen)
-		binary.BigEndian.PutUint32(key, uint32(start))
-		it.Seek(key)
-		if !it.Valid() {
-			b.Fatalf("Seek(%d): key not found", start)
-		}
-		_ = it.ValueSlice().Data()
-		for i := 1; i < scanLen; i++ {
-			it.Next()
-			if !it.Valid() {
-				b.Fatalf("Next at %d: unexpected end", i)
-			}
-			_ = it.ValueSlice().Data()
-		}
-	}
-	if err := it.Err(); err != nil {
-		b.Fatal(err)
-	}
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchRangeScan128(b, r, n)
 }
 
 // --- Scattered read benchmarks (ReadIndices) ---
@@ -474,209 +358,37 @@ func generateScatteredIndices(rng *rand.Rand, n, total int) []int {
 
 func BenchmarkPackfileReadIndices(b *testing.B) {
 	setupBenchData(b)
-
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-
 	n, _ := er.EventCount()
-	// 50 scattered indices per call — typical query fan-out
-	const numIndices = 50
-	rng := rand.New(rand.NewSource(42))
-	b.ResetTimer()
-
-	for b.Loop() {
-		indices := generateScatteredIndices(rng, numIndices, n)
-		for ev, err := range er.ReadIndices(context.Background(), indices) {
-			if err != nil {
-				b.Fatal(err)
-			}
-			_ = ev
-		}
-	}
-}
-
-func BenchmarkPackfileReadEventParallel50(b *testing.B) {
-	setupBenchData(b)
-
-	er := eventstore.Open(eventstorePath)
-	defer er.Close()
-
-	n, _ := er.EventCount()
-	const numIndices = 50
-	rng := rand.New(rand.NewSource(42))
-	b.ResetTimer()
-
-	for b.Loop() {
-		indices := generateScatteredIndices(rng, numIndices, n)
-		var wg sync.WaitGroup
-		wg.Add(numIndices)
-		for _, idx := range indices {
-			go func(idx int) {
-				defer wg.Done()
-				ev, err := er.ReadEvent(idx)
-				if err != nil {
-					b.Error(err)
-				}
-				_ = ev
-			}(idx)
-		}
-		wg.Wait()
-	}
-}
-
-func BenchmarkPackfileReadEventSeq50(b *testing.B) {
-	setupBenchData(b)
-
-	er := eventstore.Open(eventstorePath)
-	defer er.Close()
-
-	n, _ := er.EventCount()
-	const numIndices = 50
-	rng := rand.New(rand.NewSource(42))
-	b.ResetTimer()
-
-	for b.Loop() {
-		indices := generateScatteredIndices(rng, numIndices, n)
-		for _, idx := range indices {
-			ev, err := er.ReadEvent(idx)
-			if err != nil {
-				b.Fatal(err)
-			}
-			_ = ev
-		}
-	}
-}
-
-// rocksDBParallelMultiGet splits keys across goroutines for parallel I/O,
-// matching packfile ReadIndices' internal goroutine parallelism.
-func rocksDBParallelMultiGet(b *testing.B, db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle, ro *grocksdb.ReadOptions, keys [][]byte, concurrency int) {
-	b.Helper()
-	if concurrency <= 1 || len(keys) < concurrency {
-		vals, err := db.BatchedMultiGetCF(ro, cf, true, keys...)
-		if err != nil {
-			b.Fatal(err)
-		}
-		for _, v := range vals {
-			_ = v.Data()
-		}
-		vals.Destroy()
-		return
-	}
-	var (
-		wg       sync.WaitGroup
-		errOnce  sync.Once
-		firstErr error
-	)
-	perWorker := (len(keys) + concurrency - 1) / concurrency
-	for i := range concurrency {
-		lo := i * perWorker
-		hi := min(lo+perWorker, len(keys))
-		if lo >= len(keys) {
-			break
-		}
-		wg.Go(func() {
-			vals, err := db.BatchedMultiGetCF(ro, cf, true, keys[lo:hi]...)
-			if err != nil {
-				errOnce.Do(func() { firstErr = err })
-				return
-			}
-			for _, v := range vals {
-				_ = v.Data()
-			}
-			vals.Destroy()
-		})
-	}
-	wg.Wait()
-	if firstErr != nil {
-		b.Fatal(firstErr)
-	}
+	benchReadIndices(b, er, n)
 }
 
 func BenchmarkRocksDBReadIndices(b *testing.B) {
 	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	cf := db.GetDefaultColumnFamily()
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
-	const numIndices = 50
-	rng := rand.New(rand.NewSource(42))
-	keys := make([][]byte, numIndices)
-	keyBuf := make([]byte, numIndices*4)
-	for i := range keys {
-		keys[i] = keyBuf[i*4 : i*4+4]
-	}
-	b.ResetTimer()
-
-	for b.Loop() {
-		indices := generateScatteredIndices(rng, numIndices, totalEvents)
-		for i, idx := range indices {
-			binary.BigEndian.PutUint32(keys[i], uint32(idx))
-		}
-		rocksDBParallelMultiGet(b, db, cf, ro, keys, 8)
-	}
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchReadIndices(b, r, n)
 }
 
 func BenchmarkPackfileParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
-
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-
 	n, _ := er.EventCount()
-	const numIndices = 50
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		rng := rand.New(rand.NewSource(rand.Int63()))
-		for pb.Next() {
-			indices := generateScatteredIndices(rng, numIndices, n)
-			for ev, err := range er.ReadIndices(context.Background(), indices) {
-				if err != nil {
-					b.Error(err)
-					return
-				}
-				_ = ev
-			}
-		}
-	})
+	benchParallelReadIndices(b, er, n)
 }
 
 func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
-
-	db := openRocksDB(b)
-	defer db.Close()
-
-	cf := db.GetDefaultColumnFamily()
-	ro := newBenchReadOptions()
-	defer ro.Destroy()
-
-	const numIndices = 50
-
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		rng := rand.New(rand.NewSource(rand.Int63()))
-		keys := make([][]byte, numIndices)
-		keyBuf := make([]byte, numIndices*4)
-		for i := range keys {
-			keys[i] = keyBuf[i*4 : i*4+4]
-		}
-		for pb.Next() {
-			indices := generateScatteredIndices(rng, numIndices, totalEvents)
-			for i, idx := range indices {
-				binary.BigEndian.PutUint32(keys[i], uint32(idx))
-			}
-			rocksDBParallelMultiGet(b, db, cf, ro, keys, 8)
-		}
-	})
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchParallelReadIndices(b, r, n)
 }
 
-// --- Open latency benchmarks ---
+// --- Open latency benchmarks (backend-specific) ---
 
 func BenchmarkPackfileOpen(b *testing.B) {
 	setupBenchData(b)
@@ -690,28 +402,12 @@ func BenchmarkPackfileOpen(b *testing.B) {
 
 func BenchmarkRocksDBOpen(b *testing.B) {
 	setupBenchData(b)
-
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetSkipStatsUpdateOnDBOpen(true)
-	opts.SetSkipCheckingSSTFileSizesOnDBOpen(true)
-	opts.SetMaxFileOpeningThreads(1)
-	opts.SetDisableAutoCompactions(true)
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetNoBlockCache(true)
-	bbto.SetFormatVersion(5)
-	opts.SetBlockBasedTableFactory(bbto)
-	bbto.Destroy()
-
 	b.ResetTimer()
+
 	for b.Loop() {
-		db, err := grocksdb.OpenDbForReadOnly(opts, rocksDBPath, false)
-		if err != nil {
-			b.Fatal(err)
-		}
-		db.Close()
+		r := rocksdbES.Open(rocksDBPath)
+		r.Close()
 	}
-	b.StopTimer()
-	opts.Destroy()
 }
 
 // --- Write / ingestion benchmarks ---
@@ -774,66 +470,24 @@ func BenchmarkPackfileWriteParallel32(b *testing.B) {
 // rocksDBWriteCore contains the shared write logic for throughput and memory benchmarks.
 func rocksDBWriteCore(b *testing.B, parallelComp int) {
 	dir := b.TempDir()
-	sstFilePath := filepath.Join(dir, "ingest.sst")
 	dbPath := filepath.Join(dir, "rocks.db")
 
-	// Write SST file via SSTFileWriter.
-	writeOpts := grocksdb.NewDefaultOptions()
-	writeOpts.SetCompression(grocksdb.ZSTDCompression)
-	writeOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
-	if parallelComp > 1 {
-		writeOpts.SetCompressionOptionsParallelThreads(parallelComp)
-	}
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	avgEventSize := totalRawBytes / len(allEvents)
-	bbto.SetBlockSize(128 * avgEventSize)
-	bbto.SetBlockSizeDeviation(100)
-	bbto.SetFormatVersion(5)
-	bbto.SetBlockRestartInterval(128)
-	writeOpts.SetBlockBasedTableFactory(bbto)
-	bbto.Destroy()
-
-	envOpts := grocksdb.NewDefaultEnvOptions()
-	sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
-	if err := sfw.Open(sstFilePath); err != nil {
-		b.Fatal(err)
-	}
-	key := make([]byte, 4)
-	for i, ev := range allEvents {
-		binary.BigEndian.PutUint32(key, uint32(i))
-		if err := sfw.Add(key, ev); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := sfw.Finish(); err != nil {
-		b.Fatal(err)
-	}
-	sfw.Destroy()
-	envOpts.Destroy()
-	writeOpts.Destroy()
-
-	// Open DB and ingest.
-	dbOpts := grocksdb.NewDefaultOptions()
-	dbOpts.SetCreateIfMissing(true)
-	dbOpts.SetCompression(grocksdb.ZSTDCompression)
-	dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	dbBbto.SetNoBlockCache(true)
-	dbBbto.SetBlockSize(128 * avgEventSize)
-	dbOpts.SetBlockBasedTableFactory(dbBbto)
-	dbBbto.Destroy()
-
-	db, err := grocksdb.OpenDb(dbOpts, dbPath)
+	w, err := rocksdbES.Create(dbPath, rocksdbES.WriterOptions{
+		BlockSize:          128 * avgEventSize,
+		CompressionThreads: parallelComp,
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
-	ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-	ingestOpts.SetMoveFiles(true)
-	if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
+	for _, ev := range allEvents {
+		if err := w.Append(ev); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := w.Finish(); err != nil {
 		b.Fatal(err)
 	}
-	ingestOpts.Destroy()
-	db.Close()
-	dbOpts.Destroy()
 }
 
 func benchRocksDBWrite(b *testing.B, parallelComp int) {

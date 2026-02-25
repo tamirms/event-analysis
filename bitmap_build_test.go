@@ -15,7 +15,7 @@ func buildBitmapFromEventStore(ctx context.Context, storePath, mphfPath, dataPat
 	er := eventstore.Open(storePath)
 	defer er.Close()
 
-	w := bitmapindex.NewWriter(bitmapindex.WriterOptions{CapacityHint: 600_000})
+	w := bitmapindex.NewWriter(mphfPath, dataPath, bitmapindex.WriterOptions{CapacityHint: 600_000})
 
 	ordinal := uint32(0)
 	var ev event.Event
@@ -34,5 +34,5 @@ func buildBitmapFromEventStore(ctx context.Context, storePath, mphfPath, dataPat
 		ordinal++
 	}
 
-	return w.Finish(ctx, mphfPath, dataPath)
+	return w.Finish(ctx)
 }

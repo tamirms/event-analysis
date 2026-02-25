@@ -1,15 +1,13 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
+	rocksdbES "github.com/tamir/events-analysis/eventstore/rocksdb"
 )
 
 // TestWriteThroughput measures end-to-end write throughput across concurrency
@@ -91,67 +89,24 @@ func TestWriteThroughput(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sstFilePath := filepath.Join(dir, "ingest.sst")
-		dbPath := filepath.Join(dir, "rocks.db")
+		dbPath := dir + "/rocks.db"
 
 		start := time.Now()
-
-		writeOpts := grocksdb.NewDefaultOptions()
-		writeOpts.SetCompression(grocksdb.ZSTDCompression)
-		writeOpts.SetCompressionOptions(grocksdb.NewCompressionOptions(-14, 3, 0, 0))
-		if threads > 1 {
-			writeOpts.SetCompressionOptionsParallelThreads(threads)
-		}
-		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		bbto.SetBlockSize(blockSize)
-		bbto.SetBlockSizeDeviation(100)
-		bbto.SetFormatVersion(5)
-		bbto.SetBlockRestartInterval(128)
-		writeOpts.SetBlockBasedTableFactory(bbto)
-		bbto.Destroy()
-
-		envOpts := grocksdb.NewDefaultEnvOptions()
-		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
-		if err := sfw.Open(sstFilePath); err != nil {
-			t.Fatal(err)
-		}
-		key := make([]byte, 4)
-		for i, ev := range allEvents {
-			binary.BigEndian.PutUint32(key, uint32(i))
-			if err := sfw.Add(key, ev); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := sfw.Finish(); err != nil {
-			t.Fatal(err)
-		}
-		sfw.Destroy()
-		envOpts.Destroy()
-		writeOpts.Destroy()
-
-		dbOpts := grocksdb.NewDefaultOptions()
-		dbOpts.SetCreateIfMissing(true)
-		dbOpts.SetCompression(grocksdb.ZSTDCompression)
-		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		dbBbto.SetNoBlockCache(true)
-		dbBbto.SetBlockSize(blockSize)
-		dbBbto.SetFormatVersion(5)
-		dbOpts.SetBlockBasedTableFactory(dbBbto)
-		dbBbto.Destroy()
-
-		db, err := grocksdb.OpenDb(dbOpts, dbPath)
+		w, err := rocksdbES.Create(dbPath, rocksdbES.WriterOptions{
+			BlockSize:          blockSize,
+			CompressionThreads: threads,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-		ingestOpts.SetMoveFiles(true)
-		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
+		for _, ev := range allEvents {
+			if err := w.Append(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Finish(); err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts.Destroy()
-		db.Close()
-		dbOpts.Destroy()
-
 		elapsed := time.Since(start)
 		fmt.Printf("  t=%2d: %.2fs  %4.0f MB/s\n", threads, elapsed.Seconds(),
 			float64(totalRawBytes)/elapsed.Seconds()/1e6)
@@ -165,63 +120,24 @@ func TestWriteThroughput(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sstFilePath := filepath.Join(dir, "ingest.sst")
-		dbPath := filepath.Join(dir, "rocks.db")
+		dbPath := dir + "/rocks.db"
 
 		start := time.Now()
-
-		writeOpts := grocksdb.NewDefaultOptions()
-		writeOpts.SetCompression(grocksdb.NoCompression)
-		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		bbto.SetBlockSize(blockSize)
-		bbto.SetBlockSizeDeviation(100)
-		bbto.SetFormatVersion(5)
-		bbto.SetBlockRestartInterval(128)
-		writeOpts.SetBlockBasedTableFactory(bbto)
-		bbto.Destroy()
-
-		envOpts := grocksdb.NewDefaultEnvOptions()
-		sfw := grocksdb.NewSSTFileWriter(envOpts, writeOpts)
-		if err := sfw.Open(sstFilePath); err != nil {
-			t.Fatal(err)
-		}
-		key := make([]byte, 4)
-		for i, ev := range allEvents {
-			binary.BigEndian.PutUint32(key, uint32(i))
-			if err := sfw.Add(key, ev); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := sfw.Finish(); err != nil {
-			t.Fatal(err)
-		}
-		sfw.Destroy()
-		envOpts.Destroy()
-		writeOpts.Destroy()
-
-		dbOpts := grocksdb.NewDefaultOptions()
-		dbOpts.SetCreateIfMissing(true)
-		dbOpts.SetCompression(grocksdb.NoCompression)
-		dbBbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		dbBbto.SetNoBlockCache(true)
-		dbBbto.SetBlockSize(blockSize)
-		dbBbto.SetFormatVersion(5)
-		dbOpts.SetBlockBasedTableFactory(dbBbto)
-		dbBbto.Destroy()
-
-		db, err := grocksdb.OpenDb(dbOpts, dbPath)
+		w, err := rocksdbES.Create(dbPath, rocksdbES.WriterOptions{
+			BlockSize:     blockSize,
+			NoCompression: true,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts := grocksdb.NewDefaultIngestExternalFileOptions()
-		ingestOpts.SetMoveFiles(true)
-		if err := db.IngestExternalFile([]string{sstFilePath}, ingestOpts); err != nil {
+		for _, ev := range allEvents {
+			if err := w.Append(ev); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Finish(); err != nil {
 			t.Fatal(err)
 		}
-		ingestOpts.Destroy()
-		db.Close()
-		dbOpts.Destroy()
-
 		elapsed := time.Since(start)
 		fmt.Printf("  %.2fs  %4.0f MB/s\n", elapsed.Seconds(),
 			float64(totalRawBytes)/elapsed.Seconds()/1e6)

@@ -22,6 +22,10 @@ type Writer struct {
 	err        error // sticky — once set, all subsequent ops fail
 	closed     bool  // set by Finish or Abort
 	fileClosed bool  // set when file.Close() succeeds, prevents double-close in Abort
+
+	// Background writeback tracking (see BytesPerSync).
+	bytesPerSync int64
+	lastSyncPos  int64
 }
 
 // Create starts writing a new packfile at path.
@@ -33,10 +37,11 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 		return nil, err
 	}
 	return &Writer{
-		file:    f,
-		path:    path,
-		tmpPath: tmpPath,
-		opts:    opts,
+		file:         f,
+		path:         path,
+		tmpPath:      tmpPath,
+		opts:         opts,
+		bytesPerSync: int64(opts.BytesPerSync),
 	}, nil
 }
 
@@ -53,8 +58,13 @@ func (w *Writer) Append(record []byte) error {
 	w.pos += int64(n)
 	if err != nil {
 		w.err = err
+		return err
 	}
-	return err
+	if w.bytesPerSync > 0 && w.pos-w.lastSyncPos >= w.bytesPerSync {
+		initiateWriteback(w.file, w.lastSyncPos, w.pos-w.lastSyncPos)
+		w.lastSyncPos = w.pos
+	}
+	return nil
 }
 
 // Finish writes the index, metadata, and trailer, fsyncs, and

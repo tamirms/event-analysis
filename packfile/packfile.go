@@ -33,6 +33,13 @@ type Trailer struct {
 // WriterOptions configures how the packfile is written.
 type WriterOptions struct {
 	Metadata []byte // opaque, caller-defined, stored in the file
+
+	// BytesPerSync initiates background writeback of dirty pages every N bytes
+	// written. On Linux this uses sync_file_range(SYNC_FILE_RANGE_WRITE) which
+	// is non-blocking — it tells the kernel to start flushing without waiting.
+	// This spreads I/O across the write phase so the final fdatasync in Finish()
+	// has less data to flush. 0 disables (default).
+	BytesPerSync int
 }
 
 // Errors

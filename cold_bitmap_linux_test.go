@@ -7,10 +7,10 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/tamir/events-analysis/bitmapindex"
+	rocksdbBI "github.com/tamir/events-analysis/bitmapindex/rocksdb"
 )
 
 func benchColdBitmapMPHF(b *testing.B, numLookups int) {
@@ -122,10 +122,13 @@ func benchColdBitmapRocksDBParallel(b *testing.B, numLookups int) {
 	keys := bitmapSampleKeys
 	rng := rand.New(rand.NewSource(42))
 
-	lookupKeys := make([]int, numLookups)
+	lookupKeys := make([]bitmapindex.FieldKey, numLookups)
 	for i := range lookupKeys {
-		lookupKeys[i] = rng.Intn(len(keys))
+		k := keys[rng.Intn(len(keys))]
+		lookupKeys[i] = bitmapindex.FieldKey{Field: k.Field, Key: k.Key}
 	}
+
+	ctx := context.Background()
 
 	for b.Loop() {
 		b.StopTimer()
@@ -134,30 +137,12 @@ func benchColdBitmapRocksDBParallel(b *testing.B, numLookups int) {
 		}
 		b.StartTimer()
 
-		r, err := openRocksDBBitmap(rdbPath)
+		r := rocksdbBI.Open(rdbPath, rocksdbBI.WithConcurrency(numLookups))
+		results, err := r.LookupKeys(ctx, lookupKeys)
 		if err != nil {
 			b.Fatal(err)
 		}
-
-		var wg sync.WaitGroup
-		var errOnce sync.Once
-		var firstErr error
-		for _, ki := range lookupKeys {
-			wg.Go(func() {
-				k := keys[ki]
-				bm, err := r.Lookup(k.Field, k.Key)
-				if err != nil {
-					errOnce.Do(func() { firstErr = err })
-					return
-				}
-				_ = bm
-			})
-		}
-		wg.Wait()
-		if firstErr != nil {
-			b.Fatal(firstErr)
-		}
-
+		_ = results
 		r.Close()
 	}
 }
@@ -187,10 +172,7 @@ func benchColdBitmapRocksDB(b *testing.B, numLookups int) {
 		}
 		b.StartTimer()
 
-		r, err := openRocksDBBitmap(rdbPath)
-		if err != nil {
-			b.Fatal(err)
-		}
+		r := rocksdbBI.Open(rdbPath)
 
 		for _, ki := range lookupKeys {
 			k := keys[ki]

@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/tamir/events-analysis/eventstore"
+	rocksdbES "github.com/tamir/events-analysis/eventstore/rocksdb"
 	"golang.org/x/sys/unix"
 )
 
@@ -107,7 +107,6 @@ func BenchmarkColdPackfileReadIndices32(b *testing.B)  { benchColdPackfileReadIn
 func BenchmarkColdPackfileReadIndices64(b *testing.B)  { benchColdPackfileReadIndices(b, 64) }
 func BenchmarkColdPackfileReadIndices128(b *testing.B) { benchColdPackfileReadIndices(b, 128) }
 
-
 func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
@@ -122,17 +121,6 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	rng := rand.New(rand.NewSource(42))
 	indices := coldScatteredIndices(rng, numReads, totalEvents, blockSize)
 
-	keys := make([][]byte, numReads)
-	keyBuf := make([]byte, numReads*4)
-	for i, idx := range indices {
-		keys[i] = keyBuf[i*4 : i*4+4]
-		binary.BigEndian.PutUint32(keys[i], uint32(idx))
-	}
-
-	ro := newBenchReadOptions()
-	ro.SetAsyncIO(true)
-	defer ro.Destroy()
-
 	for b.Loop() {
 		b.StopTimer()
 		if err := dropDirCache(rdbPath); err != nil {
@@ -140,16 +128,14 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 		}
 		b.StartTimer()
 
-		db, dbOpts, err := openReadOnlyRocksDB(rdbPath)
-		if err != nil {
-			b.Fatal(err)
+		r := rocksdbES.Open(rdbPath, rocksdbES.WithConcurrency(concurrency))
+		for ev, err := range r.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
 		}
-		cf := db.GetDefaultColumnFamily()
-
-		rocksDBParallelMultiGet(b, db, cf, ro, keys, concurrency)
-
-		db.Close()
-		dbOpts.Destroy()
+		r.Close()
 	}
 }
 

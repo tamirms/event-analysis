@@ -53,7 +53,9 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	if opts.BlockSize < 0 {
 		return nil, errors.New("eventstore: BlockSize must be > 0")
 	}
-	pw, err := packfile.Create(path, packfile.WriterOptions{})
+	pw, err := packfile.Create(path, packfile.WriterOptions{
+		BytesPerSync: 1 << 20, // 1MB — initiate background writeback to overlap I/O with compression
+	})
 	if err != nil {
 		return nil, err
 	}

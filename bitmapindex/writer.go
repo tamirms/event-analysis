@@ -37,13 +37,16 @@ type WriterOptions struct {
 // Writer accumulates (ordinal, key) tuples and builds an MPHF+packfile index.
 // Not safe for concurrent use — all calls to Add must be serialized.
 type Writer struct {
+	mphfPath    string
+	dataPath    string
 	bitmaps     map[[16]byte]*roaring.Bitmap
 	batchSize   int
 	concurrency int
 }
 
-// NewWriter creates a new bitmap index writer.
-func NewWriter(opts WriterOptions) *Writer {
+// NewWriter creates a new bitmap index writer. mphfPath and dataPath are the
+// output paths for the MPHF index and packfile data files respectively.
+func NewWriter(mphfPath, dataPath string, opts WriterOptions) *Writer {
 	bs := opts.BatchSize
 	if bs <= 0 {
 		bs = defaultBatchSize
@@ -54,6 +57,8 @@ func NewWriter(opts WriterOptions) *Writer {
 	hint := max(opts.CapacityHint, 0)
 	conc := max(opts.Concurrency, 1)
 	return &Writer{
+		mphfPath:    mphfPath,
+		dataPath:    dataPath,
 		bitmaps:     make(map[[16]byte]*roaring.Bitmap, hint),
 		batchSize:   bs,
 		concurrency: conc,
@@ -84,8 +89,10 @@ func (w *Writer) add(key []byte, ordinal uint32) {
 	bm.Add(ordinal)
 }
 
-// Finish builds the MPHF and packfile, writing them to the given paths.
-func (w *Writer) Finish(ctx context.Context, mphfPath, dataPath string) (err error) {
+// Finish builds the MPHF and packfile, writing them to the configured paths.
+func (w *Writer) Finish(ctx context.Context) (err error) {
+	mphfPath := w.mphfPath
+	dataPath := w.dataPath
 	totalKeys := len(w.bitmaps)
 	if totalKeys == 0 {
 		return fmt.Errorf("bitmapindex: no keys to index")

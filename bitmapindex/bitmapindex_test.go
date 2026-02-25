@@ -37,7 +37,7 @@ func TestRoundTrip(t *testing.T) {
 	topicApprove := []byte("approve")
 
 	// Build index.
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	w.Add(makeTestEvent(contractA, topicTransfer), 0)
 	w.Add(makeTestEvent(contractA, topicTransfer), 1)
 	w.Add(makeTestEvent(contractB, topicMint), 2)
@@ -46,7 +46,7 @@ func TestRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -101,7 +101,7 @@ func TestPrefetchPath(t *testing.T) {
 	contractA := bytes.Repeat([]byte{0x01}, 32)
 	contractB := bytes.Repeat([]byte{0x02}, 32)
 
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	w.Add(makeTestEvent(contractA), 0)
 	w.Add(makeTestEvent(contractA), 1)
 	w.Add(makeTestEvent(contractB), 2)
@@ -109,7 +109,7 @@ func TestPrefetchPath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -142,13 +142,13 @@ func TestNonMemberLookup(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build a small index with one key.
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	w.Add(makeTestEvent(bytes.Repeat([]byte{0x01}, 32)), 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	contractA := bytes.Repeat([]byte{0x01}, 32)
 	contractB := bytes.Repeat([]byte{0x02}, 32)
 	// Add many ordinals to trigger compression (>= 256 bytes serialized).
@@ -182,7 +182,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestConcurrentLookups(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build an index with several keys.
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	contracts := make([][]byte, 20)
 	for i := range contracts {
 		raw := make([]byte, 32)
@@ -232,7 +232,7 @@ func TestConcurrentLookups(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -276,7 +276,7 @@ func TestManyKeys(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	const numKeys = 1000
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	contracts := make([][]byte, numKeys)
 	for i := range contracts {
 		raw := make([]byte, 32)
@@ -289,7 +289,7 @@ func TestManyKeys(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	raw := bytes.Repeat([]byte{0x42}, 32)
 	// Same 32-byte key as ContractID vs Topic0 vs Topic1.
 	w.Add(makeTestEvent(raw), 10)                   // ContractID
@@ -334,7 +334,7 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -368,7 +368,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
 	// Build a small index.
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	cid := bytes.Repeat([]byte{0x01}, 32)
 	w.Add(makeTestEvent(cid), 0)
 	w.Add(makeTestEvent(cid), 1)
@@ -376,7 +376,7 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -434,14 +434,14 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter(WriterOptions{})
+	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	cid := bytes.Repeat([]byte{0x01}, 32)
 	w.Add(makeTestEvent(cid), 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -473,7 +473,7 @@ func buildTestIndex(t *testing.T, dir string, contracts [][]byte, opts WriterOpt
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
 
-	w := NewWriter(opts)
+	w := NewWriter(mphfPath, dataPath, opts)
 	for i, cid := range contracts {
 		w.Add(makeTestEvent(cid), uint32(i))
 	}
@@ -481,7 +481,7 @@ func buildTestIndex(t *testing.T, dir string, contracts [][]byte, opts WriterOpt
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := w.Finish(ctx, mphfPath, dataPath); err != nil {
+	if err := w.Finish(ctx); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 	return mphfPath, dataPath
