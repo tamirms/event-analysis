@@ -244,7 +244,7 @@ MPHF+packfile is 10% smaller. Build time: MPHF 6.1s vs RocksDB 7.5s.
 | BitmapMPHFLookup | 12,876 | 6,953B / 147 |
 | BitmapRocksDBLookup | 17,091 | 6,453B / 149 |
 
-MPHF is **1.3x faster** for single-key lookups. Both allocations are dominated by roaring bitmap deserialization. The gap is narrower than ARM64 (1.5x) because x86's faster single-core performance benefits both implementations, compressing the ratio.
+MPHF is **1.3x faster** for single-key lookups. Both allocations are dominated by roaring bitmap deserialization. The gap is narrower than ARM64 (1.7x) because x86's faster single-core performance benefits both implementations, compressing the ratio.
 
 ### Warm Cache — Parallel Lookup (32 cores)
 
