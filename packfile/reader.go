@@ -1,11 +1,13 @@
 package packfile
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"iter"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -261,14 +263,14 @@ func (r *Reader) resolveOffsetPair(index int) (start, end int64, err error) {
 	return r.offsets[index], r.offsets[index+1], nil
 }
 
-// ReadRecordInto reads a single record into a caller-provided buffer.
+// ReadRecord reads a single record into a caller-provided buffer.
 // Returns a slice of buf (possibly reallocated if buf is too small).
-// Caller must reassign: buf, err = r.ReadRecordInto(index, buf)
+// Caller must reassign: buf, err = r.ReadRecord(index, buf)
 //
 // Note: the packfile format does not include per-record checksums.
 // Data integrity for individual records must be provided by an upper
 // layer (e.g. zstd content checksums in the eventstore package).
-func (r *Reader) ReadRecordInto(index int, buf []byte) ([]byte, error) {
+func (r *Reader) ReadRecord(index int, buf []byte) ([]byte, error) {
 	if err := r.waitOpen(); err != nil {
 		return buf, err
 	}
@@ -400,4 +402,210 @@ func (r *Reader) Close() error {
 		}
 	})
 	return r.closeErr
+}
+
+// workItem represents a contiguous run of record indices to read.
+type workItem struct {
+	inputStart  int // position in the original indices slice
+	recordStart int // first record index
+	count       int // number of consecutive records
+}
+
+// partitionRuns scans sorted, unique indices and partitions them into
+// consecutive runs, splitting runs longer than maxRunLen so that multiple
+// workers can process chunks of a large consecutive run in parallel.
+// Each run of count consecutive records starting at recordStart maps
+// back to indices[inputStart:inputStart+count].
+func partitionRuns(indices []int, maxRunLen int) []workItem {
+	if len(indices) == 0 {
+		return nil
+	}
+	items := make([]workItem, 0, len(indices)/2+1)
+	runStart := 0
+	for i := 1; i < len(indices); i++ {
+		if indices[i] != indices[i-1]+1 {
+			appendRuns(&items, runStart, indices[runStart], i-runStart, maxRunLen)
+			runStart = i
+		}
+	}
+	appendRuns(&items, runStart, indices[runStart], len(indices)-runStart, maxRunLen)
+	return items
+}
+
+// appendRuns adds one or more workItems for a consecutive run, splitting
+// it into chunks of at most maxRunLen records.
+func appendRuns(items *[]workItem, inputStart, recordStart, count, maxRunLen int) {
+	for count > 0 {
+		n := min(count, maxRunLen)
+		*items = append(*items, workItem{
+			inputStart:  inputStart,
+			recordStart: recordStart,
+			count:       n,
+		})
+		inputStart += n
+		recordStart += n
+		count -= n
+	}
+}
+
+// ReadScattered reads records at the given sorted, unique record indices
+// with parallel I/O. Consecutive index runs are read as sequential batches
+// via ReadRecords (bandwidth-optimal on cold storage); isolated indices
+// use individual parallel reads via ReadRecord. Long consecutive runs are
+// split across workers so decompression is parallelized on warm cache.
+//
+// process is called once per index in indices. workerID identifies the
+// calling goroutine (in [0, min(len(indices), concurrency))); callers can
+// use it to index into pre-allocated per-worker state, avoiding sync.Pool
+// overhead per call.
+// inputPos is the position in the indices slice (not the record index
+// itself — use indices[inputPos] if needed).
+//
+// data is borrowed and must not be retained after process returns:
+//
+//	// Correct: copy the data
+//	myBuf = append(myBuf[:0], data...)
+//
+//	// WRONG: data will be overwritten on the next call
+//	saved = data
+//
+// process may be called from multiple goroutines concurrently when
+// concurrency > 1; it must be safe for concurrent use.
+//
+// ReadScattered does NOT recover panics from process. An unrecovered panic
+// in process will crash the program with a stack trace — correct behavior
+// for programming errors. Callers that use pooled CGO objects in process
+// should use explicit Put on the success path only (not defer) to avoid
+// returning potentially-corrupt objects to the pool on panic.
+//
+// Context cancellation is checked between work items but not between
+// individual records within a consecutive run. A run of N consecutive
+// records will be fully processed before checking ctx.
+//
+// indices must be sorted ascending with no duplicates (panics otherwise).
+// Returns ErrIndexRange if any index is out of [0, RecordCount).
+func (r *Reader) ReadScattered(
+	ctx context.Context,
+	indices []int,
+	concurrency int,
+	process func(workerID, inputPos int, data []byte) error,
+) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	if err := r.waitOpen(); err != nil {
+		return err
+	}
+
+	rc := int(r.trailer.RecordCount)
+
+	// Validate bounds and sorted+unique invariant.
+	for i, idx := range indices {
+		if idx < 0 || idx >= rc {
+			return fmt.Errorf("%w: %d not in [0, %d)", ErrIndexRange, idx, rc)
+		}
+		if i > 0 && indices[i] <= indices[i-1] {
+			panic(fmt.Sprintf("packfile: ReadScattered indices not sorted/unique at position %d: %d <= %d",
+				i, indices[i], indices[i-1]))
+		}
+	}
+
+	// Split consecutive runs so each worker gets roughly equal chunks.
+	// This preserves batch I/O for cold storage while parallelizing
+	// decompression across workers for warm cache.
+	maxRunLen := max((len(indices)+concurrency-1)/concurrency, 1)
+	items := partitionRuns(indices, maxRunLen)
+
+	numWorkers := min(len(items), concurrency)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var nextItem atomic.Int64
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+
+	wg.Add(numWorkers)
+	for w := range numWorkers {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			// Use pooled 1MB buffer for single-record reads to avoid
+			// per-goroutine allocation that becomes GC pressure across
+			// many ReadScattered calls. Released before ReadRecords
+			// (which uses its own pooled buffer) to avoid doubling memory.
+			bp := readBufPool.Get().(*[]byte)
+			buf := (*bp)[:0]
+			hasBuf := true
+			returnBuf := func() {
+				if hasBuf {
+					*bp = buf
+					readBufPool.Put(bp)
+					hasBuf = false
+				}
+			}
+			defer returnBuf()
+
+			for {
+				wi := int(nextItem.Add(1)) - 1
+				if wi >= len(items) || ctx.Err() != nil {
+					return
+				}
+
+				item := items[wi]
+
+				if item.count == 1 {
+					// Re-acquire buffer if we released it for a previous ReadRecords call.
+					if !hasBuf {
+						bp = readBufPool.Get().(*[]byte)
+						buf = (*bp)[:0]
+						hasBuf = true
+					}
+					// Single record: use ReadRecord with reusable worker buffer.
+					var err error
+					buf, err = r.ReadRecord(item.recordStart, buf)
+					if err != nil {
+						errOnce.Do(func() { firstErr = err })
+						cancel()
+						return
+					}
+					if err := process(workerID, item.inputStart, buf); err != nil {
+						errOnce.Do(func() { firstErr = err })
+						cancel()
+						return
+					}
+				} else {
+					// Release our buffer before ReadRecords, which acquires
+					// its own pooled buffer internally.
+					returnBuf()
+					// Consecutive run: batch read via ReadRecords.
+					i := 0
+					for data, err := range r.ReadRecords(item.recordStart, item.count) {
+						if err != nil {
+							errOnce.Do(func() { firstErr = err })
+							cancel()
+							return
+						}
+						if err := process(workerID, item.inputStart+i, data); err != nil {
+							errOnce.Do(func() { firstErr = err })
+							cancel()
+							return
+						}
+						i++
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }

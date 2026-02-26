@@ -143,3 +143,116 @@ func BenchmarkColdRocksDBReadIndices1(b *testing.B)  { benchColdRocksDBReadIndic
 func BenchmarkColdRocksDBReadIndices8(b *testing.B)  { benchColdRocksDBReadIndices(b, 8) }
 func BenchmarkColdRocksDBReadIndices32(b *testing.B) { benchColdRocksDBReadIndices(b, 32) }
 func BenchmarkColdRocksDBReadIndices64(b *testing.B) { benchColdRocksDBReadIndices(b, 64) }
+
+// coldConsecutiveIndices generates indices that span numBlocks consecutive blocks,
+// each picking one event per block starting from startBlock.
+func coldConsecutiveIndices(numBlocks, startBlock, totalEvents, blockSize int) []int {
+	indices := make([]int, 0, numBlocks)
+	for i := range numBlocks {
+		idx := (startBlock + i) * blockSize
+		if idx >= totalEvents {
+			break
+		}
+		indices = append(indices, idx)
+	}
+	return indices
+}
+
+// coldMixedIndices generates a mix of ~50% consecutive runs and ~50% scattered indices.
+func coldMixedIndices(rng *rand.Rand, n, totalEvents, blockSize int) []int {
+	totalBlocks := totalEvents / blockSize
+	half := n / 2
+
+	// First half: consecutive run starting at a random block.
+	startBlock := rng.Intn(totalBlocks - half)
+	indices := make([]int, 0, n)
+	for i := range half {
+		indices = append(indices, (startBlock+i)*blockSize)
+	}
+
+	// Second half: scattered random blocks (avoiding the consecutive range).
+	scattered := make(map[int]struct{}, n-half)
+	for len(scattered) < n-half {
+		blk := rng.Intn(totalBlocks)
+		if blk >= startBlock && blk < startBlock+half {
+			continue
+		}
+		scattered[blk] = struct{}{}
+	}
+	for blk := range scattered {
+		indices = append(indices, blk*blockSize+rng.Intn(blockSize))
+	}
+
+	sort.Ints(indices)
+	return indices
+}
+
+func benchColdPackfileReadIndicesConsecutive(b *testing.B, concurrency int) {
+	setupBenchData(b)
+
+	const numBlocks = 1000
+	const blockSize = 128
+	const startBlock = 100
+
+	esPath := filepath.Join(coldFixtureDir(), "bench.events")
+	if _, err := os.Stat(esPath); err != nil {
+		b.Fatalf("fixture not found: %s (set COLD_FIXTURES_DIR for alternate location)", esPath)
+	}
+
+	indices := coldConsecutiveIndices(numBlocks, startBlock, totalEvents, blockSize)
+
+	for b.Loop() {
+		b.StopTimer()
+		if err := dropFileCache(esPath); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
+		for ev, err := range er.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
+		}
+		er.Close()
+	}
+}
+
+func BenchmarkColdPackfileReadIndicesConsec1(b *testing.B)  { benchColdPackfileReadIndicesConsecutive(b, 1) }
+func BenchmarkColdPackfileReadIndicesConsec8(b *testing.B)  { benchColdPackfileReadIndicesConsecutive(b, 8) }
+func BenchmarkColdPackfileReadIndicesConsec32(b *testing.B) { benchColdPackfileReadIndicesConsecutive(b, 32) }
+
+func benchColdPackfileReadIndicesMixed(b *testing.B, concurrency int) {
+	setupBenchData(b)
+
+	const numReads = 1000
+	const blockSize = 128
+
+	esPath := filepath.Join(coldFixtureDir(), "bench.events")
+	if _, err := os.Stat(esPath); err != nil {
+		b.Fatalf("fixture not found: %s (set COLD_FIXTURES_DIR for alternate location)", esPath)
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	indices := coldMixedIndices(rng, numReads, totalEvents, blockSize)
+
+	for b.Loop() {
+		b.StopTimer()
+		if err := dropFileCache(esPath); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
+		for ev, err := range er.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
+		}
+		er.Close()
+	}
+}
+
+func BenchmarkColdPackfileReadIndicesMixed8(b *testing.B) { benchColdPackfileReadIndicesMixed(b, 8) }

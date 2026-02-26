@@ -2,8 +2,10 @@ package packfile
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,7 +56,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	for i, want := range records {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -78,7 +80,7 @@ func TestEmptyFile(t *testing.T) {
 		t.Fatalf("RecordCount = %d, want 0", rc)
 	}
 
-	_, err = r.ReadRecordInto(0, nil)
+	_, err = r.ReadRecord(0, nil)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadRecord(0) on empty: got %v, want ErrIndexRange", err)
 	}
@@ -99,7 +101,7 @@ func TestSingleRecord(t *testing.T) {
 		t.Fatalf("RecordCount = %d, want 1", rc)
 	}
 
-	got, err := r.ReadRecordInto(0, nil)
+	got, err := r.ReadRecord(0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +128,7 @@ func TestPartialLastGroup(t *testing.T) {
 
 	// Verify all records.
 	for i, want := range records {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -154,7 +156,7 @@ func TestLargeRecords(t *testing.T) {
 
 	// Point reads.
 	for i, want := range records {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -250,7 +252,7 @@ func TestConcurrentReads(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			got, err := r.ReadRecordInto(idx, nil)
+			got, err := r.ReadRecord(idx, nil)
 			if err != nil {
 				errs <- err
 				return
@@ -428,7 +430,7 @@ func TestVariableSizeRecords(t *testing.T) {
 	defer r.Close()
 
 	for i, want := range records {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -447,7 +449,7 @@ func TestUniformSizeRecords(t *testing.T) {
 	defer r.Close()
 
 	for i, want := range records {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -464,17 +466,17 @@ func TestReadRecordOutOfRange(t *testing.T) {
 	r := Open(path)
 	defer r.Close()
 
-	_, err := r.ReadRecordInto(-1, nil)
+	_, err := r.ReadRecord(-1, nil)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadRecord(-1): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadRecordInto(5, nil)
+	_, err = r.ReadRecord(5, nil)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadRecord(5): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadRecordInto(100, nil)
+	_, err = r.ReadRecord(100, nil)
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadRecord(100): got %v, want ErrIndexRange", err)
 	}
@@ -654,7 +656,7 @@ func TestSpeculativeReadFallbackNoMetadata(t *testing.T) {
 
 	// Spot-check records near group boundaries (128-record groups in FOR index).
 	for _, i := range []int{0, 1, 127, 128, 129, 255, 256, n/2, n - 2, n - 1} {
-		got, err := r.ReadRecordInto(i, nil)
+		got, err := r.ReadRecord(i, nil)
 		if err != nil {
 			t.Fatalf("ReadRecord(%d): %v", i, err)
 		}
@@ -668,7 +670,7 @@ func TestOpenBadPath(t *testing.T) {
 	r := Open("/nonexistent/path/to/file.pack")
 	defer r.Close()
 
-	_, err := r.ReadRecordInto(0, nil)
+	_, err := r.ReadRecord(0, nil)
 	if err == nil {
 		t.Fatal("expected error for bad path")
 	}
@@ -693,5 +695,413 @@ func TestDoubleClose(t *testing.T) {
 	err2 := r.Close()
 	if err1 != err2 {
 		t.Fatalf("double Close: first=%v, second=%v", err1, err2)
+	}
+}
+
+// --- partitionRuns tests ---
+
+func TestPartitionRuns(t *testing.T) {
+	tests := []struct {
+		name      string
+		indices   []int
+		maxRunLen int
+		want      []workItem
+	}{
+		{"empty", nil, 100, nil},
+		{"single", []int{5}, 100, []workItem{{0, 5, 1}}},
+		{"all_consecutive", []int{3, 4, 5, 6, 7}, 100, []workItem{{0, 3, 5}}},
+		{"all_scattered", []int{0, 5, 10, 20}, 100, []workItem{
+			{0, 0, 1}, {1, 5, 1}, {2, 10, 1}, {3, 20, 1},
+		}},
+		{"mixed", []int{0, 1, 2, 5, 6, 10}, 100, []workItem{
+			{0, 0, 3}, {3, 5, 2}, {5, 10, 1},
+		}},
+		{"two_elements_consecutive", []int{7, 8}, 100, []workItem{{0, 7, 2}}},
+		{"two_elements_scattered", []int{3, 9}, 100, []workItem{{0, 3, 1}, {1, 9, 1}}},
+		// Run splitting: 10 consecutive indices split into chunks of 3.
+		{"split_consecutive", []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, 3, []workItem{
+			{0, 0, 3}, {3, 3, 3}, {6, 6, 3}, {9, 9, 1},
+		}},
+		// Run splitting: only long runs are split, short runs and isolated indices are unchanged.
+		{"split_mixed", []int{0, 1, 2, 3, 4, 10, 11, 20}, 3, []workItem{
+			{0, 0, 3}, {3, 3, 2}, {5, 10, 2}, {7, 20, 1},
+		}},
+		// maxRunLen=1 degenerates to all-scattered.
+		{"split_max1", []int{0, 1, 2}, 1, []workItem{
+			{0, 0, 1}, {1, 1, 1}, {2, 2, 1},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := partitionRuns(tt.indices, tt.maxRunLen)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d: %+v", len(got), len(tt.want), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("item[%d] = %+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// --- ReadScattered tests ---
+
+func TestReadScatteredAllConsecutive(t *testing.T) {
+	records := makeRecords(100, 1024)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	indices := make([]int, 50)
+	for i := range indices {
+		indices[i] = 10 + i // 10..59
+	}
+
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 4,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d: data mismatch", idx)
+		}
+	}
+}
+
+func TestReadScatteredMixed(t *testing.T) {
+	records := makeRecords(100, 512)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	// Mix of consecutive runs and isolated indices.
+	indices := []int{0, 1, 2, 10, 20, 21, 22, 23, 50, 99}
+
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 4,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
+		}
+	}
+}
+
+func TestReadScatteredAllScattered(t *testing.T) {
+	records := makeRecords(100, 256)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	indices := []int{0, 10, 30, 50, 70, 99}
+
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 4,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
+		}
+	}
+}
+
+func TestReadScatteredSingle(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	var got []byte
+	err := r.ReadScattered(context.Background(), []int{5}, 4,
+		func(workerID, inputPos int, data []byte) error {
+			got = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, records[5]) {
+		t.Fatal("data mismatch")
+	}
+}
+
+func TestReadScatteredEmpty(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	err := r.ReadScattered(context.Background(), nil, 4,
+		func(workerID, inputPos int, data []byte) error {
+			t.Fatal("should not be called")
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = r.ReadScattered(context.Background(), []int{}, 4,
+		func(workerID, inputPos int, data []byte) error {
+			t.Fatal("should not be called")
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadScatteredHighConcurrency(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	indices := []int{1, 5, 8}
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 100,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d: data mismatch", idx)
+		}
+	}
+}
+
+func TestReadScatteredWorkerIDs(t *testing.T) {
+	records := makeRecords(100, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	// All scattered so each is a separate work item.
+	indices := make([]int, 20)
+	for i := range indices {
+		indices[i] = i * 5
+	}
+
+	const concurrency = 4
+	seen := make([]bool, concurrency)
+	var mu sync.Mutex
+
+	err := r.ReadScattered(context.Background(), indices, concurrency,
+		func(workerID, inputPos int, data []byte) error {
+			if workerID < 0 || workerID >= concurrency {
+				return fmt.Errorf("workerID %d out of range [0, %d)", workerID, concurrency)
+			}
+			mu.Lock()
+			seen[workerID] = true
+			mu.Unlock()
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With 20 work items and 4 workers, multiple workers must have been used.
+	used := 0
+	for _, s := range seen {
+		if s {
+			used++
+		}
+	}
+	if used < 2 {
+		t.Fatalf("expected multiple workers to be used, got %d", used)
+	}
+}
+
+func TestReadScatteredContextCancel(t *testing.T) {
+	records := makeRecords(100, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	indices := make([]int, 50)
+	for i := range indices {
+		indices[i] = i * 2
+	}
+
+	err := r.ReadScattered(ctx, indices, 4,
+		func(workerID, inputPos int, data []byte) error {
+			return nil
+		})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestReadScatteredProcessError(t *testing.T) {
+	records := makeRecords(100, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	// All scattered to maximize work items.
+	indices := make([]int, 50)
+	for i := range indices {
+		indices[i] = i * 2
+	}
+
+	sentinel := fmt.Errorf("process error")
+	err := r.ReadScattered(context.Background(), indices, 1,
+		func(workerID, inputPos int, data []byte) error {
+			if inputPos == 3 {
+				return sentinel
+			}
+			return nil
+		})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("got %v, want sentinel error", err)
+	}
+}
+
+func TestReadScatteredOutOfRange(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	err := r.ReadScattered(context.Background(), []int{10}, 1,
+		func(workerID, inputPos int, data []byte) error { return nil })
+	if !errors.Is(err, ErrIndexRange) {
+		t.Fatalf("got %v, want ErrIndexRange", err)
+	}
+
+	err = r.ReadScattered(context.Background(), []int{-1}, 1,
+		func(workerID, inputPos int, data []byte) error { return nil })
+	if !errors.Is(err, ErrIndexRange) {
+		t.Fatalf("got %v, want ErrIndexRange for -1", err)
+	}
+}
+
+func TestReadScatteredUnsortedPanic(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for unsorted indices")
+		}
+	}()
+
+	r.ReadScattered(context.Background(), []int{5, 3}, 1,
+		func(workerID, inputPos int, data []byte) error { return nil })
+}
+
+func TestReadScatteredDuplicatePanic(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for duplicate indices")
+		}
+	}()
+
+	r.ReadScattered(context.Background(), []int{3, 3}, 1,
+		func(workerID, inputPos int, data []byte) error { return nil })
+}
+
+func TestReadScatteredZeroConcurrency(t *testing.T) {
+	records := makeRecords(10, 100)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	indices := []int{0, 3, 7}
+	results := make([][]byte, len(indices))
+	// concurrency=0 should be clamped to 1, not panic.
+	err := r.ReadScattered(context.Background(), indices, 0,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d: data mismatch", idx)
+		}
+	}
+}
+
+func TestReadScatteredCrossFORGroupBoundary(t *testing.T) {
+	// 300 records spans multiple FOR groups (each 128 records).
+	// Consecutive range 120..179 crosses the group boundary at 128.
+	records := makeRecords(300, 512)
+	path := writeTestPackfile(t, records, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	indices := make([]int, 60)
+	for i := range indices {
+		indices[i] = 120 + i // 120..179, crosses boundary at 128
+	}
+
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 4,
+		func(workerID, inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
+		}
 	}
 }

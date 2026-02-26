@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
@@ -242,7 +241,7 @@ func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 	lb := getBuf()
 	defer putBuf(lb)
 
-	lb.rec, err = r.pack.ReadRecordInto(batchIdx, lb.rec)
+	lb.rec, err = r.pack.ReadRecord(batchIdx, lb.rec)
 	if err != nil {
 		return nil, fmt.Errorf("bitmapindex: read batch %d for rank %d: %w", batchIdx, rank, err)
 	}
@@ -337,79 +336,49 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		w.keys = append(w.keys, found[i])
 	}
 
-	numBatches := len(work)
+	// Extract sorted batch indices for ReadScattered.
+	batchIndices := make([]int, len(work))
+	for i := range work {
+		batchIndices[i] = work[i].batchIdx
+	}
 
-	// Parallel I/O: fixed worker pool with atomic work stealing.
-	numWorkers := min(numBatches, r.concurrency)
+	// Pre-allocate per-worker lookupBufs.
+	numWorkers := min(len(work), r.concurrency)
+	workers := make([]*lookupBuf, numWorkers)
+	for i := range workers {
+		workers[i] = getBuf()
+	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	err = r.pack.ReadScattered(ctx, batchIndices, r.concurrency,
+		func(workerID, inputPos int, data []byte) error {
+			bw := &work[inputPos]
+			lb := workers[workerID]
+			// Safe to alias: data is stable for the duration of this callback,
+			// and parseBatch + extractBitmap fully consume it before returning.
+			lb.rec = data
 
-	var nextBatch atomic.Int64
-	var wg sync.WaitGroup
-	var errOnce sync.Once
-	var firstErr error
-
-	wg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer wg.Done()
-			lb := getBuf()
-			defer func() {
-				if rv := recover(); rv != nil {
-					// Don't return lb to pool — CGO decompressor may be in invalid state.
-					errOnce.Do(func() { firstErr = fmt.Errorf("bitmapindex: panic in LookupKeys worker: %v", rv) })
-					cancel()
-					return
-				}
-				putBuf(lb)
-			}()
-
-			for {
-				bi := int(nextBatch.Add(1)) - 1
-				if bi >= numBatches || ctx.Err() != nil {
-					return
-				}
-
-				bw := &work[bi]
-				var err error
-				lb.rec, err = r.pack.ReadRecordInto(bw.batchIdx, lb.rec)
-				if err != nil {
-					errOnce.Do(func() {
-						firstErr = fmt.Errorf("bitmapindex: read batch %d: %w", bw.batchIdx, err)
-					})
-					cancel()
-					return
-				}
-
-				batch, err := parseBatch(lb.rec, bw.batchIdx)
-				if err != nil {
-					errOnce.Do(func() { firstErr = err })
-					cancel()
-					return
-				}
-
-				for _, ki := range bw.keys {
-					bm, err := extractBitmap(batch, ki.localIdx, ki.hk[:], lb)
-					if err != nil {
-						if errors.Is(err, ErrKeyNotFound) {
-							continue // fingerprint false positive
-						}
-						errOnce.Do(func() { firstErr = err })
-						cancel()
-						return
-					}
-					out[ki.outIdx] = bm
-				}
+			batch, err := parseBatch(lb.rec, bw.batchIdx)
+			if err != nil {
+				return err
 			}
-		}()
-	}
-	wg.Wait()
+			for _, ki := range bw.keys {
+				bm, err := extractBitmap(batch, ki.localIdx, ki.hk[:], lb)
+				if err != nil {
+					if errors.Is(err, ErrKeyNotFound) {
+						continue
+					}
+					return err
+				}
+				out[ki.outIdx] = bm
+			}
+			return nil
+		})
 
-	if firstErr != nil {
-		return nil, firstErr
+	for _, lb := range workers {
+		putBuf(lb)
 	}
-	if err := ctx.Err(); err != nil {
+
+	if err != nil {
 		return nil, err
 	}
 

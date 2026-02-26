@@ -200,6 +200,36 @@ func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 	}
 }
 
+// benchReadIndicesConsecutive reads indices that span consecutive blocks,
+// exercising the batch I/O path in ReadScattered.
+func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) {
+	b.Helper()
+	const blockSize = 128
+	const numBlocks = 1000
+	startBlock := 100
+	indices := make([]int, numBlocks)
+	for i := range indices {
+		indices[i] = (startBlock + i) * blockSize
+	}
+	// Clamp to valid range.
+	for i := range indices {
+		if indices[i] >= n {
+			indices = indices[:i]
+			break
+		}
+	}
+	b.ResetTimer()
+
+	for b.Loop() {
+		for ev, err := range r.ReadIndices(context.Background(), indices) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = ev
+		}
+	}
+}
+
 func benchParallelRead(b *testing.B, r eventstore.StoreReader, n int) {
 	b.Helper()
 	b.ResetTimer()
@@ -370,6 +400,22 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 	defer r.Close()
 	n, _ := r.EventCount()
 	benchReadIndices(b, r, n)
+}
+
+func BenchmarkPackfileReadIndicesConsecutive(b *testing.B) {
+	setupBenchData(b)
+	er := eventstore.Open(eventstorePath)
+	defer er.Close()
+	n, _ := er.EventCount()
+	benchReadIndicesConsecutive(b, er, n)
+}
+
+func BenchmarkRocksDBReadIndicesConsecutive(b *testing.B) {
+	setupBenchData(b)
+	r := rocksdbES.Open(rocksDBPath)
+	defer r.Close()
+	n, _ := r.EventCount()
+	benchReadIndicesConsecutive(b, r, n)
 }
 
 func BenchmarkPackfileParallelReadIndices(b *testing.B) {

@@ -7,7 +7,6 @@ import (
 	"iter"
 	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/tamir/events-analysis/packfile"
 	"github.com/tamir/events-analysis/zstd"
@@ -247,7 +246,7 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	defer blockBufPool.Put(bb)
 
 	var err error
-	bb.compressed, err = r.pr.ReadRecordInto(blockIdx, bb.compressed)
+	bb.compressed, err = r.pr.ReadRecord(blockIdx, bb.compressed)
 	if err != nil {
 		return nil, err
 	}
@@ -324,12 +323,6 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 	}
 }
 
-// indicesWork holds working state for ReadIndices.
-type indicesWork struct {
-	blocks []blockRange // unique blocks to read
-	events [][]byte     // output: one per input index
-}
-
 // blockRange maps a block to its slice of requested indices.
 // Since indices are sorted, all indices for a given block are contiguous
 // in the original indices slice — represented as [inputStart, inputEnd).
@@ -337,16 +330,6 @@ type blockRange struct {
 	blockIdx   int
 	inputStart int // start index into indices[]
 	inputEnd   int // end index into indices[]
-}
-
-func (w *indicesWork) reset(n int) {
-	w.blocks = w.blocks[:0]
-	if cap(w.events) < n {
-		w.events = make([][]byte, n)
-	} else {
-		w.events = w.events[:n]
-		clear(w.events)
-	}
 }
 
 // ReadIndices reads events at scattered indices with parallel I/O.
@@ -364,7 +347,7 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			return
 		}
 
-		// Validate bounds and sorted+unique invariant
+		// Validate bounds and sorted+unique invariant.
 		for i, idx := range indices {
 			if idx < 0 || idx >= r.nEvents {
 				panic(fmt.Sprintf("eventstore: ReadIndices index %d out of range [0, %d)",
@@ -376,100 +359,65 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			}
 		}
 
-		w := &indicesWork{}
-		w.reset(len(indices))
-
-		// Phase 1: group indices by block.
+		// Phase 1: group indices by block, build blockIndices and blockGroups.
+		var blockGroups []blockRange
+		var blockIndices []int
 		prevBlockIdx := -1
 		for i, idx := range indices {
 			blkIdx := idx / r.blockN
 			if blkIdx != prevBlockIdx {
-				if len(w.blocks) > 0 {
-					w.blocks[len(w.blocks)-1].inputEnd = i
+				if len(blockGroups) > 0 {
+					blockGroups[len(blockGroups)-1].inputEnd = i
 				}
-				w.blocks = append(w.blocks, blockRange{blockIdx: blkIdx, inputStart: i})
+				blockGroups = append(blockGroups, blockRange{blockIdx: blkIdx, inputStart: i})
+				blockIndices = append(blockIndices, blkIdx)
 				prevBlockIdx = blkIdx
 			}
 		}
-		if len(w.blocks) > 0 {
-			w.blocks[len(w.blocks)-1].inputEnd = len(indices)
+		if len(blockGroups) > 0 {
+			blockGroups[len(blockGroups)-1].inputEnd = len(indices)
 		}
 
-		// Phase 2: fixed worker pool, each worker steals blocks via atomic counter.
-		var errOnce sync.Once
-		var firstErr error
+		events := make([][]byte, len(indices))
 
-		numBlocks := len(w.blocks)
-		numWorkers := min(numBlocks, r.concurrency)
+		// Pre-allocate per-worker blockBufs.
+		numWorkers := min(len(blockGroups), r.concurrency)
+		workers := make([]*blockBuf, numWorkers)
+		for i := range workers {
+			workers[i] = blockBufPool.Get().(*blockBuf)
+		}
 
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		var nextBlock atomic.Int64
-		var wg sync.WaitGroup
-		wg.Add(numWorkers)
-
-		for range numWorkers {
-			go func() {
-				defer wg.Done()
-				bb := blockBufPool.Get().(*blockBuf)
-				defer func() {
-					if rv := recover(); rv != nil {
-						// Don't return bb to pool — CGO decompressor may be in invalid state.
-						errOnce.Do(func() { firstErr = fmt.Errorf("eventstore: panic in worker: %v", rv) })
-						cancel()
-						return
-					}
-					blockBufPool.Put(bb)
-				}()
-
-				for {
-					bi := int(nextBlock.Add(1)) - 1
-					if bi >= numBlocks || ctx.Err() != nil {
-						return
-					}
-					if err := r.processBlock(w, bi, indices, bb); err != nil {
-						errOnce.Do(func() { firstErr = err })
-						cancel()
-						return
-					}
+		// Phase 2: ReadScattered replaces manual work-stealing.
+		err := r.pr.ReadScattered(ctx, blockIndices, r.concurrency,
+			func(workerID, inputPos int, data []byte) error {
+				bb := workers[workerID]
+				// Safe to alias: data is stable for the duration of this callback,
+				// and bb.decode + bb.event fully consume it before returning.
+				bb.compressed = data
+				blk := blockGroups[inputPos]
+				if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx), r.noCompress); err != nil {
+					return err
 				}
-			}()
+				for j := blk.inputStart; j < blk.inputEnd; j++ {
+					events[j] = bb.event(indices[j] % r.blockN)
+				}
+				return nil
+			})
+
+		// Return workers to pool (skip on panic — process crash is fine).
+		for _, bb := range workers {
+			blockBufPool.Put(bb)
 		}
-		wg.Wait()
 
 		// Phase 3: yield results in index order.
-		if firstErr != nil {
-			yield(nil, firstErr)
-			return
-		}
-		if err := ctx.Err(); err != nil {
+		if err != nil {
 			yield(nil, err)
 			return
 		}
-		for _, ev := range w.events {
+		for _, ev := range events {
 			if !yield(ev, nil) {
 				return
 			}
 		}
 	}
-}
-
-// processBlock reads and decodes a single block, populating w.events for
-// the requested indices within that block.
-func (r *Reader) processBlock(w *indicesWork, bi int, indices []int, bb *blockBuf) error {
-	blk := w.blocks[bi]
-
-	var err error
-	bb.compressed, err = r.pr.ReadRecordInto(blk.blockIdx, bb.compressed)
-	if err != nil {
-		return err
-	}
-	if err := bb.decode(bb.compressed, r.eventsInBlock(blk.blockIdx), r.noCompress); err != nil {
-		return err
-	}
-	for j := blk.inputStart; j < blk.inputEnd; j++ {
-		w.events[j] = bb.event(indices[j] % r.blockN)
-	}
-	return nil
 }

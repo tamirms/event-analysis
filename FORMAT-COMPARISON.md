@@ -19,6 +19,7 @@ Numbers from BENCHMARKS.md (Intel Xeon 32-core). ARM64 ratios are similar (see B
 | **Scattered 50 indices** | 158 µs | 206 µs | Packfile (1.3x) |
 | **Parallel point (32 cores)** | 687 ns | 853 ns | Packfile (1.2x) |
 | **Parallel scattered (32 cores)** | 42 µs | 45 µs | Tie (~1.07x) |
+| **Consecutive 1000 blocks** | 2.5 ms | 2.3 ms | Tie (~1.08x) |
 | **Write (NVMe, 8 goroutines)** | 2,805 MB/s | 926 MB/s | Packfile (3.0x) |
 | **Write (EBS, 8 goroutines)** | 821 MB/s | 756 MB/s | Packfile (1.09x) |
 | **Open latency (warm)** | 320 µs | 1,951 µs | Packfile (6.1x) |
@@ -64,6 +65,12 @@ The performance gap is structural, not tunable:
   dominates CPU overhead. 1,000 scattered reads: ~333ms for both.
 - **Parallel scattered reads:** Under 32-core parallel load with 50 indices, RocksDB's
   `BatchedMultiGetCF` nearly matches packfile's work-stealing (45µs vs 42µs).
+- **Consecutive block reads (warm):** 1,000 consecutive blocks: packfile's ReadScattered
+  batch I/O (2.5ms) nearly matches RocksDB's block cache locality (2.3ms). Both are
+  decompression-bound (~1,000 zstd block decompressions each). Packfile splits large
+  consecutive runs across workers for parallel decompression; RocksDB benefits from
+  sequential prefetch in its block cache. On cold EBS, packfile pulls ahead (47ms vs
+  IOPS-limited scattered reads at 98ms) because batch `ReadRecords` is bandwidth-optimal.
 - **EBS writes:** Packfile at 8 goroutines (821 MB/s) is now 1.09x faster than RocksDB at 8
   threads (756 MB/s) on EBS, thanks to `sync_file_range(SYNC_FILE_RANGE_WRITE)` which initiates
   background writeback every 1MB during the append phase. Before this optimization, RocksDB was
@@ -83,22 +90,22 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/) | 772 | — |
+| Core format (packfile/) | 980 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
-| Eventstore impl | 782 | 401 |
-| Bitmapindex impl | 946 | 344 |
-| **Total implementation** | **2,719** | **901** |
+| Eventstore impl | 730 | 401 |
+| Bitmapindex impl | 915 | 344 |
+| **Total implementation** | **2,844** | **901** |
 
 RocksDB requires **~3x less code** because RocksDB handles block management, compression,
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these in Go:
 
 - Frame-of-Reference encoding/decoding (for.go: 87 lines)
-- Block accumulation and streaming compression pipeline (eventstore/writer.go: 272 lines)
-- Block decompression with sync.Pool, runtime.SetFinalizer (eventstore/reader.go: 475 lines)
-- Work-stealing parallel I/O for ReadIndices (eventstore/reader.go)
-- MPHF construction and query (bitmapindex/writer.go: 324 lines, reader.go: 550 lines)
+- Block accumulation and streaming compression pipeline (eventstore/writer.go: 274 lines)
+- Block decompression with sync.Pool, runtime.SetFinalizer (eventstore/reader.go: 423 lines)
+- Consecutive-run batching + work-stealing parallel I/O (packfile/reader.go — ReadScattered)
+- MPHF construction and query (bitmapindex/writer.go: 324 lines, reader.go: 519 lines)
 - Prefetch heuristics, mmap vs read decisions (bitmapindex/reader.go)
 - Atomic write with temp file + rename + directory fsync (packfile/writer.go)
 - CRC32C checksums and trailer parsing (packfile/reader.go, writer.go)
@@ -108,15 +115,16 @@ all of these in Go:
 | Aspect | Packfile | RocksDB |
 |--------|----------|---------|
 | **Compression pipeline** | Bounded channel + N workers + reorder buffer | `SetCompressionOptionsParallelThreads(N)` |
-| **Parallel read** | Work-stealing goroutine pool + atomic counter | `BatchedMultiGetCF` with sorted input |
+| **Parallel read** | ReadScattered: consecutive-run batching + work-stealing | `BatchedMultiGetCF` with sorted input |
 | **Block buffer management** | sync.Pool + runtime.SetFinalizer for CGO objects | Handled internally by RocksDB |
 | **Index format** | FOR-128 encoding, speculative read at open | B-tree block index (automatic) |
 | **Write atomicity** | Manual temp file + rename + dir fsync | `IngestSST` with `MoveFiles(true)` |
 | **Checksums** | Manual CRC32C of index + trailer | Automatic per-block (configurable) |
 
 The packfile's complexity is concentrated in two areas that are difficult to get right:
-(1) the concurrent compression pipeline with in-order reordering, and (2) the work-stealing
-parallel I/O in ReadIndices. These are well-tested but represent significant ongoing
+(1) the concurrent compression pipeline with in-order reordering, and (2) ReadScattered
+(consecutive-run batching + work-stealing dispatch in packfile/reader.go), shared by both
+eventstore and bitmapindex. These are well-tested but represent significant ongoing
 maintenance surface.
 
 RocksDB delegates these concerns to a mature, battle-tested C++ library. The tradeoff is
@@ -127,11 +135,11 @@ code paths.
 
 | Package | Tests | Lines |
 |---------|-------|-------|
-| eventstore (packfile) | 22 | 764 |
-| eventstore/rocksdb | 18 | 447 |
+| eventstore (packfile) | 26 | 764 |
+| eventstore/rocksdb | 17 | 446 |
 | bitmapindex (packfile) | in root tests | — |
-| bitmapindex/rocksdb | 9 | 315 |
-| packfile | 17 | 697 |
+| bitmapindex/rocksdb | 9 | 314 |
+| packfile | 37 | 1,107 |
 
 The packfile tests are more comprehensive because the format has more edge cases to cover
 (block boundaries, partial blocks, FOR encoding corner cases, compression failures). RocksDB

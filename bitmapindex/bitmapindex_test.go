@@ -382,10 +382,10 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 
 	// Read the raw record to find its location in the file.
 	pack := packfile.Open(dataPath)
-	rec, err := pack.ReadRecordInto(0, nil)
+	rec, err := pack.ReadRecord(0, nil)
 	if err != nil {
 		pack.Close()
-		t.Fatalf("ReadRecordInto: %v", err)
+		t.Fatalf("ReadRecord: %v", err)
 	}
 	pack.Close()
 
@@ -448,9 +448,9 @@ func TestCRC32CPackfileIntegrity(t *testing.T) {
 	pack := packfile.Open(dataPath)
 	defer pack.Close()
 
-	rec, err := pack.ReadRecordInto(0, nil)
+	rec, err := pack.ReadRecord(0, nil)
 	if err != nil {
-		t.Fatalf("ReadRecordInto: %v", err)
+		t.Fatalf("ReadRecord: %v", err)
 	}
 
 	if len(rec) < fingerprintSize+1+checksumSize {
@@ -813,7 +813,7 @@ func TestMetadataFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := pack.ReadRecordInto(0, nil)
+	rec, err := pack.ReadRecord(0, nil)
 	pack.Close()
 	if err != nil {
 		t.Fatal(err)
