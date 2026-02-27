@@ -2,14 +2,11 @@ package bitmapindex
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
-	"runtime"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -17,15 +14,12 @@ import (
 	streamerrors "github.com/tamirms/streamhash/errors"
 
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/zstd"
+	"github.com/tamir/events-analysis/packfile/record"
 )
 
 var ErrKeyNotFound = errors.New("bitmapindex: key not found")
 
-const (
-	defaultConcurrency        = 8
-	knownFlags         uint16 = 0
-)
+const defaultConcurrency = 8
 
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*readerConfig)
@@ -72,9 +66,11 @@ type Reader struct {
 	mphfErr   error
 
 	// Packfile metadata — validated on first access:
-	packOnce  sync.Once
-	batchSize int
-	packErr   error
+	packOnce   sync.Once
+	totalKeys  int
+	batchSize  int
+	compressed bool
+	packErr    error
 
 	// Idempotent close:
 	closeOnce sync.Once
@@ -97,21 +93,24 @@ func (r *Reader) waitPackfile() error {
 			r.packErr = err
 			return
 		}
-		if len(meta) < metadataSize {
-			r.packErr = fmt.Errorf("bitmapindex: metadata too short: %d bytes (want >= %d)", len(meta), metadataSize)
+
+		totalItems, recordSize, flags, err := packfile.DecodeMetadata(meta)
+		if err != nil {
+			r.packErr = fmt.Errorf("bitmapindex: %w", err)
 			return
 		}
 
-		totalKeys := int(binary.LittleEndian.Uint32(meta[0:4]))
-		r.batchSize = int(binary.LittleEndian.Uint16(meta[4:6]))
-		flags := binary.LittleEndian.Uint16(meta[6:8])
-
-		if flags&^knownFlags != 0 {
-			r.packErr = fmt.Errorf("bitmapindex: unknown metadata flags: %04x", flags)
+		if flags&^packfile.FlagNoCompression != 0 {
+			r.packErr = fmt.Errorf("bitmapindex: unknown metadata flags: %08x", flags)
 			return
 		}
-		if totalKeys == 0 {
-			r.packErr = fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", totalKeys)
+
+		r.totalKeys = totalItems
+		r.batchSize = recordSize
+		r.compressed = flags&packfile.FlagNoCompression == 0
+
+		if r.totalKeys == 0 {
+			r.packErr = fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", r.totalKeys)
 			return
 		}
 		if r.batchSize == 0 {
@@ -124,10 +123,10 @@ func (r *Reader) waitPackfile() error {
 			r.packErr = err
 			return
 		}
-		expectedBatches := (totalKeys + r.batchSize - 1) / r.batchSize
+		expectedBatches := (r.totalKeys + r.batchSize - 1) / r.batchSize
 		if expectedBatches != rc {
 			r.packErr = fmt.Errorf("bitmapindex: metadata says %d keys / %d batchSize = %d batches, but packfile has %d records",
-				totalKeys, r.batchSize, expectedBatches, rc)
+				r.totalKeys, r.batchSize, expectedBatches, rc)
 		}
 	})
 	return r.packErr
@@ -238,20 +237,15 @@ func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 	batchIdx := int(rank) / r.batchSize
 	localIdx := int(rank) % r.batchSize
 
-	lb := getBuf()
-	defer putBuf(lb)
+	rd := record.Get()
+	defer record.Put(rd)
 
-	lb.rec, err = r.pack.ReadRecord(batchIdx, lb.rec)
-	if err != nil {
-		return nil, fmt.Errorf("bitmapindex: read batch %d for rank %d: %w", batchIdx, rank, err)
+	n := packfile.ItemsInRecord(r.totalKeys, r.batchSize, batchIdx)
+	if err := rd.ReadAndDecode(r.pack, batchIdx, n, r.compressed); err != nil {
+		return nil, fmt.Errorf("bitmapindex: decode batch %d for rank %d: %w", batchIdx, rank, err)
 	}
 
-	batch, err := parseBatch(lb.rec, batchIdx)
-	if err != nil {
-		return nil, err
-	}
-
-	return extractBitmap(batch, localIdx, hk[:], lb)
+	return lookupEntry(rd, localIdx, hk[:])
 }
 
 // LookupKeys returns bitmaps for multiple keys with parallel I/O.
@@ -316,8 +310,8 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 	}
 
 	// Sort by batch index so keys hitting the same batch are adjacent.
-	sort.Slice(found, func(i, j int) bool {
-		return found[i].batchIdx < found[j].batchIdx
+	slices.SortFunc(found, func(a, b foundKey) int {
+		return a.batchIdx - b.batchIdx
 	})
 
 	// Group into per-batch work items.
@@ -342,27 +336,24 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		batchIndices[i] = work[i].batchIdx
 	}
 
-	// Pre-allocate per-worker lookupBufs.
+	// Pre-allocate per-worker decoders.
 	numWorkers := min(len(work), r.concurrency)
-	workers := make([]*lookupBuf, numWorkers)
+	workers := make([]*record.Decoder, numWorkers)
 	for i := range workers {
-		workers[i] = getBuf()
+		workers[i] = record.Get()
 	}
 
 	err = r.pack.ReadScattered(ctx, batchIndices, r.concurrency,
 		func(workerID, inputPos int, data []byte) error {
 			bw := &work[inputPos]
-			lb := workers[workerID]
-			// Safe to alias: data is stable for the duration of this callback,
-			// and parseBatch + extractBitmap fully consume it before returning.
-			lb.rec = data
+			rd := workers[workerID]
 
-			batch, err := parseBatch(lb.rec, bw.batchIdx)
-			if err != nil {
-				return err
+			n := packfile.ItemsInRecord(r.totalKeys, r.batchSize, bw.batchIdx)
+			if err := rd.Decode(data, n, r.compressed); err != nil {
+				return fmt.Errorf("bitmapindex: decode batch %d: %w", bw.batchIdx, err)
 			}
 			for _, ki := range bw.keys {
-				bm, err := extractBitmap(batch, ki.localIdx, ki.hk[:], lb)
+				bm, err := lookupEntry(rd, ki.localIdx, ki.hk[:])
 				if err != nil {
 					if errors.Is(err, ErrKeyNotFound) {
 						continue
@@ -374,8 +365,8 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 			return nil
 		})
 
-	for _, lb := range workers {
-		putBuf(lb)
+	for _, rd := range workers {
+		record.Put(rd)
 	}
 
 	if err != nil {
@@ -404,116 +395,22 @@ func (r *Reader) Close() error {
 
 // --- Internal helpers ---
 
-// lookupBuf holds reusable buffers for batch reads and decompression.
-type lookupBuf struct {
-	rec       []byte
-	decompBuf []byte
-	dec       *zstd.Decompressor
-}
+// lookupEntry extracts and deserializes the bitmap at localIdx within
+// a decoded batch. hk is the 16-byte pre-hash; the first 4 bytes are
+// the fingerprint. Returns ErrKeyNotFound on fingerprint mismatch.
+func lookupEntry(rd *record.Decoder, localIdx int, hk []byte) (*roaring.Bitmap, error) {
+	entry := rd.Entry(localIdx)
 
-var bufPool = sync.Pool{
-	New: func() any {
-		dec := zstd.NewDecompressor()
-		lb := &lookupBuf{
-			rec: make([]byte, 0, 32*1024),
-			dec: dec,
-		}
-		runtime.SetFinalizer(lb, func(b *lookupBuf) { b.dec.Close() })
-		return lb
-	},
-}
-
-func getBuf() *lookupBuf {
-	return bufPool.Get().(*lookupBuf)
-}
-
-func putBuf(b *lookupBuf) {
-	b.rec = b.rec[:0]
-	b.decompBuf = b.decompBuf[:0]
-	bufPool.Put(b)
-}
-
-// batchRecord holds parsed offsets into a CRC-verified batch record.
-type batchRecord struct {
-	count     int
-	rec       []byte // CRC-verified, CRC stripped
-	fpBase    int
-	flagsBase int
-	sizesBase int
-	dataBase  int
-}
-
-// parseBatch verifies the CRC32C of rec and parses the batch header.
-func parseBatch(rec []byte, batchIdx int) (batchRecord, error) {
-	if len(rec) < 2+fingerprintSize+1+4+checksumSize {
-		return batchRecord{}, fmt.Errorf("bitmapindex: batch record too short at batch %d: %d bytes", batchIdx, len(rec))
-	}
-
-	storedCRC := binary.LittleEndian.Uint32(rec[len(rec)-checksumSize:])
-	computedCRC := crc32.Checksum(rec[:len(rec)-checksumSize], crc32cTable)
-	if storedCRC != computedCRC {
-		return batchRecord{}, fmt.Errorf("bitmapindex: batch CRC32C mismatch at batch %d: stored=%08x computed=%08x", batchIdx, storedCRC, computedCRC)
-	}
-	rec = rec[:len(rec)-checksumSize]
-
-	count := int(binary.LittleEndian.Uint16(rec[:2]))
-	headerSize := 2 + count*fingerprintSize + count + count*4
-	if len(rec) < headerSize {
-		return batchRecord{}, fmt.Errorf("bitmapindex: batch header truncated at batch %d", batchIdx)
-	}
-
-	return batchRecord{
-		count:     count,
-		rec:       rec,
-		fpBase:    2,
-		flagsBase: 2 + count*fingerprintSize,
-		sizesBase: 2 + count*fingerprintSize + count,
-		dataBase:  headerSize,
-	}, nil
-}
-
-// extractBitmap extracts and deserializes the bitmap at localIdx within batch.
-// hk is the 16-byte pre-hash; the first 4 bytes are the fingerprint.
-func extractBitmap(batch batchRecord, localIdx int, hk []byte, lb *lookupBuf) (*roaring.Bitmap, error) {
-	if localIdx >= batch.count {
-		return nil, fmt.Errorf("bitmapindex: local index %d >= batch count %d", localIdx, batch.count)
-	}
-
-	// Verify fingerprint.
-	fpOff := batch.fpBase + localIdx*fingerprintSize
-	if batch.rec[fpOff] != hk[0] || batch.rec[fpOff+1] != hk[1] ||
-		batch.rec[fpOff+2] != hk[2] || batch.rec[fpOff+3] != hk[3] {
+	// Verify fingerprint (first 4 bytes of entry).
+	if len(entry) < fingerprintSize ||
+		entry[0] != hk[0] || entry[1] != hk[1] ||
+		entry[2] != hk[2] || entry[3] != hk[3] {
 		return nil, ErrKeyNotFound
 	}
 
-	flags := batch.rec[batch.flagsBase+localIdx]
-	dataSize := int(binary.LittleEndian.Uint32(batch.rec[batch.sizesBase+localIdx*4:]))
-
-	// Compute data offset by summing sizes of preceding bitmaps.
-	dataOff := batch.dataBase
-	for i := range localIdx {
-		dataOff += int(binary.LittleEndian.Uint32(batch.rec[batch.sizesBase+i*4:]))
-	}
-
-	if dataOff+dataSize > len(batch.rec) {
-		return nil, fmt.Errorf("bitmapindex: bitmap data overflow at local %d in batch", localIdx)
-	}
-
-	data := batch.rec[dataOff : dataOff+dataSize]
-
-	if flags&flagCompressed != 0 {
-		decoded, err := lb.dec.Decode(lb.decompBuf[:0], data)
-		if err != nil {
-			return nil, fmt.Errorf("bitmapindex: decompress bitmap at local %d: %w", localIdx, err)
-		}
-		lb.decompBuf = decoded
-		data = decoded
-	}
-
 	bm := roaring.New()
-	if err := bm.UnmarshalBinary(data); err != nil {
+	if err := bm.UnmarshalBinary(entry[fingerprintSize:]); err != nil {
 		return nil, fmt.Errorf("bitmapindex: deserialize bitmap at local %d: %w", localIdx, err)
 	}
-
 	return bm, nil
 }

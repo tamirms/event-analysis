@@ -67,6 +67,12 @@ func (w *Writer) Append(record []byte) error {
 	return nil
 }
 
+// SetMetadata sets the opaque metadata to be written at Finish time.
+// Must be called before Finish.
+func (w *Writer) SetMetadata(meta []byte) {
+	w.opts.Metadata = meta
+}
+
 // Finish writes the index, metadata, and trailer, fsyncs, and
 // atomically renames to the final path. Returns an error if the
 // writer has already been finished or aborted. On failure, the caller
@@ -110,7 +116,7 @@ func (w *Writer) Finish() (Trailer, error) {
 	}
 
 	// CRC32C over raw index bytes.
-	binary.Write(&indexBuf, binary.LittleEndian, crc32c(indexBuf.Bytes()))
+	binary.Write(&indexBuf, binary.LittleEndian, CRC32C(indexBuf.Bytes()))
 
 	indexSize := uint32(indexBuf.Len())
 
@@ -137,7 +143,7 @@ func (w *Writer) Finish() (Trailer, error) {
 	binary.LittleEndian.PutUint32(trailer[6:], uint32(recordCount))
 	binary.LittleEndian.PutUint32(trailer[10:], indexSize)
 	binary.LittleEndian.PutUint32(trailer[14:], metadataSize)
-	binary.LittleEndian.PutUint32(trailer[18:], crc32c(trailer[0:18]))
+	binary.LittleEndian.PutUint32(trailer[18:], CRC32C(trailer[0:18]))
 	// trailer[22:32] reserved, already zero
 
 	if _, err := w.file.Write(trailer[:]); err != nil {
@@ -176,14 +182,8 @@ func (w *Writer) Finish() (Trailer, error) {
 		RecordCount:     uint32(recordCount),
 		IndexSize:       indexSize,
 		MetadataSize:    metadataSize,
-		TrailerChecksum: crc32c(trailer[0:18]),
+		TrailerChecksum: CRC32C(trailer[0:18]),
 	}, nil
-}
-
-// SetMetadata sets the opaque metadata to be written at Finish time.
-// Must be called before Finish.
-func (w *Writer) SetMetadata(meta []byte) {
-	w.opts.Metadata = meta
 }
 
 // Abort discards the in-progress packfile and removes the temp file.

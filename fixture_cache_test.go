@@ -12,7 +12,7 @@ const fixtureDir = "testdata/fixtures"
 
 // fixtureFormatVersion is bumped when the on-disk format changes (e.g., bitmapindex metadata).
 // Fixtures auto-invalidate when the version in meta.json doesn't match.
-const fixtureFormatVersion = 3
+const fixtureFormatVersion = 6
 
 type fixtureMeta struct {
 	SourceDataMtime  time.Time `json:"source_data_mtime"`

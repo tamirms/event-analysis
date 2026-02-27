@@ -164,11 +164,10 @@ func (w *Writer) Append(event []byte) error {
 
 // buildBlock assembles the current event buffer into an uncompressed block.
 func (w *Writer) buildBlock() []byte {
-	encoded := packfile.EncodeGroup(w.sizes)
-	block := make([]byte, len(w.buf)+len(encoded))
+	trailing := packfile.EncodeTrailingGroup(w.sizes)
+	block := make([]byte, len(w.buf)+len(trailing))
 	copy(block, w.buf)
-	copy(block[len(w.buf):], encoded[1:]) // min + packed
-	block[len(block)-1] = encoded[0]      // W as last byte
+	copy(block[len(w.buf):], trailing)
 	w.buf = w.buf[:0]
 	w.sizes = w.sizes[:0]
 	return block
@@ -178,7 +177,10 @@ func (w *Writer) flush() error {
 	block := w.buildBlock()
 
 	if w.concurrency <= 1 {
-		if !w.noCompress {
+		if w.noCompress {
+			crc := packfile.CRC32C(block)
+			block = binary.LittleEndian.AppendUint32(block, crc)
+		} else {
 			if w.compressor == nil {
 				w.compressor = zstd.NewCompressor()
 			}
@@ -230,17 +232,11 @@ func (w *Writer) Finish() error {
 		return w.err
 	}
 
-	// Encode metadata: [4B eventCount LE][4B blockSize LE][4B flags LE]
-	// flags bit 0: noCompression
-	var meta [12]byte
-	binary.LittleEndian.PutUint32(meta[0:], uint32(w.total))
-	binary.LittleEndian.PutUint32(meta[4:], uint32(w.blockN))
 	var flags uint32
 	if w.noCompress {
-		flags |= 1
+		flags |= packfile.FlagNoCompression
 	}
-	binary.LittleEndian.PutUint32(meta[8:], flags)
-	w.pw.SetMetadata(meta[:])
+	w.pw.SetMetadata(packfile.EncodeMetadata(w.total, w.blockN, flags))
 
 	if w.compressor != nil {
 		w.compressor.Close()

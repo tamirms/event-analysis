@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -162,8 +161,8 @@ func TestNonMemberLookup(t *testing.T) {
 	}
 }
 
-// TestLargeBitmapRoundTrip exercises the zstd compression path by creating
-// a bitmap with enough ordinals that its serialized size exceeds 256 bytes.
+// TestLargeBitmapRoundTrip exercises round-trip with a large bitmap whose
+// serialized size exceeds 256 bytes.
 func TestLargeBitmapRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	mphfPath := filepath.Join(dir, "index.mphf")
@@ -172,7 +171,7 @@ func TestLargeBitmapRoundTrip(t *testing.T) {
 	w := NewWriter(mphfPath, dataPath, WriterOptions{})
 	contractA := bytes.Repeat([]byte{0x01}, 32)
 	contractB := bytes.Repeat([]byte{0x02}, 32)
-	// Add many ordinals to trigger compression (>= 256 bytes serialized).
+	// Add many ordinals so the bitmap serializes to a substantial size.
 	for i := range uint32(5000) {
 		w.Add(makeTestEvent(contractA), i)
 	}
@@ -360,9 +359,9 @@ func TestMultipleDiscriminatorsSameKey(t *testing.T) {
 	}
 }
 
-// TestCRC32CCorruptionDetected verifies that corrupting a byte in a packfile
-// record causes Lookup to return a CRC mismatch error.
-func TestCRC32CCorruptionDetected(t *testing.T) {
+// TestCorruptionDetected verifies that corrupting a byte in a packfile
+// record causes Lookup to return an integrity error (CRC32C or zstd checksum).
+func TestCorruptionDetected(t *testing.T) {
 	dir := t.TempDir()
 	mphfPath := filepath.Join(dir, "index.mphf")
 	dataPath := filepath.Join(dir, "index.bitmaps")
@@ -400,17 +399,17 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 	}
 	r.Close()
 
-	// Corrupt a byte in the record's data (after fingerprint, before CRC).
+	// Corrupt a byte in the compressed record data.
 	fileData, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	recIdx := bytes.Index(fileData, rec[:fingerprintSize+1])
+	recIdx := bytes.Index(fileData, rec[:5])
 	if recIdx < 0 {
 		t.Fatal("could not find record in packfile")
 	}
-	fileData[recIdx+fingerprintSize] ^= 0xFF
+	fileData[recIdx+4] ^= 0xFF
 
 	corruptedDataPath := filepath.Join(dir, "corrupted.bitmaps")
 	if err := os.WriteFile(corruptedDataPath, fileData, 0644); err != nil {
@@ -425,43 +424,6 @@ func TestCRC32CCorruptionDetected(t *testing.T) {
 		t.Fatal("expected error from corrupted record, got nil")
 	}
 	t.Logf("corruption detected: %v", err)
-}
-
-// TestCRC32CPackfileIntegrity verifies CRC32C is correctly written and verified
-// by manually checking a record's CRC32C.
-func TestCRC32CPackfileIntegrity(t *testing.T) {
-	dir := t.TempDir()
-	mphfPath := filepath.Join(dir, "index.mphf")
-	dataPath := filepath.Join(dir, "index.bitmaps")
-
-	w := NewWriter(mphfPath, dataPath, WriterOptions{})
-	cid := bytes.Repeat([]byte{0x01}, 32)
-	w.Add(makeTestEvent(cid), 0)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := w.Finish(ctx); err != nil {
-		t.Fatalf("Finish: %v", err)
-	}
-
-	pack := packfile.Open(dataPath)
-	defer pack.Close()
-
-	rec, err := pack.ReadRecord(0, nil)
-	if err != nil {
-		t.Fatalf("ReadRecord: %v", err)
-	}
-
-	if len(rec) < fingerprintSize+1+checksumSize {
-		t.Fatalf("record too short: %d bytes", len(rec))
-	}
-
-	storedCRC := binary.LittleEndian.Uint32(rec[len(rec)-checksumSize:])
-	computedCRC := crc32.Checksum(rec[:len(rec)-checksumSize], crc32cTable)
-	if storedCRC != computedCRC {
-		t.Errorf("CRC32C mismatch: stored=%08x computed=%08x", storedCRC, computedCRC)
-	}
 }
 
 // --- LookupKeys tests ---
@@ -774,6 +736,34 @@ func TestCustomBatchSize(t *testing.T) {
 	}
 }
 
+func TestCompressedRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	const numKeys = 200
+	contracts := make([][]byte, numKeys)
+	for i := range contracts {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		contracts[i] = raw
+	}
+
+	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{Compress: true})
+
+	r := Open(mphfPath, dataPath)
+	defer r.Close()
+
+	for i, cid := range contracts {
+		bm, err := r.Lookup(FieldContractID, cid)
+		if err != nil {
+			t.Fatalf("Lookup key %d: %v", i, err)
+		}
+		arr := bm.ToArray()
+		if len(arr) != 1 || arr[0] != uint32(i) {
+			t.Errorf("key %d: got %v, want [%d]", i, arr, i)
+		}
+	}
+}
+
 func TestMetadataValidation(t *testing.T) {
 	dir := t.TempDir()
 
@@ -819,8 +809,14 @@ func TestMetadataFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Set unknown flags.
-	binary.LittleEndian.PutUint16(meta[6:8], 0xFFFF)
+	// Verify FlagNoCompression is accepted (it's the default now).
+	flags := binary.LittleEndian.Uint32(meta[8:12])
+	if flags != packfile.FlagNoCompression {
+		t.Fatalf("expected FlagNoCompression in metadata, got %08x", flags)
+	}
+
+	// Set an unknown flag (bit 1) — must be rejected.
+	binary.LittleEndian.PutUint32(meta[8:12], 0x00000002)
 
 	tamperedPath := filepath.Join(dir, "tampered.bitmaps")
 	pw, err := packfile.Create(tamperedPath, packfile.WriterOptions{})

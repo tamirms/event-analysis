@@ -594,7 +594,7 @@ func TestFORRoundTrip(t *testing.T) {
 			copy(padded, encoded)
 
 			var consumed int
-			dst, consumed = DecodeGroup(padded, len(tt.values), dst)
+			dst, consumed = decodeGroup(padded, len(tt.values), dst)
 			if consumed != len(encoded) {
 				t.Fatalf("consumed %d bytes, want %d", consumed, len(encoded))
 			}
@@ -920,8 +920,19 @@ func TestReadScatteredWorkerIDs(t *testing.T) {
 	seen := make([]bool, concurrency)
 	var mu sync.Mutex
 
+	// Barrier ensures all workers start before any can finish.
+	// Without this, one worker steals all items via atomic.Add
+	// before the others are scheduled.
+	var barrier sync.WaitGroup
+	barrier.Add(concurrency)
+	var barrierOnce [concurrency]sync.Once
+
 	err := r.ReadScattered(context.Background(), indices, concurrency,
 		func(workerID, inputPos int, data []byte) error {
+			barrierOnce[workerID].Do(func() {
+				barrier.Done()
+				barrier.Wait()
+			})
 			if workerID < 0 || workerID >= concurrency {
 				return fmt.Errorf("workerID %d out of range [0, %d)", workerID, concurrency)
 			}
@@ -934,7 +945,7 @@ func TestReadScatteredWorkerIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// With 20 work items and 4 workers, multiple workers must have been used.
+	// With the barrier ensuring all 4 workers start, all must be used.
 	used := 0
 	for _, s := range seen {
 		if s {
@@ -1072,6 +1083,63 @@ func TestReadScatteredZeroConcurrency(t *testing.T) {
 		if !bytes.Equal(results[i], records[idx]) {
 			t.Fatalf("index %d: data mismatch", idx)
 		}
+	}
+}
+
+func TestItemsInRecord(t *testing.T) {
+	tests := []struct {
+		name       string
+		total      int
+		recordSize int
+		recordIdx  int
+		want       int
+	}{
+		{"full block", 300, 128, 0, 128},
+		{"full block second", 300, 128, 1, 128},
+		{"partial last block", 300, 128, 2, 44},
+		{"exact multiple", 256, 128, 1, 128},
+		{"single record", 50, 128, 0, 50},
+		{"totalItems zero", 0, 128, 0, 0},
+		{"small recordSize", 10, 3, 0, 3},
+		{"small recordSize last", 10, 3, 3, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ItemsInRecord(tt.total, tt.recordSize, tt.recordIdx)
+			if got != tt.want {
+				t.Errorf("ItemsInRecord(%d, %d, %d) = %d, want %d",
+					tt.total, tt.recordSize, tt.recordIdx, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeDecodeMetadata(t *testing.T) {
+	tests := []struct {
+		totalItems int
+		recordSize int
+		flags      uint32
+	}{
+		{1000, 128, 0},
+		{0, 64, FlagNoCompression},
+		{8700000, 256, 0},
+		{1, 1, 0xFFFFFFFF},
+	}
+	for _, tt := range tests {
+		total, recSize, flags, err := DecodeMetadata(EncodeMetadata(tt.totalItems, tt.recordSize, tt.flags))
+		if err != nil {
+			t.Fatalf("DecodeMetadata: %v", err)
+		}
+		if total != tt.totalItems || recSize != tt.recordSize || flags != tt.flags {
+			t.Errorf("round-trip mismatch: got (%d, %d, %d), want (%d, %d, %d)",
+				total, recSize, flags, tt.totalItems, tt.recordSize, tt.flags)
+		}
+	}
+
+	// Too-short metadata.
+	_, _, _, err := DecodeMetadata(make([]byte, 11))
+	if err == nil {
+		t.Error("expected error for short metadata")
 	}
 }
 

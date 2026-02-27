@@ -133,7 +133,7 @@ func doOpen(path string) openResult {
 	metadataSize := int(binary.LittleEndian.Uint32(tb[14:]))
 	storedTrailerCRC := binary.LittleEndian.Uint32(tb[18:])
 
-	if storedTrailerCRC != crc32c(tb[0:18]) {
+	if storedTrailerCRC != CRC32C(tb[0:18]) {
 		return openResult{err: ErrChecksum}
 	}
 
@@ -214,7 +214,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	// Verify CRC32C over raw index bytes (all groups, excluding trailing 4-byte CRC).
 	payloadLen := indexSize - 4
 	storedCRC := binary.LittleEndian.Uint32(buf[payloadLen:])
-	if storedCRC != crc32c(buf[:payloadLen]) {
+	if storedCRC != CRC32C(buf[:payloadLen]) {
 		return nil, ErrChecksum
 	}
 
@@ -237,7 +237,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 		}
 
 		var size int
-		values, size = DecodeGroup(buf[pos:], limit, values)
+		values, size = decodeGroup(buf[pos:], limit, values)
 		for _, v := range values {
 			offsets[idx] = offset
 			idx++

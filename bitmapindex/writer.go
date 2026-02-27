@@ -6,14 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"maps"
+	"math"
 	"os"
-	"sort"
-	"sync"
+	"slices"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
-	"golang.org/x/exp/maps"
 
 	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/packfile"
@@ -22,26 +21,27 @@ import (
 
 const (
 	defaultBatchSize = 128
-	// maxBatchSize is the largest batch size the format supports.
-	// The batch record encodes the entry count as a uint16.
+	// maxBatchSize caps the batch size — larger batches make no practical
+	// sense for bitmaps. The metadata format supports u32 but we keep
+	// the cap at 65535.
 	maxBatchSize = 1<<16 - 1
 )
 
 // WriterOptions configures Writer behavior.
 type WriterOptions struct {
-	BatchSize    int // bitmaps per packfile record; 0 → 128
-	CapacityHint int // pre-sizes internal map; 0 → no hint
-	Concurrency  int // parallel compression goroutines; 0 or 1 → serial
+	BatchSize    int  // bitmaps per packfile record; 0 → 128
+	CapacityHint int  // pre-sizes internal map; 0 → no hint
+	Compress     bool // zstd-compress batches; default false (CRC32C integrity only)
 }
 
 // Writer accumulates (ordinal, key) tuples and builds an MPHF+packfile index.
 // Not safe for concurrent use — all calls to Add must be serialized.
 type Writer struct {
-	mphfPath    string
-	dataPath    string
-	bitmaps     map[[16]byte]*roaring.Bitmap
-	batchSize   int
-	concurrency int
+	mphfPath  string
+	dataPath  string
+	bitmaps   map[[16]byte]*roaring.Bitmap
+	batchSize int
+	compress  bool
 }
 
 // NewWriter creates a new bitmap index writer. mphfPath and dataPath are the
@@ -55,13 +55,12 @@ func NewWriter(mphfPath, dataPath string, opts WriterOptions) *Writer {
 		bs = maxBatchSize
 	}
 	hint := max(opts.CapacityHint, 0)
-	conc := max(opts.Concurrency, 1)
 	return &Writer{
-		mphfPath:    mphfPath,
-		dataPath:    dataPath,
-		bitmaps:     make(map[[16]byte]*roaring.Bitmap, hint),
-		batchSize:   bs,
-		concurrency: conc,
+		mphfPath:  mphfPath,
+		dataPath:  dataPath,
+		bitmaps:   make(map[[16]byte]*roaring.Bitmap, hint),
+		batchSize: bs,
+		compress:  opts.Compress,
 	}
 }
 
@@ -97,12 +96,13 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	if totalKeys == 0 {
 		return fmt.Errorf("bitmapindex: no keys to index")
 	}
+	if totalKeys > math.MaxUint32 {
+		return fmt.Errorf("bitmapindex: key count %d exceeds uint32 max", totalKeys)
+	}
 
 	// Collect and sort MPHF keys.
-	sortedKeys := maps.Keys(w.bitmaps)
-	sort.Slice(sortedKeys, func(i, j int) bool {
-		return bytes.Compare(sortedKeys[i][:], sortedKeys[j][:]) < 0
-	})
+	sortedKeys := slices.SortedFunc(maps.Keys(w.bitmaps),
+		func(a, b [16]byte) int { return bytes.Compare(a[:], b[:]) })
 
 	// Build MPHF.
 	builder, err := streamhash.NewBuilder(ctx, mphfPath, uint64(totalKeys),
@@ -158,88 +158,24 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	// Free the original map — bitmaps are now owned by ranked[].
 	w.bitmaps = nil
 
-	// Per-bitmap preparation (RunOptimize + serialize + compress).
+	// Per-bitmap preparation (RunOptimize + serialize).
 	type preparedBitmap struct {
 		fingerprint [4]byte
-		flags       byte
-		data        []byte // compressed or raw bitmap payload
+		data        []byte // raw serialized bitmap (uncompressed)
 	}
 	prepared := make([]preparedBitmap, totalKeys)
 
-	prepareBitmap := func(i int, enc *zstd.Compressor) error {
+	for i := range totalKeys {
 		entry := &ranked[i]
 		entry.bitmap.RunOptimize()
 		raw, err := entry.bitmap.ToBytes()
 		if err != nil {
-			return err
+			return fmt.Errorf("bitmapindex: serialize bitmap %d: %w", i, err)
 		}
 		entry.bitmap = nil // free bitmap memory
-
-		pb := preparedBitmap{fingerprint: entry.fingerprint}
-		if len(raw) >= 256 {
-			compressed, encErr := enc.Encode(raw)
-			if encErr != nil {
-				return encErr
-			}
-			if len(compressed) < len(raw) {
-				pb.flags = flagCompressed
-				pb.data = make([]byte, len(compressed))
-				copy(pb.data, compressed)
-				prepared[i] = pb
-				return nil
-			}
-		}
-		pb.data = raw
-		prepared[i] = pb
-		return nil
-	}
-
-	numWorkers := min(w.concurrency, totalKeys)
-
-	if numWorkers <= 1 {
-		// Serial path.
-		enc := zstd.NewCompressor(zstd.WithoutChecksum())
-		defer enc.Close()
-		for i := range totalKeys {
-			if err := prepareBitmap(i, enc); err != nil {
-				return fmt.Errorf("bitmapindex: record preparation: %w", err)
-			}
-		}
-	} else {
-		// Parallel path.
-		ch := make(chan int, totalKeys)
-		for i := range totalKeys {
-			ch <- i
-		}
-		close(ch)
-
-		prepCtx, prepCancel := context.WithCancel(ctx)
-		defer prepCancel()
-
-		var wg sync.WaitGroup
-		var errOnce sync.Once
-		var firstErr error
-		for range numWorkers {
-			wg.Go(func() {
-				enc := zstd.NewCompressor(zstd.WithoutChecksum())
-				defer enc.Close()
-
-				for i := range ch {
-					if prepCtx.Err() != nil {
-						return
-					}
-					if err := prepareBitmap(i, enc); err != nil {
-						errOnce.Do(func() { firstErr = err })
-						prepCancel()
-						return
-					}
-				}
-			})
-		}
-		wg.Wait()
-
-		if firstErr != nil {
-			return fmt.Errorf("bitmapindex: record preparation: %w", firstErr)
+		prepared[i] = preparedBitmap{
+			fingerprint: entry.fingerprint,
+			data:        raw,
 		}
 	}
 
@@ -252,67 +188,73 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		return fmt.Errorf("bitmapindex: create packfile: %w", err)
 	}
 
-	// Encode metadata: [totalKeys:u32][batchSize:u16][flags:u16]
-	var meta [metadataSize]byte
-	binary.LittleEndian.PutUint32(meta[0:4], uint32(totalKeys))
-	binary.LittleEndian.PutUint16(meta[4:6], uint16(batchSize))
-	binary.LittleEndian.PutUint16(meta[6:8], 0) // flags: reserved
-	pw.SetMetadata(meta[:])
+	var flags uint32
+	if !w.compress {
+		flags |= packfile.FlagNoCompression
+	}
+	pw.SetMetadata(packfile.EncodeMetadata(totalKeys, batchSize, flags))
 
-	var batchBuf []byte
+	var compressor *zstd.Compressor
+	if w.compress {
+		compressor = zstd.NewCompressor()
+		defer compressor.Close()
+	}
+
+	// Estimate initial capacity from the first batch.
+	firstEnd := min(batchSize, totalKeys)
+	initCap := 0
+	for i := range firstEnd {
+		initCap += fingerprintSize + len(prepared[i].data)
+	}
+	batchBuf := make([]byte, 0, initCap+32)
+	sizes := make([]uint32, 0, batchSize)
 	for b := range numBatches {
 		start := b * batchSize
 		end := min(start+batchSize, totalKeys)
-		count := end - start
 
-		// Estimate capacity: header + data.
-		headerSize := 2 + count*fingerprintSize + count + count*4
+		// Estimate capacity: colocated entries + trailing FOR.
 		dataSize := 0
 		for i := start; i < end; i++ {
-			dataSize += len(prepared[i].data)
+			dataSize += fingerprintSize + len(prepared[i].data)
 		}
 		batchBuf = batchBuf[:0]
-		if cap(batchBuf) < headerSize+dataSize+checksumSize {
-			batchBuf = make([]byte, 0, headerSize+dataSize+checksumSize)
+		if cap(batchBuf) < dataSize+32 {
+			batchBuf = make([]byte, 0, dataSize+32)
 		}
+		sizes = sizes[:0]
 
-		// Count.
-		batchBuf = binary.LittleEndian.AppendUint16(batchBuf, uint16(count))
-
-		// Fingerprints.
+		// Colocated entries: [fp0 bm0][fp1 bm1]...
 		for i := start; i < end; i++ {
+			entrySize := fingerprintSize + len(prepared[i].data)
 			batchBuf = append(batchBuf, prepared[i].fingerprint[:]...)
-		}
-
-		// Flags.
-		for i := start; i < end; i++ {
-			batchBuf = append(batchBuf, prepared[i].flags)
-		}
-
-		// Sizes.
-		for i := start; i < end; i++ {
-			batchBuf = binary.LittleEndian.AppendUint32(batchBuf, uint32(len(prepared[i].data)))
-		}
-
-		// Data.
-		for i := start; i < end; i++ {
 			batchBuf = append(batchBuf, prepared[i].data...)
+			sizes = append(sizes, uint32(entrySize))
+
+			prepared[i].data = nil // free as we go
 		}
 
-		// CRC32C over the entire batch (excluding CRC itself).
-		crc := crc32.Checksum(batchBuf, crc32cTable)
-		batchBuf = binary.LittleEndian.AppendUint32(batchBuf, crc)
+		// Append trailing FOR-encoded sizes.
+		batchBuf = append(batchBuf, packfile.EncodeTrailingGroup(sizes)...)
+
+		if w.compress {
+			compressed, err := compressor.Encode(batchBuf)
+			if err != nil {
+				return errors.Join(
+					fmt.Errorf("bitmapindex: compress batch %d: %w", b, err),
+					pw.Abort(),
+				)
+			}
+			batchBuf = append(batchBuf[:0], compressed...)
+		} else {
+			crc := packfile.CRC32C(batchBuf)
+			batchBuf = binary.LittleEndian.AppendUint32(batchBuf, crc)
+		}
 
 		if err := pw.Append(batchBuf); err != nil {
 			return errors.Join(
 				fmt.Errorf("bitmapindex: append batch %d: %w", b, err),
 				pw.Abort(),
 			)
-		}
-
-		// Free prepared data for this batch.
-		for i := start; i < end; i++ {
-			prepared[i].data = nil
 		}
 	}
 
