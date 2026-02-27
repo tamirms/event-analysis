@@ -4,12 +4,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"sync"
 
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/packfile"
+	"github.com/tamir/events-analysis/record"
 	"github.com/tamir/events-analysis/zstd"
 )
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const DefaultBlockSize = 128
 
@@ -17,7 +22,7 @@ const DefaultBlockSize = 128
 type WriterOptions struct {
 	BlockSize     int  // events per block; 0 defaults to DefaultBlockSize (128)
 	Concurrency   int  // compression goroutines; 0 or 1 = serial
-	NoCompression bool // skip zstd compression and CRC (for benchmarking raw I/O)
+	NoCompression bool // skip zstd; use CRC32C integrity instead (for benchmarking raw I/O)
 }
 
 type blockResult struct {
@@ -164,7 +169,7 @@ func (w *Writer) Append(event []byte) error {
 
 // buildBlock assembles the current event buffer into an uncompressed block.
 func (w *Writer) buildBlock() []byte {
-	trailing := packfile.EncodeTrailingGroup(w.sizes)
+	trailing := intpack.EncodeTrailingGroup(w.sizes)
 	block := make([]byte, len(w.buf)+len(trailing))
 	copy(block, w.buf)
 	copy(block[len(w.buf):], trailing)
@@ -178,7 +183,7 @@ func (w *Writer) flush() error {
 
 	if w.concurrency <= 1 {
 		if w.noCompress {
-			crc := packfile.CRC32C(block)
+			crc := crc32.Checksum(block, crc32cTable)
 			block = binary.LittleEndian.AppendUint32(block, crc)
 		} else {
 			if w.compressor == nil {
@@ -234,9 +239,9 @@ func (w *Writer) Finish() error {
 
 	var flags uint32
 	if w.noCompress {
-		flags |= packfile.FlagNoCompression
+		flags |= record.FlagNoCompression
 	}
-	w.pw.SetMetadata(packfile.EncodeMetadata(w.total, w.blockN, flags))
+	w.pw.SetMetadata(record.EncodeMetadata(w.total, w.blockN, flags))
 
 	if w.compressor != nil {
 		w.compressor.Close()
@@ -245,8 +250,8 @@ func (w *Writer) Finish() error {
 
 	_, err := w.pw.Finish()
 	if err != nil {
-		w.err = err
-		return err
+		w.err = errors.Join(err, w.pw.Abort())
+		return w.err
 	}
 	w.closed = true
 	return nil

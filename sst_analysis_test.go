@@ -12,6 +12,7 @@ import (
 
 	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/packfile"
 )
 
@@ -103,7 +104,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 			for j := start; j < end; j++ {
 				sizes[j-start] = uint32(len(allEvents[j]))
 			}
-			encoded := packfile.EncodeGroup(sizes)
+			encoded := intpack.EncodeGroup(sizes)
 			totalFOR += int64(len(encoded))
 		}
 

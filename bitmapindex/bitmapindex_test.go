@@ -13,6 +13,7 @@ import (
 
 	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/packfile"
+	"github.com/tamir/events-analysis/record"
 )
 
 // makeTestEvent builds a minimal Event with the given contractID and topics.
@@ -811,7 +812,7 @@ func TestMetadataFlags(t *testing.T) {
 
 	// Verify FlagNoCompression is accepted (it's the default now).
 	flags := binary.LittleEndian.Uint32(meta[8:12])
-	if flags != packfile.FlagNoCompression {
+	if flags != record.FlagNoCompression {
 		t.Fatalf("expected FlagNoCompression in metadata, got %08x", flags)
 	}
 

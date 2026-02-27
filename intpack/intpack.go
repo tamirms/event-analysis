@@ -1,10 +1,22 @@
-package packfile
+// Package intpack implements FOR (Frame-of-Reference) integer encoding
+// for groups of uint32 values. Values are encoded as bit-packed residuals
+// relative to the group minimum, requiring only ceil(log2(max-min)) bits
+// per value.
+//
+// Two formats are provided:
+//   - Standard: [1B width][4B min LE][packed residuals] — width-first for streaming decode.
+//   - Trailing: [4B min LE][packed residuals][1B width] — width-last for appending after
+//     variable-length data (used by record-level size indexes).
+package intpack
 
 import (
 	"encoding/binary"
 	"fmt"
 	"math/bits"
 )
+
+// GroupSize is the standard number of values per FOR group used by packfile indexes.
+const GroupSize = 128
 
 // EncodeGroup FOR-encodes values into one group: [1B W][4B min LE][packed residuals].
 // W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
@@ -21,20 +33,29 @@ func EncodeGroup(values []uint32) []byte {
 	return buf[:5+packSize]
 }
 
-// decodeGroup FOR-decodes one group of n values from data into dst.
-// Returns values (possibly reallocated if dst is too small) and bytes consumed.
-// Panics if n <= 0. data must have 7 bytes of overshoot past the encoded
+// DecodeGroup FOR-decodes one group of n values from data into dst.
+// Returns values (possibly reallocated if dst is too small), bytes consumed,
+// and any error. data must have 7 bytes of overshoot past the encoded
 // payload for safe 8-byte reads.
-func decodeGroup(data []byte, n int, dst []uint32) (values []uint32, size int) {
+func DecodeGroup(data []byte, n int, dst []uint32) (values []uint32, size int, err error) {
+	if n <= 0 {
+		return dst, 0, fmt.Errorf("intpack: DecodeGroup n must be > 0, got %d", n)
+	}
+	if len(data) < 5 {
+		return dst, 0, fmt.Errorf("intpack: DecodeGroup data too short (%d bytes, need >= 5)", len(data))
+	}
 	dst = ensureCap(dst, n)
 	w := uint64(data[0])
 	if w > 32 {
-		panic(fmt.Sprintf("packfile: invalid FOR width %d (max 32)", w))
+		return dst, 0, fmt.Errorf("intpack: invalid FOR width %d (max 32)", w)
 	}
 	groupMin := binary.LittleEndian.Uint32(data[1:])
 	packSize := (int(w)*n + 7) / 8
+	if len(data) < 5+packSize {
+		return dst, 0, fmt.Errorf("intpack: DecodeGroup data too short for payload (%d bytes, need >= %d)", len(data), 5+packSize)
+	}
 	unpackResiduals(data[5:], n, w, groupMin, dst)
-	return dst, 5 + packSize
+	return dst, 5 + packSize, nil
 }
 
 // EncodeTrailingGroup FOR-encodes values into trailing format:
@@ -59,19 +80,22 @@ func EncodeTrailingGroup(values []uint32) []byte {
 // Returns decoded sizes (possibly reallocated). Validates that sum(sizes)
 // equals the data length preceding the trailing group.
 func DecodeTrailingGroup(data []byte, n int, sizes []uint32) ([]uint32, error) {
+	if n <= 0 {
+		return sizes, fmt.Errorf("intpack: DecodeTrailingGroup n must be > 0, got %d", n)
+	}
 	if len(data) < 6 { // minimum: 1 data byte + 4B min + 1B W
-		return sizes, fmt.Errorf("packfile: data too small for trailing FOR group (%d bytes)", len(data))
+		return sizes, fmt.Errorf("intpack: data too small for trailing FOR group (%d bytes)", len(data))
 	}
 
 	w := uint64(data[len(data)-1]) // W is the last byte
 	if w > 32 {
-		return sizes, fmt.Errorf("packfile: invalid FOR width %d in trailing group (max 32)", w)
+		return sizes, fmt.Errorf("intpack: invalid FOR width %d in trailing group (max 32)", w)
 	}
 	packSize := (int(w)*n + 7) / 8
 	indexSize := 4 + packSize + 1 // min(4) + packed + W(1)
 
 	if indexSize > len(data) {
-		return sizes, fmt.Errorf("packfile: trailing FOR index size %d exceeds data size %d", indexSize, len(data))
+		return sizes, fmt.Errorf("intpack: trailing FOR index size %d exceeds data size %d", indexSize, len(data))
 	}
 
 	dataEnd := len(data) - indexSize
@@ -87,7 +111,7 @@ func DecodeTrailingGroup(data []byte, n int, sizes []uint32) ([]uint32, error) {
 		sum += int(s)
 	}
 	if sum != dataEnd {
-		return sizes, fmt.Errorf("packfile: trailing FOR size sum %d != data end %d", sum, dataEnd)
+		return sizes, fmt.Errorf("intpack: trailing FOR size sum %d != data end %d", sum, dataEnd)
 	}
 
 	return sizes, nil
@@ -138,7 +162,9 @@ func unpackResiduals(packed []byte, n int, w uint64, groupMin uint32, values []u
 		return
 	}
 	mask := uint64((1 << w) - 1)
-	safeLimit := len(packed) - 7 // bytePos < safeLimit → 8-byte read is in bounds
+	// When len(packed) < 7, safeLimit is negative — all reads use the
+	// byte-by-byte fallback path since int(bytePos) is always >= 0.
+	safeLimit := len(packed) - 7
 	for j := range n {
 		bitPos := uint64(j) * w
 		bytePos := bitPos / 8

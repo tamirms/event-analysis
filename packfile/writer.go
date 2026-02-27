@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/tamir/events-analysis/intpack"
 )
 
 // Writer creates a new packfile. Records must be appended in order.
@@ -95,9 +97,9 @@ func (w *Writer) Finish() (Trailer, error) {
 	}
 
 	var deltas []uint32
-	for g := 0; g*groupSize < recordCount; g++ {
-		base := g * groupSize
-		end := min(base+groupSize, recordCount)
+	for g := 0; g*intpack.GroupSize < recordCount; g++ {
+		base := g * intpack.GroupSize
+		end := min(base+intpack.GroupSize, recordCount)
 
 		deltas = deltas[:0]
 		if cap(deltas) < end-base {
@@ -112,7 +114,7 @@ func (w *Writer) Finish() (Trailer, error) {
 			deltas = append(deltas, uint32(d))
 		}
 
-		indexBuf.Write(EncodeGroup(deltas))
+		indexBuf.Write(intpack.EncodeGroup(deltas))
 	}
 
 	// CRC32C over raw index bytes.

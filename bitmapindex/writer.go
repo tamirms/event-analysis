@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"maps"
 	"math"
 	"os"
@@ -15,9 +16,13 @@ import (
 	"github.com/tamirms/streamhash"
 
 	"github.com/tamir/events-analysis/event"
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/packfile"
+	"github.com/tamir/events-analysis/record"
 	"github.com/tamir/events-analysis/zstd"
 )
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
 	defaultBatchSize = 128
@@ -190,9 +195,9 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 
 	var flags uint32
 	if !w.compress {
-		flags |= packfile.FlagNoCompression
+		flags |= record.FlagNoCompression
 	}
-	pw.SetMetadata(packfile.EncodeMetadata(totalKeys, batchSize, flags))
+	pw.SetMetadata(record.EncodeMetadata(totalKeys, batchSize, flags))
 
 	var compressor *zstd.Compressor
 	if w.compress {
@@ -234,7 +239,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		}
 
 		// Append trailing FOR-encoded sizes.
-		batchBuf = append(batchBuf, packfile.EncodeTrailingGroup(sizes)...)
+		batchBuf = append(batchBuf, intpack.EncodeTrailingGroup(sizes)...)
 
 		if w.compress {
 			compressed, err := compressor.Encode(batchBuf)
@@ -246,7 +251,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 			}
 			batchBuf = append(batchBuf[:0], compressed...)
 		} else {
-			crc := packfile.CRC32C(batchBuf)
+			crc := crc32.Checksum(batchBuf, crc32cTable)
 			batchBuf = binary.LittleEndian.AppendUint32(batchBuf, crc)
 		}
 
@@ -259,7 +264,10 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	}
 
 	if _, err := pw.Finish(); err != nil {
-		return fmt.Errorf("bitmapindex: finish packfile: %w", err)
+		return errors.Join(
+			fmt.Errorf("bitmapindex: finish packfile: %w", err),
+			pw.Abort(),
+		)
 	}
 
 	return nil

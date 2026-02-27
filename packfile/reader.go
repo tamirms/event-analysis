@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tamir/events-analysis/intpack"
 )
 
 const (
@@ -206,7 +208,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
 	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
 	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
-	maxRecords := maxGroups * groupSize
+	maxRecords := maxGroups * intpack.GroupSize
 	if recordCount > maxRecords {
 		return nil, fmt.Errorf("%w: recordCount %d implausible for indexSize %d", ErrCorrupt, recordCount, indexSize)
 	}
@@ -223,21 +225,25 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	pos := 0
 	offset := int64(0)
 
-	groupCount := (recordCount + groupSize - 1) / groupSize
+	groupCount := (recordCount + intpack.GroupSize - 1) / intpack.GroupSize
 
 	var values []uint32
 	for g := range groupCount {
-		limit := groupSize
-		if g == groupCount-1 && recordCount%groupSize != 0 {
-			limit = recordCount % groupSize
+		limit := intpack.GroupSize
+		if g == groupCount-1 && recordCount%intpack.GroupSize != 0 {
+			limit = recordCount % intpack.GroupSize
 		}
 
-		if pos > payloadLen {
-			return nil, fmt.Errorf("%w: index decode overran payload at group %d (pos %d > %d)", ErrCorrupt, g, pos, payloadLen)
+		if pos >= payloadLen {
+			return nil, fmt.Errorf("%w: index decode overran payload at group %d (pos %d >= %d)", ErrCorrupt, g, pos, payloadLen)
 		}
 
 		var size int
-		values, size = decodeGroup(buf[pos:], limit, values)
+		var err error
+		values, size, err = intpack.DecodeGroup(buf[pos:], limit, values)
+		if err != nil {
+			return nil, fmt.Errorf("%w: index group %d: %w", ErrCorrupt, g, err)
+		}
 		for _, v := range values {
 			offsets[idx] = offset
 			idx++

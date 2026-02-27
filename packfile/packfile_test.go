@@ -567,49 +567,6 @@ func TestSpeculativeReadFallback(t *testing.T) {
 	}
 }
 
-func TestFORRoundTrip(t *testing.T) {
-	tests := []struct {
-		name   string
-		values []uint32
-	}{
-		{"uniform", []uint32{100, 100, 100, 100}},
-		{"ascending", []uint32{10, 20, 30, 40, 50}},
-		{"single", []uint32{42}},
-		{"wide_range", []uint32{0, 1, 1000000}},
-		{"max_group", func() []uint32 {
-			v := make([]uint32, 128)
-			for i := range v {
-				v[i] = uint32(i * 7)
-			}
-			return v
-		}()},
-	}
-
-	var dst []uint32
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			encoded := EncodeGroup(tt.values)
-			// Pad for safe 8-byte overshoot reads.
-			padded := make([]byte, len(encoded)+7)
-			copy(padded, encoded)
-
-			var consumed int
-			dst, consumed = decodeGroup(padded, len(tt.values), dst)
-			if consumed != len(encoded) {
-				t.Fatalf("consumed %d bytes, want %d", consumed, len(encoded))
-			}
-			if len(dst) != len(tt.values) {
-				t.Fatalf("decoded %d values, want %d", len(dst), len(tt.values))
-			}
-			for i, v := range dst {
-				if v != tt.values[i] {
-					t.Fatalf("value[%d] = %d, want %d", i, v, tt.values[i])
-				}
-			}
-		})
-	}
-}
-
 func TestSpeculativeReadFallbackNoMetadata(t *testing.T) {
 	// Same as above but with no metadata — exercises the fallback path
 	// where the index overshoot bytes are zeros (from make) rather than
@@ -1083,63 +1040,6 @@ func TestReadScatteredZeroConcurrency(t *testing.T) {
 		if !bytes.Equal(results[i], records[idx]) {
 			t.Fatalf("index %d: data mismatch", idx)
 		}
-	}
-}
-
-func TestItemsInRecord(t *testing.T) {
-	tests := []struct {
-		name       string
-		total      int
-		recordSize int
-		recordIdx  int
-		want       int
-	}{
-		{"full block", 300, 128, 0, 128},
-		{"full block second", 300, 128, 1, 128},
-		{"partial last block", 300, 128, 2, 44},
-		{"exact multiple", 256, 128, 1, 128},
-		{"single record", 50, 128, 0, 50},
-		{"totalItems zero", 0, 128, 0, 0},
-		{"small recordSize", 10, 3, 0, 3},
-		{"small recordSize last", 10, 3, 3, 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ItemsInRecord(tt.total, tt.recordSize, tt.recordIdx)
-			if got != tt.want {
-				t.Errorf("ItemsInRecord(%d, %d, %d) = %d, want %d",
-					tt.total, tt.recordSize, tt.recordIdx, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestEncodeDecodeMetadata(t *testing.T) {
-	tests := []struct {
-		totalItems int
-		recordSize int
-		flags      uint32
-	}{
-		{1000, 128, 0},
-		{0, 64, FlagNoCompression},
-		{8700000, 256, 0},
-		{1, 1, 0xFFFFFFFF},
-	}
-	for _, tt := range tests {
-		total, recSize, flags, err := DecodeMetadata(EncodeMetadata(tt.totalItems, tt.recordSize, tt.flags))
-		if err != nil {
-			t.Fatalf("DecodeMetadata: %v", err)
-		}
-		if total != tt.totalItems || recSize != tt.recordSize || flags != tt.flags {
-			t.Errorf("round-trip mismatch: got (%d, %d, %d), want (%d, %d, %d)",
-				total, recSize, flags, tt.totalItems, tt.recordSize, tt.flags)
-		}
-	}
-
-	// Too-short metadata.
-	_, _, _, err := DecodeMetadata(make([]byte, 11))
-	if err == nil {
-		t.Error("expected error for short metadata")
 	}
 }
 

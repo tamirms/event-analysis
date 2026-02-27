@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/packfile/record"
+	"github.com/tamir/events-analysis/record"
 )
 
 var ErrIndexRange = fmt.Errorf("eventstore: %w", packfile.ErrIndexRange)
@@ -40,20 +40,20 @@ func (r *Reader) waitOpen() error {
 			return
 		}
 
-		totalItems, recordSize, flags, err := packfile.DecodeMetadata(meta)
+		totalItems, recordSize, flags, err := record.DecodeMetadata(meta)
 		if err != nil {
 			r.openErr = fmt.Errorf("eventstore: %w", err)
 			return
 		}
 
-		if flags&^packfile.FlagNoCompression != 0 {
+		if flags&^record.FlagNoCompression != 0 {
 			r.openErr = fmt.Errorf("eventstore: unknown metadata flags: %08x", flags)
 			return
 		}
 
 		r.nEvents = totalItems
 		r.blockN = recordSize
-		r.compressed = flags&packfile.FlagNoCompression == 0
+		r.compressed = flags&record.FlagNoCompression == 0
 
 		if r.blockN <= 0 {
 			r.openErr = fmt.Errorf("eventstore: invalid blockN %d in metadata", r.blockN)
@@ -123,7 +123,7 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	rd := record.Get()
 	defer record.Put(rd)
 
-	n := packfile.ItemsInRecord(r.nEvents, r.blockN, blockIdx)
+	n := record.ItemsInRecord(r.nEvents, r.blockN, blockIdx)
 	if err := rd.ReadAndDecode(r.pr, blockIdx, n, r.compressed); err != nil {
 		return nil, err
 	}
@@ -164,7 +164,7 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 				return
 			}
 
-			n := packfile.ItemsInRecord(r.nEvents, r.blockN, blockIdx)
+			n := record.ItemsInRecord(r.nEvents, r.blockN, blockIdx)
 			if err := rd.Decode(recData, n, r.compressed); err != nil {
 				yield(nil, err)
 				return
@@ -263,7 +263,7 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			func(workerID, inputPos int, data []byte) error {
 				rd := workers[workerID]
 				blk := blockGroups[inputPos]
-				n := packfile.ItemsInRecord(r.nEvents, r.blockN, blk.blockIdx)
+				n := record.ItemsInRecord(r.nEvents, r.blockN, blk.blockIdx)
 				if err := rd.Decode(data, n, r.compressed); err != nil {
 					return err
 				}

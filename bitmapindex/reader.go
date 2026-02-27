@@ -14,7 +14,7 @@ import (
 	streamerrors "github.com/tamirms/streamhash/errors"
 
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/packfile/record"
+	"github.com/tamir/events-analysis/record"
 )
 
 var ErrKeyNotFound = errors.New("bitmapindex: key not found")
@@ -94,20 +94,20 @@ func (r *Reader) waitPackfile() error {
 			return
 		}
 
-		totalItems, recordSize, flags, err := packfile.DecodeMetadata(meta)
+		totalItems, recordSize, flags, err := record.DecodeMetadata(meta)
 		if err != nil {
 			r.packErr = fmt.Errorf("bitmapindex: %w", err)
 			return
 		}
 
-		if flags&^packfile.FlagNoCompression != 0 {
+		if flags&^record.FlagNoCompression != 0 {
 			r.packErr = fmt.Errorf("bitmapindex: unknown metadata flags: %08x", flags)
 			return
 		}
 
 		r.totalKeys = totalItems
 		r.batchSize = recordSize
-		r.compressed = flags&packfile.FlagNoCompression == 0
+		r.compressed = flags&record.FlagNoCompression == 0
 
 		if r.totalKeys == 0 {
 			r.packErr = fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", r.totalKeys)
@@ -240,7 +240,7 @@ func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 	rd := record.Get()
 	defer record.Put(rd)
 
-	n := packfile.ItemsInRecord(r.totalKeys, r.batchSize, batchIdx)
+	n := record.ItemsInRecord(r.totalKeys, r.batchSize, batchIdx)
 	if err := rd.ReadAndDecode(r.pack, batchIdx, n, r.compressed); err != nil {
 		return nil, fmt.Errorf("bitmapindex: decode batch %d for rank %d: %w", batchIdx, rank, err)
 	}
@@ -348,7 +348,7 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 			bw := &work[inputPos]
 			rd := workers[workerID]
 
-			n := packfile.ItemsInRecord(r.totalKeys, r.batchSize, bw.batchIdx)
+			n := record.ItemsInRecord(r.totalKeys, r.batchSize, bw.batchIdx)
 			if err := rd.Decode(data, n, r.compressed); err != nil {
 				return fmt.Errorf("bitmapindex: decode batch %d: %w", bw.batchIdx, err)
 			}
