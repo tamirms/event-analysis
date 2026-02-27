@@ -17,6 +17,7 @@ type ReadAtCloser interface {
 const (
 	magic       = 0x534C4348 // "SLCH"
 	version     = 1
+	groupSize   = 128 // values per FOR group in the index section
 	trailerSize = 32
 )
 

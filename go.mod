@@ -7,7 +7,7 @@ require (
 	github.com/klauspost/compress v1.18.3
 	github.com/linxGnu/grocksdb v1.10.7
 	github.com/stellar/go-stellar-sdk v0.1.0
-	github.com/tamirms/streamhash v0.0.0-20260222180902-234f2350378c
+	github.com/tamirms/streamhash v0.0.0-20260227190507-b121da8d8320
 	golang.org/x/sys v0.40.0
 )
 

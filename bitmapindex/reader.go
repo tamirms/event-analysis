@@ -224,7 +224,7 @@ func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 
 	rank, err := mphf.Query(hk[:])
 	if err != nil {
-		if errors.Is(err, streamerrors.ErrNotFound) || errors.Is(err, streamerrors.ErrFingerprintMismatch) {
+		if errors.Is(err, streamerrors.ErrNotFound) {
 			return nil, ErrKeyNotFound
 		}
 		return nil, fmt.Errorf("bitmapindex: MPHF query: %w", err)
@@ -282,7 +282,7 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 
 		rank, err := mphf.Query(hk[:])
 		if err != nil {
-			if errors.Is(err, streamerrors.ErrNotFound) || errors.Is(err, streamerrors.ErrFingerprintMismatch) {
+			if errors.Is(err, streamerrors.ErrNotFound) {
 				continue
 			}
 			return nil, fmt.Errorf("bitmapindex: MPHF query key %d: %w", i, err)

@@ -208,7 +208,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
 	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
 	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
-	maxRecords := maxGroups * intpack.GroupSize
+	maxRecords := maxGroups * groupSize
 	if recordCount > maxRecords {
 		return nil, fmt.Errorf("%w: recordCount %d implausible for indexSize %d", ErrCorrupt, recordCount, indexSize)
 	}
@@ -225,13 +225,13 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	pos := 0
 	offset := int64(0)
 
-	groupCount := (recordCount + intpack.GroupSize - 1) / intpack.GroupSize
+	groupCount := (recordCount + groupSize - 1) / groupSize
 
 	var values []uint32
 	for g := range groupCount {
-		limit := intpack.GroupSize
-		if g == groupCount-1 && recordCount%intpack.GroupSize != 0 {
-			limit = recordCount % intpack.GroupSize
+		limit := groupSize
+		if g == groupCount-1 && recordCount%groupSize != 0 {
+			limit = recordCount % groupSize
 		}
 
 		if pos >= payloadLen {
@@ -454,42 +454,23 @@ func appendRuns(items *[]workItem, inputStart, recordStart, count, maxRunLen int
 	}
 }
 
-// ReadScattered reads records at the given sorted, unique record indices
-// with parallel I/O. Consecutive index runs are read as sequential batches
-// via ReadRecords (bandwidth-optimal on cold storage); isolated indices
-// use individual parallel reads via ReadRecord. Long consecutive runs are
-// split across workers so decompression is parallelized on warm cache.
+// ReadScattered reads records at the given sorted, unique indices with
+// parallel I/O. It coalesces consecutive indices into batch reads and
+// distributes work across goroutines.
 //
-// process is called once per index in indices. workerID identifies the
-// calling goroutine (in [0, min(len(indices), concurrency))); callers can
-// use it to index into pre-allocated per-worker state, avoiding sync.Pool
-// overhead per call.
-// inputPos is the position in the indices slice (not the record index
-// itself — use indices[inputPos] if needed).
-//
-// data is borrowed and must not be retained after process returns:
-//
-//	// Correct: copy the data
-//	myBuf = append(myBuf[:0], data...)
-//
-//	// WRONG: data will be overwritten on the next call
-//	saved = data
+// process is called exactly once per element of indices:
+//   - workerID: which goroutine is calling ([0, concurrency)).
+//     Use to index into per-worker state (decoders, buffers).
+//   - inputPos: position in the indices slice.
+//     Use indices[inputPos] to get the record index.
+//   - data: the raw record bytes. Borrowed — do not retain after return.
 //
 // process may be called from multiple goroutines concurrently when
 // concurrency > 1; it must be safe for concurrent use.
 //
-// ReadScattered does NOT recover panics from process. An unrecovered panic
-// in process will crash the program with a stack trace — correct behavior
-// for programming errors. Callers that use pooled CGO objects in process
-// should use explicit Put on the success path only (not defer) to avoid
-// returning potentially-corrupt objects to the pool on panic.
-//
-// Context cancellation is checked between work items but not between
-// individual records within a consecutive run. A run of N consecutive
-// records will be fully processed before checking ctx.
-//
 // indices must be sorted ascending with no duplicates (panics otherwise).
 // Returns ErrIndexRange if any index is out of [0, RecordCount).
+// Context cancellation is checked between work items.
 func (r *Reader) ReadScattered(
 	ctx context.Context,
 	indices []int,

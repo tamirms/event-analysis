@@ -90,25 +90,25 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/) | 980 | — |
+| Core format (packfile/ + intpack/ + record/) | 1,281 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
-| Eventstore impl | 730 | 401 |
-| Bitmapindex impl | 915 | 344 |
-| **Total implementation** | **2,844** | **901** |
+| Eventstore impl | 600 | 401 |
+| Bitmapindex impl | 754 | 344 |
+| **Total implementation** | **2,854** | **901** |
 
 RocksDB requires **~3x less code** because RocksDB handles block management, compression,
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these in Go:
 
-- Frame-of-Reference encoding/decoding (for.go: 87 lines)
-- Block accumulation and streaming compression pipeline (eventstore/writer.go: 274 lines)
-- Block decompression with sync.Pool, runtime.SetFinalizer (eventstore/reader.go: 423 lines)
-- Consecutive-run batching + work-stealing parallel I/O (packfile/reader.go — ReadScattered)
-- MPHF construction and query (bitmapindex/writer.go: 324 lines, reader.go: 519 lines)
-- Prefetch heuristics, mmap vs read decisions (bitmapindex/reader.go)
+- Frame-of-Reference encoding/decoding (intpack/: 186 lines)
+- Record decoding with zstd + CRC32C + trailing FOR index (record/: 193 lines)
+- Block accumulation and streaming compression pipeline (eventstore/writer.go: 275 lines)
+- Block decompression with pooled Decoders (eventstore/reader.go: 292 lines)
+- Consecutive-run coalescing + work-stealing parallel I/O (packfile/reader.go — ReadScattered)
+- MPHF construction and query (bitmapindex/writer.go: 274 lines, reader.go: 416 lines)
 - Atomic write with temp file + rename + directory fsync (packfile/writer.go)
-- CRC32C checksums and trailer parsing (packfile/reader.go, writer.go)
+- CRC32C checksums and trailer parsing (packfile/reader.go, packfile.go)
 
 ### Complexity Comparison
 

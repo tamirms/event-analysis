@@ -15,9 +15,6 @@ import (
 	"math/bits"
 )
 
-// GroupSize is the standard number of values per FOR group used by packfile indexes.
-const GroupSize = 128
-
 // EncodeGroup FOR-encodes values into one group: [1B W][4B min LE][packed residuals].
 // W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
 // Panics if len(values) == 0.

@@ -97,9 +97,9 @@ func (w *Writer) Finish() (Trailer, error) {
 	}
 
 	var deltas []uint32
-	for g := 0; g*intpack.GroupSize < recordCount; g++ {
-		base := g * intpack.GroupSize
-		end := min(base+intpack.GroupSize, recordCount)
+	for g := 0; g*groupSize < recordCount; g++ {
+		base := g * groupSize
+		end := min(base+groupSize, recordCount)
 
 		deltas = deltas[:0]
 		if cap(deltas) < end-base {
