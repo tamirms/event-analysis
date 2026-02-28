@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -780,7 +781,7 @@ func TestMetadataValidation(t *testing.T) {
 	if err = pw.Append([]byte{0x01, 0x00}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pw.Finish(); err != nil {
+	if _, err = pw.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -816,19 +817,18 @@ func TestMetadataFlags(t *testing.T) {
 		t.Fatalf("expected FlagNoCompression in metadata, got %08x", flags)
 	}
 
-	// Set an unknown flag (bit 1) — must be rejected.
-	binary.LittleEndian.PutUint32(meta[8:12], 0x00000002)
+	// Set an unknown flag (bit 2) — must be rejected.
+	binary.LittleEndian.PutUint32(meta[8:12], 0x00000004)
 
 	tamperedPath := filepath.Join(dir, "tampered.bitmaps")
 	pw, err := packfile.Create(tamperedPath, packfile.WriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pw.SetMetadata(meta)
 	if err = pw.Append(rec); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pw.Finish(); err != nil {
+	if _, err = pw.Finish(meta); err != nil {
 		t.Fatal(err)
 	}
 
@@ -885,4 +885,156 @@ func TestCloseWithFailedOpen(t *testing.T) {
 	// Close drains goroutines and releases resources. Open errors are
 	// surfaced at query time, not at Close time, so this should not panic.
 	r.Close()
+}
+
+// --- Content Hash Tests ---
+
+func TestContentHashRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	mphfPath, dataPath := buildTestIndex(t, dir, makeContracts(50), WriterOptions{ContentHash: true})
+
+	r := Open(mphfPath, dataPath)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestContentHashDeterministic(t *testing.T) {
+	contracts := makeContracts(50)
+
+	dir1 := t.TempDir()
+	mphfPath1, dataPath1 := buildTestIndex(t, dir1, contracts, WriterOptions{ContentHash: true})
+
+	dir2 := t.TempDir()
+	mphfPath2, dataPath2 := buildTestIndex(t, dir2, contracts, WriterOptions{ContentHash: true})
+
+	r1 := Open(mphfPath1, dataPath1)
+	defer r1.Close()
+	r2 := Open(mphfPath2, dataPath2)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("hashes differ: %x vs %x", hash1, hash2)
+	}
+}
+
+func TestContentHashDisabled(t *testing.T) {
+	dir := t.TempDir()
+	mphfPath, dataPath := buildTestIndex(t, dir, makeContracts(10), WriterOptions{})
+
+	r := Open(mphfPath, dataPath)
+	defer r.Close()
+
+	_, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected no content hash when disabled")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify should return nil when no hash stored: %v", err)
+	}
+}
+
+func TestContentHashCompressed(t *testing.T) {
+	dir := t.TempDir()
+	mphfPath, dataPath := buildTestIndex(t, dir, makeContracts(50), WriterOptions{ContentHash: true, Compress: true})
+
+	r := Open(mphfPath, dataPath)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestContentHashCorruption(t *testing.T) {
+	dir := t.TempDir()
+	contracts := makeContracts(50)
+	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{ContentHash: true})
+
+	// Verify it works before corruption.
+	r := Open(mphfPath, dataPath)
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify before corruption: %v", err)
+	}
+	r.Close()
+
+	// Corrupt the stored SHA-256 hash in metadata. The metadata is located at
+	// fileSize - trailerSize(32) - metadataSize. The hash starts at byte 12
+	// within the metadata (after the 12-byte standard header).
+	fileData, err := os.ReadFile(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	trailerStart := len(fileData) - 32
+	metadataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+14:]))
+	if metadataSize < 44 {
+		t.Fatalf("unexpected metadataSize %d (want >= 44)", metadataSize)
+	}
+
+	// Flip a byte in the stored SHA-256 hash (byte 12 of metadata = first hash byte).
+	metadataStart := trailerStart - metadataSize
+	fileData[metadataStart+12] ^= 0xFF
+
+	corruptedPath := filepath.Join(dir, "corrupted.bitmaps")
+	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r = Open(mphfPath, corruptedPath)
+	defer r.Close()
+
+	err = r.Verify(context.Background())
+	if err == nil {
+		t.Fatal("expected error from corrupted hash")
+	}
+	if !errors.Is(err, record.ErrContentHashMismatch) {
+		t.Fatalf("expected ErrContentHashMismatch, got: %v", err)
+	}
+}
+
+func makeContracts(n int) [][]byte {
+	contracts := make([][]byte, n)
+	for i := range contracts {
+		raw := make([]byte, 32)
+		binary.BigEndian.PutUint32(raw, uint32(i))
+		contracts[i] = raw
+	}
+	return contracts
 }

@@ -24,8 +24,20 @@ func TestWriteThroughput(t *testing.T) {
 		baseDir = os.TempDir()
 	}
 
-	fmt.Println("\nPackfile:")
+	type packConfig struct {
+		label string
+		opts  eventstore.WriterOptions
+	}
+	var configs []packConfig
 	for _, conc := range []int{1, 4, 8, 16, 24, 32} {
+		configs = append(configs,
+			packConfig{fmt.Sprintf("c=%2d         ", conc), eventstore.WriterOptions{Concurrency: conc}},
+			packConfig{fmt.Sprintf("c=%2d hash    ", conc), eventstore.WriterOptions{Concurrency: conc, ContentHash: true}},
+		)
+	}
+
+	fmt.Println("\nPackfile:")
+	for _, cfg := range configs {
 		dir, err := os.MkdirTemp(baseDir, "wp-*")
 		if err != nil {
 			t.Fatal(err)
@@ -33,7 +45,7 @@ func TestWriteThroughput(t *testing.T) {
 		p := dir + "/bench.events"
 
 		start := time.Now()
-		ew, err := eventstore.Create(p, eventstore.WriterOptions{Concurrency: conc})
+		ew, err := eventstore.Create(p, cfg.opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -46,7 +58,7 @@ func TestWriteThroughput(t *testing.T) {
 			t.Fatal(err)
 		}
 		elapsed := time.Since(start)
-		fmt.Printf("  c=%2d: %.2fs  %4.0f MB/s\n", conc, elapsed.Seconds(),
+		fmt.Printf("  %s: %.2fs  %4.0f MB/s\n", cfg.label, elapsed.Seconds(),
 			float64(totalRawBytes)/elapsed.Seconds()/1e6)
 
 		os.RemoveAll(dir)

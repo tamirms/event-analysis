@@ -459,10 +459,7 @@ func appendRuns(items *[]workItem, inputStart, recordStart, count, maxRunLen int
 // distributes work across goroutines.
 //
 // process is called exactly once per element of indices:
-//   - workerID: which goroutine is calling ([0, concurrency)).
-//     Use to index into per-worker state (decoders, buffers).
 //   - inputPos: position in the indices slice.
-//     Use indices[inputPos] to get the record index.
 //   - data: the raw record bytes. Borrowed — do not retain after return.
 //
 // process may be called from multiple goroutines concurrently when
@@ -475,7 +472,7 @@ func (r *Reader) ReadScattered(
 	ctx context.Context,
 	indices []int,
 	concurrency int,
-	process func(workerID, inputPos int, data []byte) error,
+	process func(inputPos int, data []byte) error,
 ) error {
 	if len(indices) == 0 {
 		return nil
@@ -518,8 +515,7 @@ func (r *Reader) ReadScattered(
 	var firstErr error
 
 	wg.Add(numWorkers)
-	for w := range numWorkers {
-		workerID := w
+	for range numWorkers {
 		go func() {
 			defer wg.Done()
 			// Use pooled 1MB buffer for single-record reads to avoid
@@ -561,7 +557,7 @@ func (r *Reader) ReadScattered(
 						cancel()
 						return
 					}
-					if err := process(workerID, item.inputStart, buf); err != nil {
+					if err := process(item.inputStart, buf); err != nil {
 						errOnce.Do(func() { firstErr = err })
 						cancel()
 						return
@@ -578,7 +574,7 @@ func (r *Reader) ReadScattered(
 							cancel()
 							return
 						}
-						if err := process(workerID, item.inputStart+i, data); err != nil {
+						if err := process(item.inputStart+i, data); err != nil {
 							errOnce.Do(func() { firstErr = err })
 							cancel()
 							return

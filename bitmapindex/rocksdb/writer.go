@@ -1,7 +1,6 @@
 package rocksdb
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -87,7 +86,7 @@ func (w *Writer) Finish(_ context.Context) error {
 	}
 	w.bitmaps = nil
 	sort.Slice(entries, func(i, j int) bool {
-		return bytes.Compare([]byte(entries[i].key), []byte(entries[j].key)) < 0
+		return entries[i].key < entries[j].key
 	})
 
 	// Write SST file.

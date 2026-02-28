@@ -31,11 +31,9 @@ for _, ledger := range ledgers {
     w.Append(zstd.Compress(encodeLedger(ledger)))
 }
 
-// Metadata can be set after all records are written (e.g. when total count
-// is not known until the write loop finishes).
-w.SetMetadata(chunkMeta{FirstLedger: 420000, Count: len(ledgers)}.Marshal())
-
-trailer, _ := w.Finish() // writes index, fsyncs, atomic rename
+// Metadata is passed to Finish — known at finalization time (e.g. total count).
+meta := chunkMeta{FirstLedger: 420000, Count: len(ledgers)}.Marshal()
+trailer, _ := w.Finish(meta) // writes index, metadata, fsyncs, atomic rename
 ```
 
 Records are appended in order. `Finish` builds the index, writes it to disk, fsyncs, and atomically renames the temp file to the final path. If the process crashes before `Finish`, no partial file is left behind.
@@ -65,31 +63,22 @@ defer r.Close()
 // e.g. [3, 4, 5, 12, 13, 45, 46, 47, 48]
 indices := bitmapResult.ToSortedSlice()
 
-// Pre-allocate one record.Decoder per worker to avoid pool overhead per call.
-decoders := make([]*record.Decoder, runtime.NumCPU())
-for i := range decoders {
-    decoders[i] = record.New()
-}
-defer func() {
-    for _, d := range decoders {
-        d.Close()
-    }
-}()
-
-err := r.ReadScattered(ctx, indices, len(decoders),
-    func(workerID, inputPos int, data []byte) error {
+err := r.ReadScattered(ctx, indices, runtime.NumCPU(),
+    func(inputPos int, data []byte) error {
+        rd := record.Get()
+        defer record.Put(rd)
         blockIdx := indices[inputPos]
         n := record.ItemsInRecord(totalEvents, blockSize, blockIdx)
-        if err := decoders[workerID].Decode(data, n, compressed); err != nil {
+        if err := rd.Decode(data, n, compressed); err != nil {
             return err
         }
-        // extract entries from decoders[workerID]...
+        // extract entries from rd...
         return nil
     },
 )
 ```
 
-`workerID` identifies which goroutine is calling (in `[0, concurrency)`), so each worker uses its own decoder without synchronization. `inputPos` is the position in `indices` — use `indices[inputPos]` to get the actual record index. `data` is borrowed from an internal buffer and must not be retained after `process` returns.
+`inputPos` is the position in `indices` — use `indices[inputPos]` to get the actual record index. `data` is borrowed from an internal buffer and must not be retained after `process` returns. Use `record.Get()`/`record.Put()` for per-callback decoders.
 
 ### Reading: Sequential Scan
 
@@ -121,7 +110,7 @@ w, _ := packfile.Create("bitmaps-00042.pack", packfile.WriterOptions{})
 for slot := 0; slot < mphf.Len(); slot++ {
     w.Append(compressedBitmaps[slot])
 }
-w.Finish()
+w.Finish(nil) // no metadata
 
 // Read — MPHF gives ordinal, packfile gives data
 r := packfile.Open("bitmaps-00042.pack")
@@ -163,8 +152,6 @@ package packfile
 
 // WriterOptions configures how the packfile is written.
 type WriterOptions struct {
-    Metadata []byte // opaque, caller-defined, stored in the file
-
     // BytesPerSync initiates background writeback of dirty pages every N bytes
     // written. On Linux this uses sync_file_range(SYNC_FILE_RANGE_WRITE) which
     // is non-blocking — it tells the kernel to start flushing without waiting.
@@ -183,21 +170,16 @@ func Create(path string, opts WriterOptions) (*Writer, error)
 // Append writes a single record. Records are opaque byte slices.
 func (w *Writer) Append(record []byte) error
 
-// SetMetadata sets the opaque metadata to be written at Finish time.
-// Must be called before Finish. Allows setting metadata after records
-// are written (e.g. when total count is not known until the write
-// loop finishes).
-func (w *Writer) SetMetadata(meta []byte)
-
 // Abort discards the in-progress packfile and removes the temp file.
 // Safe to call after a failed Finish to clean up.
 // No-op after a successful Finish or a previous Abort.
 func (w *Writer) Abort() error
 
 // Finish writes the index, metadata, and trailer, fsyncs, and
-// atomically renames to the final path. Returns an error if the
-// writer has already been finished or aborted.
-func (w *Writer) Finish() (Trailer, error)
+// atomically renames to the final path. metadata is opaque caller-defined
+// bytes stored in the file (nil for no metadata). Returns an error if
+// the writer has already been finished or aborted.
+func (w *Writer) Finish(metadata []byte) (Trailer, error)
 ```
 
 ### Reader
@@ -245,19 +227,17 @@ func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error]
 // distributes work across goroutines.
 //
 // process is called exactly once per element of indices:
-//   - workerID: which goroutine is calling ([0, concurrency)).
-//     Use to index into per-worker state (decoders, buffers).
 //   - inputPos: position in the indices slice.
-//     Use indices[inputPos] to get the record index.
 //   - data: the raw record bytes. Borrowed — do not retain after return.
 //
+// process may be called from multiple goroutines concurrently.
 // indices must be sorted ascending with no duplicates (panics otherwise).
 // Returns ErrIndexRange if any index is out of [0, RecordCount).
 func (r *Reader) ReadScattered(
     ctx context.Context,
     indices []int,
     concurrency int,
-    process func(workerID, inputPos int, data []byte) error,
+    process func(inputPos int, data []byte) error,
 ) error
 
 func (r *Reader) RecordCount() (int, error)
@@ -324,7 +304,15 @@ package record
 // FlagNoCompression indicates records are stored uncompressed with CRC32C integrity.
 const FlagNoCompression uint32 = 1 << 0
 
+// FlagContentHash indicates metadata contains a 32-byte SHA-256 content hash
+// after the standard 12-byte header.
+const FlagContentHash uint32 = 1 << 1
+
 var ErrChecksum = errors.New("record: checksum mismatch")
+
+// ErrContentHashMismatch is returned when a file's content hash does not match
+// the hash stored in metadata. Used by eventstore and bitmapindex Verify().
+var ErrContentHashMismatch = errors.New("record: content hash mismatch")
 
 // Decoder decodes packfile records containing multiple entries with a trailing
 // FOR-encoded size index. Handles both zstd-compressed and CRC32C-verified
@@ -368,6 +356,11 @@ func DecodeMetadata(meta []byte) (totalItems, recordSize int, flags uint32, err 
 // ItemsInRecord returns the number of items in the given record index.
 // Handles the last record which may be partial.
 func ItemsInRecord(totalItems, recordSize, recordIdx int) int
+
+// ContentHash extracts the 32-byte SHA-256 content hash from metadata.
+// Layout: [0:4] totalItems, [4:8] recordSize, [8:12] flags, [12:44] SHA-256 hash.
+// Returns (hash, true) if FlagContentHash is set and metadata is long enough.
+func ContentHash(meta []byte, flags uint32) ([32]byte, bool)
 ```
 
 ---
@@ -522,7 +515,7 @@ Three phases:
 
 2. **Dispatch.** Workers claim runs via `atomic.Int64` (work-stealing). A single-record run uses `ReadRecord` with a pooled 1MB buffer. A multi-record run delegates to `ReadRecords`, which coalesces the range into sequential batch reads. The pooled buffer is released before entering `ReadRecords` (which has its own pool) to avoid doubling memory.
 
-3. **Callback.** Each record is passed to the caller's `process` function. The `workerID` parameter lets callers index into pre-allocated per-worker state (e.g., `record.Decoder` instances) instead of hitting a sync.Pool on every call.
+3. **Callback.** Each record is passed to the caller's `process` function with its `inputPos` (position in the indices slice). Callers use `record.Get()`/`record.Put()` for per-callback decoders.
 
 ### BytesPerSync
 
@@ -615,9 +608,9 @@ func (w *EventChunkWriter) flush() error {
 }
 
 func (w *EventChunkWriter) Finish() (packfile.Trailer, error) {
-    // Set metadata after all events are written — total count now known.
-    w.packer.SetMetadata(record.EncodeMetadata(w.count, eventsPerBlock, 0))
-    return w.packer.Finish()
+    // Build metadata after all events are written — total count now known.
+    meta := record.EncodeMetadata(w.count, eventsPerBlock, 0)
+    return w.packer.Finish(meta)
 }
 ```
 

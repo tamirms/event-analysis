@@ -2,6 +2,7 @@ package eventstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"iter"
 	"sync"
@@ -17,11 +18,13 @@ type Reader struct {
 	concurrency int              // from options, safe at construction time
 
 	// Deferred init:
-	once       sync.Once
-	nEvents    int
-	blockN     int
-	compressed bool
-	openErr    error
+	once           sync.Once
+	nEvents        int
+	blockN         int
+	compressed     bool
+	contentHash    [32]byte
+	hasContentHash bool
+	openErr        error
 }
 
 type ReaderOption func(*Reader)
@@ -46,7 +49,7 @@ func (r *Reader) waitOpen() error {
 			return
 		}
 
-		if flags&^record.FlagNoCompression != 0 {
+		if flags&^record.KnownFlags != 0 {
 			r.openErr = fmt.Errorf("eventstore: unknown metadata flags: %08x", flags)
 			return
 		}
@@ -54,6 +57,7 @@ func (r *Reader) waitOpen() error {
 		r.nEvents = totalItems
 		r.blockN = recordSize
 		r.compressed = flags&record.FlagNoCompression == 0
+		r.contentHash, r.hasContentHash = record.ContentHash(meta, flags)
 
 		if r.blockN <= 0 {
 			r.openErr = fmt.Errorf("eventstore: invalid blockN %d in metadata", r.blockN)
@@ -105,6 +109,42 @@ func (r *Reader) EventCount() (int, error) {
 
 // Close closes the underlying packfile.
 func (r *Reader) Close() error { return r.pr.Close() }
+
+// ContentHash returns the SHA-256 content hash stored in metadata, if present.
+func (r *Reader) ContentHash() ([32]byte, bool, error) {
+	if err := r.waitOpen(); err != nil {
+		return [32]byte{}, false, err
+	}
+	return r.contentHash, r.hasContentHash, nil
+}
+
+// Verify recomputes the SHA-256 content hash by streaming all events and
+// compares it to the hash stored in metadata. Returns nil if no hash is
+// stored or if the hash matches. Returns an error wrapping
+// record.ErrContentHashMismatch if the hashes differ.
+func (r *Reader) Verify(ctx context.Context) error {
+	if err := r.waitOpen(); err != nil {
+		return err
+	}
+	if !r.hasContentHash {
+		return nil
+	}
+
+	hasher := sha256.New()
+	var lenBuf [4]byte
+
+	for ev, err := range r.ReadEvents(0, r.nEvents) {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		record.HashEntry(hasher, &lenBuf, ev)
+	}
+
+	return record.VerifyHash(hasher, r.contentHash, "eventstore")
+}
 
 // ReadEvent reads a single event by global index.
 // The caller owns the returned slice.
@@ -251,17 +291,11 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 
 		events := make([][]byte, len(indices))
 
-		// Pre-allocate per-worker decoders.
-		numWorkers := min(len(blockGroups), r.concurrency)
-		workers := make([]*record.Decoder, numWorkers)
-		for i := range workers {
-			workers[i] = record.Get()
-		}
-
 		// Phase 2: ReadScattered replaces manual work-stealing.
 		err := r.pr.ReadScattered(ctx, blockIndices, r.concurrency,
-			func(workerID, inputPos int, data []byte) error {
-				rd := workers[workerID]
+			func(inputPos int, data []byte) error {
+				rd := record.Get()
+				defer record.Put(rd)
 				blk := blockGroups[inputPos]
 				n := record.ItemsInRecord(r.nEvents, r.blockN, blk.blockIdx)
 				if err := rd.Decode(data, n, r.compressed); err != nil {
@@ -272,11 +306,6 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 				}
 				return nil
 			})
-
-		// Return workers to pool (skip on panic — process crash is fine).
-		for _, rd := range workers {
-			record.Put(rd)
-		}
 
 		// Phase 3: yield results in index order.
 		if err != nil {

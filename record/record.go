@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"hash"
 	"sync"
 
 	"github.com/tamir/events-analysis/intpack"
@@ -18,10 +18,37 @@ import (
 // FlagNoCompression indicates records are stored uncompressed with CRC32C integrity.
 const FlagNoCompression uint32 = 1 << 0
 
+// FlagContentHash indicates metadata contains a 32-byte SHA-256 content hash
+// after the standard 12-byte header.
+const FlagContentHash uint32 = 1 << 1
+
 // ErrChecksum is returned when a record's CRC32C checksum does not match.
 var ErrChecksum = errors.New("record: checksum mismatch")
 
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+// ErrContentHashMismatch is returned when a file's content hash does not match
+// the hash stored in metadata. Used by eventstore and bitmapindex Verify().
+var ErrContentHashMismatch = errors.New("record: content hash mismatch")
+
+// KnownFlags is the set of all metadata flags recognized by the current version.
+const KnownFlags = FlagNoCompression | FlagContentHash
+
+// HashEntry writes a length-prefixed entry to a hash.
+// The 4-byte LE length prefix ensures unambiguous concatenation.
+func HashEntry(h hash.Hash, lenBuf *[4]byte, entry []byte) {
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(entry)))
+	h.Write(lenBuf[:])
+	h.Write(entry)
+}
+
+// VerifyHash finalizes the hasher and compares to expected.
+// Returns nil on match, or an error wrapping ErrContentHashMismatch.
+func VerifyHash(h hash.Hash, expected [32]byte, prefix string) error {
+	computed := [32]byte(h.Sum(nil))
+	if computed != expected {
+		return fmt.Errorf("%s: %w: expected %x, got %x", prefix, ErrContentHashMismatch, expected, computed)
+	}
+	return nil
+}
 
 // --- Metadata helpers ---
 //
@@ -73,6 +100,16 @@ func ItemsInRecord(totalItems, recordSize, recordIdx int) int {
 		return recordSize
 	}
 	return rem
+}
+
+// ContentHash extracts the 32-byte SHA-256 content hash from metadata.
+// Layout: [0:4] totalItems, [4:8] recordSize, [8:12] flags, [12:44] SHA-256 hash.
+// Returns (hash, true) if FlagContentHash is set and metadata is long enough.
+func ContentHash(meta []byte, flags uint32) ([32]byte, bool) {
+	if flags&FlagContentHash == 0 || len(meta) < 44 {
+		return [32]byte{}, false
+	}
+	return [32]byte(meta[12:44]), true
 }
 
 // --- Decoder ---
@@ -138,7 +175,7 @@ func (rd *Decoder) Decode(data []byte, n int, compressed bool) error {
 		}
 		payloadEnd := len(data) - 4
 		stored := binary.LittleEndian.Uint32(data[payloadEnd:])
-		if stored != crc32.Checksum(data[:payloadEnd], crc32cTable) {
+		if stored != packfile.CRC32C(data[:payloadEnd]) {
 			return fmt.Errorf("record: CRC32C: %w", ErrChecksum)
 		}
 		rd.decompressed = append(rd.decompressed[:0], data[:payloadEnd]...)

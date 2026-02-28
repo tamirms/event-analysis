@@ -458,7 +458,7 @@ acknowledges this: `fixtureFormatVersion` is bumped when format-affecting change
 - **Logical-content CAS is possible but requires extra work.** You'd hash the uncompressed
   logical content (e.g., SHA-256 of the sorted event stream) rather than the on-disk bytes.
   Both formats could support this by computing a content hash during writes and storing it
-  in metadata. The packfile trailer has room for this; RocksDB could store it in a properties
+  in metadata. The packfile metadata section stores this; RocksDB could store it in a properties
   block.
 - **Event-level CAS** (hash per event) sidesteps the compression problem entirely — individual
   events are hashed before compression. But this requires an external index mapping
@@ -482,36 +482,35 @@ acknowledges this: `fixtureFormatVersion` is bumped when format-affecting change
 **Verdict:** Neither format gives you free whole-file CAS due to zstd non-reproducibility.
 The workaround (logical content hash) works identically for both — compute SHA-256 over
 uncompressed logical content during writes. Packfile's immutable single-file design makes
-storing and retrieving the hash slightly simpler (trailer field vs metadata key), but the
+storing and retrieving the hash slightly simpler (metadata field vs RocksDB properties key), but the
 fundamental CAS capability is equivalent.
 
-**Practical workaround — logical content hash (works for both formats):**
+**Implemented: logical content hash via SHA-256 (packfile format):**
 
-The workaround is the same regardless of storage format: compute a SHA-256 over the
-uncompressed logical content during writes, store it in metadata.
+Both eventstore and bitmapindex support opt-in SHA-256 content hashing, enabled via
+`ContentHash: true` in writer options. The hash is computed incrementally during writes
+and stored in the packfile metadata (32 bytes after the standard 12-byte header).
 
-For eventstore: hash the raw event bytes sequentially as they're appended. The hash covers
-`event_0 || event_1 || ... || event_N-1` — the logical content independent of block size,
-compression, or format version. Two files with identical events in identical order produce
-the same content hash regardless of zstd version or storage format.
+For eventstore: each event is hashed with a 4-byte little-endian length prefix:
+`[len_0][event_0][len_1][event_1]...`. Length-prefixing eliminates concatenation
+ambiguity. The hash is independent of block size, compression, and format version.
+Same events in same order = same hash. For concurrent writes, a dedicated hash
+goroutine runs in parallel with the compression pipeline.
 
-For bitmap index: hash the sorted (composite_key, serialized_bitmap) pairs. Since roaring
-bitmap serialization *is* deterministic (canonical format), this produces stable hashes.
+For bitmap index: entries are hashed in rank order (0, 1, ..., N-1), each with a
+4-byte little-endian length prefix: `[len_0][fp_0 || bitmap_0]...`. Length-prefixing
+is needed because bitmaps are variable-length.
 
-The hash is computed incrementally during writes (streaming SHA-256, ~400 MB/s on ARM64,
-~800 MB/s on x86 — negligible vs compression cost). For packfile, store the hash in the
-trailer (which has room for additional fields after the existing CRC32C checksums). For
-RocksDB, store it in a dedicated metadata key or the SST properties block. The same hash
-computation works identically during `SSTFileWriter.Add()` calls — you're iterating sorted
-key-value pairs in both formats.
+SHA-256 was chosen for cross-platform hardware acceleration: Go's `crypto/sha256`
+uses ARM64 SHA2 instructions (~2.4 GB/s on Apple M-series / AWS Graviton) and
+x86 SHA-NI (~2-4 GB/s on Intel Ice Lake+ / AMD Zen+). No external dependency needed.
 
-Verification on read is optional and requires a full scan, but the hash serves as a stable
-identity for CAS without requiring reproducible compression.
+Verification via `Verify(ctx)` recomputes the hash by streaming all content and
+comparing to the stored hash. The `ContentHash()` method exposes the stored hash
+for CAS identity without requiring a full verification scan.
 
-This gives content-addressable identity at the file level: `sha256(logical_content)` is the
-CAS key, independent of the on-disk compressed representation. The workaround is
-format-neutral — the only difference is where you store the hash (packfile trailer vs
-RocksDB metadata key), not how you compute it.
+For RocksDB, the same approach would work: compute the hash during `SSTFileWriter.Add()`
+calls and store it in a dedicated metadata key or SST properties block.
 
 ### Streaming / Append-Only Architectures
 

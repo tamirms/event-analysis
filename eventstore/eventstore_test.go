@@ -3,14 +3,18 @@ package eventstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
 	"testing"
+
+	"github.com/tamir/events-analysis/record"
 )
 
 func makeEvents(n int, rng *rand.Rand) [][]byte {
@@ -25,21 +29,7 @@ func makeEvents(n int, rng *rand.Rand) [][]byte {
 }
 
 func writeTestStore(t *testing.T, events [][]byte, blockSize int) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.events")
-	w, err := Create(path, WriterOptions{BlockSize: blockSize})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, ev := range events {
-		if err := w.Append(ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := w.Finish(); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return writeTestStoreOpts(t, events, WriterOptions{BlockSize: blockSize})
 }
 
 func TestRoundTrip(t *testing.T) {
@@ -760,5 +750,224 @@ func TestEventCountBadPath(t *testing.T) {
 	_, err := r.EventCount()
 	if err == nil {
 		t.Fatal("expected error for bad path")
+	}
+}
+
+// --- Content Hash Tests ---
+
+func writeTestStoreOpts(t *testing.T, events [][]byte, opts WriterOptions) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.events")
+	w, err := Create(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := w.Append(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestContentHashRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(100))
+	events := makeEvents(500, rng)
+	path := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true})
+
+	r := Open(path)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestContentHashDeterministic(t *testing.T) {
+	rng := rand.New(rand.NewSource(101))
+	events := makeEvents(500, rng)
+
+	path1 := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true})
+	path2 := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true})
+
+	r1 := Open(path1)
+	defer r1.Close()
+	r2 := Open(path2)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("hashes differ: %x vs %x", hash1, hash2)
+	}
+}
+
+func TestContentHashDisabled(t *testing.T) {
+	rng := rand.New(rand.NewSource(102))
+	events := makeEvents(100, rng)
+	path := writeTestStoreOpts(t, events, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	_, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected no content hash when disabled")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify should return nil when no hash stored: %v", err)
+	}
+}
+
+func TestContentHashWithConcurrency(t *testing.T) {
+	rng := rand.New(rand.NewSource(103))
+	events := makeEvents(500, rng)
+
+	// Write with serial compression + content hash.
+	serialPath := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true})
+
+	// Write with parallel compression + content hash.
+	parallelPath := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true, Concurrency: 4})
+
+	r1 := Open(serialPath)
+	defer r1.Close()
+	r2 := Open(parallelPath)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("serial vs parallel hashes differ: %x vs %x", hash1, hash2)
+	}
+
+	if err := r2.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify parallel: %v", err)
+	}
+}
+
+func TestContentHashWithNoCompression(t *testing.T) {
+	rng := rand.New(rand.NewSource(104))
+	events := makeEvents(500, rng)
+	path := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true, NoCompression: true})
+
+	r := Open(path)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestContentHashOrderSensitive(t *testing.T) {
+	evA := []byte("event-A-data")
+	evB := []byte("event-B-data")
+
+	pathAB := writeTestStoreOpts(t, [][]byte{evA, evB}, WriterOptions{ContentHash: true})
+	pathBA := writeTestStoreOpts(t, [][]byte{evB, evA}, WriterOptions{ContentHash: true})
+
+	r1 := Open(pathAB)
+	defer r1.Close()
+	r2 := Open(pathBA)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 == hash2 {
+		t.Fatal("expected different hashes for different event orders")
+	}
+}
+
+func TestContentHashCorruption(t *testing.T) {
+	rng := rand.New(rand.NewSource(105))
+	events := makeEvents(200, rng)
+	path := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true})
+
+	// Verify it works before corruption.
+	r := Open(path)
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify before corruption: %v", err)
+	}
+	r.Close()
+
+	// Corrupt the stored SHA-256 hash in metadata. The metadata is located at
+	// fileSize - trailerSize(32) - metadataSize. The hash starts at byte 12
+	// within the metadata (after the 12-byte standard header).
+	fileData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Parse metadataSize from the trailer (bytes 14-18 from trailer start).
+	trailerStart := len(fileData) - 32
+	metadataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+14:]))
+	if metadataSize < 44 {
+		t.Fatalf("unexpected metadataSize %d (want >= 44)", metadataSize)
+	}
+
+	// Flip a byte in the stored SHA-256 hash (byte 12 of metadata = first hash byte).
+	metadataStart := trailerStart - metadataSize
+	fileData[metadataStart+12] ^= 0xFF
+
+	corruptedPath := filepath.Join(t.TempDir(), "corrupted.events")
+	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r = Open(corruptedPath)
+	defer r.Close()
+
+	verifyErr := r.Verify(context.Background())
+	if verifyErr == nil {
+		t.Fatal("expected error from corrupted hash")
+	}
+	if !errors.Is(verifyErr, record.ErrContentHashMismatch) {
+		t.Fatalf("expected ErrContentHashMismatch, got: %v", verifyErr)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sync"
 
+	"crypto/sha256"
+
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
 	streamerrors "github.com/tamirms/streamhash/errors"
@@ -66,11 +68,13 @@ type Reader struct {
 	mphfErr   error
 
 	// Packfile metadata — validated on first access:
-	packOnce   sync.Once
-	totalKeys  int
-	batchSize  int
-	compressed bool
-	packErr    error
+	packOnce       sync.Once
+	totalKeys      int
+	batchSize      int
+	compressed     bool
+	contentHash    [32]byte
+	hasContentHash bool
+	packErr        error
 
 	// Idempotent close:
 	closeOnce sync.Once
@@ -100,7 +104,7 @@ func (r *Reader) waitPackfile() error {
 			return
 		}
 
-		if flags&^record.FlagNoCompression != 0 {
+		if flags&^record.KnownFlags != 0 {
 			r.packErr = fmt.Errorf("bitmapindex: unknown metadata flags: %08x", flags)
 			return
 		}
@@ -108,6 +112,7 @@ func (r *Reader) waitPackfile() error {
 		r.totalKeys = totalItems
 		r.batchSize = recordSize
 		r.compressed = flags&record.FlagNoCompression == 0
+		r.contentHash, r.hasContentHash = record.ContentHash(meta, flags)
 
 		if r.totalKeys == 0 {
 			r.packErr = fmt.Errorf("bitmapindex: invalid totalKeys %d in metadata", r.totalKeys)
@@ -336,17 +341,11 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		batchIndices[i] = work[i].batchIdx
 	}
 
-	// Pre-allocate per-worker decoders.
-	numWorkers := min(len(work), r.concurrency)
-	workers := make([]*record.Decoder, numWorkers)
-	for i := range workers {
-		workers[i] = record.Get()
-	}
-
 	err = r.pack.ReadScattered(ctx, batchIndices, r.concurrency,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
+			rd := record.Get()
+			defer record.Put(rd)
 			bw := &work[inputPos]
-			rd := workers[workerID]
 
 			n := record.ItemsInRecord(r.totalKeys, r.batchSize, bw.batchIdx)
 			if err := rd.Decode(data, n, r.compressed); err != nil {
@@ -365,15 +364,60 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 			return nil
 		})
 
-	for _, rd := range workers {
-		record.Put(rd)
-	}
-
 	if err != nil {
 		return nil, err
 	}
 
 	return out, nil
+}
+
+// ContentHash returns the SHA-256 content hash stored in metadata, if present.
+func (r *Reader) ContentHash() ([32]byte, bool, error) {
+	if err := r.waitPackfile(); err != nil {
+		return [32]byte{}, false, err
+	}
+	return r.contentHash, r.hasContentHash, nil
+}
+
+// Verify recomputes the SHA-256 content hash by reading all records and
+// comparing to the stored hash. Returns nil if no hash is stored or if the
+// hash matches. Only depends on waitPackfile(), not waitMPHF().
+func (r *Reader) Verify(ctx context.Context) error {
+	if err := r.waitPackfile(); err != nil {
+		return err
+	}
+	if !r.hasContentHash {
+		return nil
+	}
+
+	hasher := sha256.New()
+	var lenBuf [4]byte
+	numBatches := (r.totalKeys + r.batchSize - 1) / r.batchSize
+
+	rd := record.Get()
+	defer record.Put(rd)
+
+	batchIdx := 0
+	for recData, rangeErr := range r.pack.ReadRecords(0, numBatches) {
+		if rangeErr != nil {
+			return rangeErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		n := record.ItemsInRecord(r.totalKeys, r.batchSize, batchIdx)
+		if err := rd.Decode(recData, n, r.compressed); err != nil {
+			return err
+		}
+
+		for i := range n {
+			record.HashEntry(hasher, &lenBuf, rd.Entry(i))
+		}
+		batchIdx++
+	}
+
+	return record.VerifyHash(hasher, r.contentHash, "bitmapindex")
 }
 
 // Close releases all resources. Safe to call multiple times.

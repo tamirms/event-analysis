@@ -6,11 +6,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"maps"
 	"math"
 	"os"
 	"slices"
+
+	"crypto/sha256"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
@@ -21,8 +22,6 @@ import (
 	"github.com/tamir/events-analysis/record"
 	"github.com/tamir/events-analysis/zstd"
 )
-
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
 	defaultBatchSize = 128
@@ -37,16 +36,18 @@ type WriterOptions struct {
 	BatchSize    int  // bitmaps per packfile record; 0 → 128
 	CapacityHint int  // pre-sizes internal map; 0 → no hint
 	Compress     bool // zstd-compress batches; default false (CRC32C integrity only)
+	ContentHash  bool // compute SHA-256 content hash over rank-ordered entries
 }
 
 // Writer accumulates (ordinal, key) tuples and builds an MPHF+packfile index.
 // Not safe for concurrent use — all calls to Add must be serialized.
 type Writer struct {
-	mphfPath  string
-	dataPath  string
-	bitmaps   map[[16]byte]*roaring.Bitmap
-	batchSize int
-	compress  bool
+	mphfPath    string
+	dataPath    string
+	bitmaps     map[[16]byte]*roaring.Bitmap
+	batchSize   int
+	compress    bool
+	contentHash bool
 }
 
 // NewWriter creates a new bitmap index writer. mphfPath and dataPath are the
@@ -61,11 +62,12 @@ func NewWriter(mphfPath, dataPath string, opts WriterOptions) *Writer {
 	}
 	hint := max(opts.CapacityHint, 0)
 	return &Writer{
-		mphfPath:  mphfPath,
-		dataPath:  dataPath,
-		bitmaps:   make(map[[16]byte]*roaring.Bitmap, hint),
-		batchSize: bs,
-		compress:  opts.Compress,
+		mphfPath:    mphfPath,
+		dataPath:    dataPath,
+		bitmaps:     make(map[[16]byte]*roaring.Bitmap, hint),
+		batchSize:   bs,
+		compress:    opts.Compress,
+		contentHash: opts.ContentHash,
 	}
 }
 
@@ -184,6 +186,23 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		}
 	}
 
+	// Compute content hash over rank-ordered entries if enabled.
+	var contentHash []byte
+	if w.contentHash {
+		hasher := sha256.New()
+		var lenBuf [4]byte
+		// Each logical entry is fingerprint + data, hashed as one length-prefixed unit.
+		// Write length prefix, fingerprint, and data as separate Write calls to avoid
+		// copying each entry into a temporary buffer.
+		for i := range totalKeys {
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(fingerprintSize+len(prepared[i].data)))
+			hasher.Write(lenBuf[:])
+			hasher.Write(prepared[i].fingerprint[:])
+			hasher.Write(prepared[i].data)
+		}
+		contentHash = hasher.Sum(nil)
+	}
+
 	// Group into batch records and write to packfile.
 	batchSize := w.batchSize
 	numBatches := (totalKeys + batchSize - 1) / batchSize
@@ -197,7 +216,9 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	if !w.compress {
 		flags |= record.FlagNoCompression
 	}
-	pw.SetMetadata(record.EncodeMetadata(totalKeys, batchSize, flags))
+	if w.contentHash {
+		flags |= record.FlagContentHash
+	}
 
 	var compressor *zstd.Compressor
 	if w.compress {
@@ -251,8 +272,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 			}
 			batchBuf = append(batchBuf[:0], compressed...)
 		} else {
-			crc := crc32.Checksum(batchBuf, crc32cTable)
-			batchBuf = binary.LittleEndian.AppendUint32(batchBuf, crc)
+			batchBuf = binary.LittleEndian.AppendUint32(batchBuf, packfile.CRC32C(batchBuf))
 		}
 
 		if err := pw.Append(batchBuf); err != nil {
@@ -263,7 +283,12 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		}
 	}
 
-	if _, err := pw.Finish(); err != nil {
+	meta := record.EncodeMetadata(totalKeys, batchSize, flags)
+	if contentHash != nil {
+		meta = append(meta, contentHash...)
+	}
+
+	if _, err := pw.Finish(meta); err != nil {
 		return errors.Join(
 			fmt.Errorf("bitmapindex: finish packfile: %w", err),
 			pw.Abort(),

@@ -3,10 +3,10 @@ package record
 import (
 	"encoding/binary"
 	"errors"
-	"hash/crc32"
 	"testing"
 
 	"github.com/tamir/events-analysis/intpack"
+	"github.com/tamir/events-analysis/packfile"
 	"github.com/tamir/events-analysis/zstd"
 )
 
@@ -67,7 +67,7 @@ func TestDecoderUncompressed(t *testing.T) {
 	raw := buildRecord(entries)
 
 	// Append CRC32C.
-	crc := crc32.Checksum(raw, crc32cTable)
+	crc := packfile.CRC32C(raw)
 	raw = binary.LittleEndian.AppendUint32(raw, crc)
 
 	rd := New()
@@ -87,7 +87,7 @@ func TestDecoderUncompressed(t *testing.T) {
 func TestDecoderCRC32CCorruption(t *testing.T) {
 	entries := [][]byte{[]byte("data")}
 	raw := buildRecord(entries)
-	crc := crc32.Checksum(raw, crc32cTable)
+	crc := packfile.CRC32C(raw)
 	raw = binary.LittleEndian.AppendUint32(raw, crc)
 
 	// Corrupt a byte in the payload.

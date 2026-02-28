@@ -1,10 +1,11 @@
 package eventstore
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"hash"
 	"math"
 	"sync"
 
@@ -14,8 +15,6 @@ import (
 	"github.com/tamir/events-analysis/zstd"
 )
 
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
-
 const DefaultBlockSize = 128
 
 // WriterOptions configures how the eventstore is written.
@@ -23,6 +22,7 @@ type WriterOptions struct {
 	BlockSize     int  // events per block; 0 defaults to DefaultBlockSize (128)
 	Concurrency   int  // compression goroutines; 0 or 1 = serial
 	NoCompression bool // skip zstd; use CRC32C integrity instead (for benchmarking raw I/O)
+	ContentHash   bool // compute SHA-256 content hash over logical event stream
 }
 
 type blockResult struct {
@@ -41,6 +41,13 @@ type Writer struct {
 	err        error            // sticky — once set, all subsequent ops fail
 	noCompress bool             // skip zstd compression
 	compressor *zstd.Compressor // for serial flush path
+
+	// Content hash (opt-in). For concurrent writes, a dedicated goroutine
+	// hashes in parallel with compression.
+	hasher   hash.Hash   // nil when content hashing is disabled; SHA-256
+	hashBuf  []byte      // [u32 len][event]... for current block
+	hashCh   chan []byte  // hash goroutine input (concurrent path only)
+	hashDone chan struct{} // signals hash goroutine completion
 
 	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
@@ -73,6 +80,14 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 		blockN:      opts.BlockSize,
 		concurrency: conc,
 		noCompress:  opts.NoCompression,
+	}
+	if opts.ContentHash {
+		w.hasher = sha256.New()
+		if w.concurrency > 1 {
+			w.hashCh = make(chan []byte, 256)
+			w.hashDone = make(chan struct{})
+			go w.hashWorker()
+		}
 	}
 	if w.concurrency > 1 {
 		w.workCh = make(chan blockResult, w.concurrency)
@@ -179,12 +194,21 @@ func (w *Writer) buildBlock() []byte {
 }
 
 func (w *Writer) flush() error {
-	block := w.buildBlock()
-
+	// Serial path: hash + compress inline.
 	if w.concurrency <= 1 {
+		// Hash directly from w.buf + w.sizes (zero alloc).
+		if w.hasher != nil {
+			var lenBuf [4]byte
+			offset := 0
+			for _, size := range w.sizes {
+				record.HashEntry(w.hasher, &lenBuf, w.buf[offset:offset+int(size)])
+				offset += int(size)
+			}
+		}
+
+		block := w.buildBlock()
 		if w.noCompress {
-			crc := crc32.Checksum(block, crc32cTable)
-			block = binary.LittleEndian.AppendUint32(block, crc)
+			block = binary.LittleEndian.AppendUint32(block, packfile.CRC32C(block))
 		} else {
 			if w.compressor == nil {
 				w.compressor = zstd.NewCompressor()
@@ -198,10 +222,40 @@ func (w *Writer) flush() error {
 		return w.pw.Append(block)
 	}
 
-	// Send to streaming compress pipeline.
+	// Concurrent path: build hash input before buildBlock resets w.buf/w.sizes.
+	var hashBuf []byte
+	if w.hashCh != nil {
+		hashBuf = w.hashBuf[:0]
+		offset := 0
+		for _, size := range w.sizes {
+			hashBuf = binary.LittleEndian.AppendUint32(hashBuf, size)
+			hashBuf = append(hashBuf, w.buf[offset:offset+int(size)]...)
+			offset += int(size)
+		}
+		w.hashBuf = make([]byte, 0, cap(hashBuf))
+	}
+
+	block := w.buildBlock()
+
+	// Feed compression first — this is the throughput-critical pipeline.
 	w.workCh <- blockResult{blockID: w.nextBlockID, data: block}
 	w.nextBlockID++
+
+	// Send to hash goroutine. Deep hashCh buffer (256) prevents this from
+	// blocking the compression pipeline even when the hash goroutine lags.
+	if hashBuf != nil {
+		w.hashCh <- hashBuf
+	}
 	return nil
+}
+
+// hashWorker processes hash buffers sequentially in a dedicated goroutine.
+// This runs concurrently with compression, hiding hash latency.
+func (w *Writer) hashWorker() {
+	defer close(w.hashDone)
+	for buf := range w.hashCh {
+		w.hasher.Write(buf)
+	}
 }
 
 // Finish flushes any partial block, drains the pipeline, writes metadata,
@@ -221,7 +275,13 @@ func (w *Writer) Finish() error {
 		}
 	}
 
-	// Drain the streaming pipeline.
+	// Drain the hash pipeline (must complete before reading final hash).
+	if w.hashCh != nil {
+		close(w.hashCh)
+		<-w.hashDone
+	}
+
+	// Drain the streaming compression pipeline.
 	if w.workCh != nil {
 		close(w.workCh)       // signal compress workers to stop
 		err := <-w.writerDone // wait for writer to finish
@@ -241,14 +301,20 @@ func (w *Writer) Finish() error {
 	if w.noCompress {
 		flags |= record.FlagNoCompression
 	}
-	w.pw.SetMetadata(record.EncodeMetadata(w.total, w.blockN, flags))
+	if w.hasher != nil {
+		flags |= record.FlagContentHash
+	}
+	meta := record.EncodeMetadata(w.total, w.blockN, flags)
+	if w.hasher != nil {
+		meta = append(meta, w.hasher.Sum(nil)...)
+	}
 
 	if w.compressor != nil {
 		w.compressor.Close()
 		w.compressor = nil
 	}
 
-	_, err := w.pw.Finish()
+	_, err := w.pw.Finish(meta)
 	if err != nil {
 		w.err = errors.Join(err, w.pw.Abort())
 		return w.err
@@ -266,6 +332,10 @@ func (w *Writer) Abort() error {
 	if w.compressor != nil {
 		w.compressor.Close()
 		w.compressor = nil
+	}
+	if w.hashCh != nil {
+		close(w.hashCh)
+		<-w.hashDone
 	}
 	if w.workCh != nil {
 		close(w.workCh)

@@ -24,7 +24,7 @@ func writeTestPackfile(t *testing.T, records [][]byte, opts WriterOptions) strin
 			t.Fatal(err)
 		}
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -353,7 +353,7 @@ func TestAtomicWrite(t *testing.T) {
 	if err := w.Append([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Finish(); err != nil {
+	if _, err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -400,7 +400,21 @@ func TestAbortCleansUp(t *testing.T) {
 func TestMetadataRoundTrip(t *testing.T) {
 	meta := []byte("chunk-meta:version=1,first_ledger=420000")
 	records := makeRecords(5, 100)
-	path := writeTestPackfile(t, records, WriterOptions{Metadata: meta})
+
+	// Write with metadata passed to Finish.
+	path := filepath.Join(t.TempDir(), "test.pack")
+	w, err := Create(path, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range records {
+		if err := w.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Finish(meta); err != nil {
+		t.Fatal(err)
+	}
 
 	r := Open(path)
 	defer r.Close()
@@ -521,7 +535,19 @@ func TestSpeculativeReadFallback(t *testing.T) {
 		records[i] = rec
 	}
 
-	path := writeTestPackfile(t, records, WriterOptions{Metadata: []byte("large-index-test")})
+	path := filepath.Join(t.TempDir(), "test.pack")
+	w, err := Create(path, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range records {
+		if err := w.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Finish([]byte("large-index-test")); err != nil {
+		t.Fatal(err)
+	}
 
 	r := Open(path)
 	defer r.Close()
@@ -720,7 +746,7 @@ func TestReadScatteredAllConsecutive(t *testing.T) {
 
 	results := make([][]byte, len(indices))
 	err := r.ReadScattered(context.Background(), indices, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
@@ -747,7 +773,7 @@ func TestReadScatteredMixed(t *testing.T) {
 
 	results := make([][]byte, len(indices))
 	err := r.ReadScattered(context.Background(), indices, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
@@ -773,7 +799,7 @@ func TestReadScatteredAllScattered(t *testing.T) {
 
 	results := make([][]byte, len(indices))
 	err := r.ReadScattered(context.Background(), indices, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
@@ -797,7 +823,7 @@ func TestReadScatteredSingle(t *testing.T) {
 
 	var got []byte
 	err := r.ReadScattered(context.Background(), []int{5}, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			got = append([]byte(nil), data...)
 			return nil
 		})
@@ -817,7 +843,7 @@ func TestReadScatteredEmpty(t *testing.T) {
 	defer r.Close()
 
 	err := r.ReadScattered(context.Background(), nil, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			t.Fatal("should not be called")
 			return nil
 		})
@@ -826,7 +852,7 @@ func TestReadScatteredEmpty(t *testing.T) {
 	}
 
 	err = r.ReadScattered(context.Background(), []int{}, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			t.Fatal("should not be called")
 			return nil
 		})
@@ -845,7 +871,7 @@ func TestReadScatteredHighConcurrency(t *testing.T) {
 	indices := []int{1, 5, 8}
 	results := make([][]byte, len(indices))
 	err := r.ReadScattered(context.Background(), indices, 100,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
@@ -860,7 +886,7 @@ func TestReadScatteredHighConcurrency(t *testing.T) {
 	}
 }
 
-func TestReadScatteredWorkerIDs(t *testing.T) {
+func TestReadScatteredConcurrency(t *testing.T) {
 	records := makeRecords(100, 100)
 	path := writeTestPackfile(t, records, WriterOptions{})
 
@@ -873,44 +899,21 @@ func TestReadScatteredWorkerIDs(t *testing.T) {
 		indices[i] = i * 5
 	}
 
-	const concurrency = 4
-	seen := make([]bool, concurrency)
-	var mu sync.Mutex
-
-	// Barrier ensures all workers start before any can finish.
-	// Without this, one worker steals all items via atomic.Add
-	// before the others are scheduled.
-	var barrier sync.WaitGroup
-	barrier.Add(concurrency)
-	var barrierOnce [concurrency]sync.Once
-
-	err := r.ReadScattered(context.Background(), indices, concurrency,
-		func(workerID, inputPos int, data []byte) error {
-			barrierOnce[workerID].Do(func() {
-				barrier.Done()
-				barrier.Wait()
-			})
-			if workerID < 0 || workerID >= concurrency {
-				return fmt.Errorf("workerID %d out of range [0, %d)", workerID, concurrency)
-			}
-			mu.Lock()
-			seen[workerID] = true
-			mu.Unlock()
+	// Verify that all records are read correctly with concurrency.
+	results := make([][]byte, len(indices))
+	err := r.ReadScattered(context.Background(), indices, 4,
+		func(inputPos int, data []byte) error {
+			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// With the barrier ensuring all 4 workers start, all must be used.
-	used := 0
-	for _, s := range seen {
-		if s {
-			used++
+	for i, idx := range indices {
+		if !bytes.Equal(results[i], records[idx]) {
+			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
 		}
-	}
-	if used < 2 {
-		t.Fatalf("expected multiple workers to be used, got %d", used)
 	}
 }
 
@@ -930,7 +933,7 @@ func TestReadScatteredContextCancel(t *testing.T) {
 	}
 
 	err := r.ReadScattered(ctx, indices, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			return nil
 		})
 	if !errors.Is(err, context.Canceled) {
@@ -953,7 +956,7 @@ func TestReadScatteredProcessError(t *testing.T) {
 
 	sentinel := fmt.Errorf("process error")
 	err := r.ReadScattered(context.Background(), indices, 1,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			if inputPos == 3 {
 				return sentinel
 			}
@@ -972,13 +975,13 @@ func TestReadScatteredOutOfRange(t *testing.T) {
 	defer r.Close()
 
 	err := r.ReadScattered(context.Background(), []int{10}, 1,
-		func(workerID, inputPos int, data []byte) error { return nil })
+		func(inputPos int, data []byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("got %v, want ErrIndexRange", err)
 	}
 
 	err = r.ReadScattered(context.Background(), []int{-1}, 1,
-		func(workerID, inputPos int, data []byte) error { return nil })
+		func(inputPos int, data []byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("got %v, want ErrIndexRange for -1", err)
 	}
@@ -998,7 +1001,7 @@ func TestReadScatteredUnsortedPanic(t *testing.T) {
 	}()
 
 	r.ReadScattered(context.Background(), []int{5, 3}, 1,
-		func(workerID, inputPos int, data []byte) error { return nil })
+		func(inputPos int, data []byte) error { return nil })
 }
 
 func TestReadScatteredDuplicatePanic(t *testing.T) {
@@ -1015,7 +1018,7 @@ func TestReadScatteredDuplicatePanic(t *testing.T) {
 	}()
 
 	r.ReadScattered(context.Background(), []int{3, 3}, 1,
-		func(workerID, inputPos int, data []byte) error { return nil })
+		func(inputPos int, data []byte) error { return nil })
 }
 
 func TestReadScatteredZeroConcurrency(t *testing.T) {
@@ -1029,7 +1032,7 @@ func TestReadScatteredZeroConcurrency(t *testing.T) {
 	results := make([][]byte, len(indices))
 	// concurrency=0 should be clamped to 1, not panic.
 	err := r.ReadScattered(context.Background(), indices, 0,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
@@ -1059,7 +1062,7 @@ func TestReadScatteredCrossFORGroupBoundary(t *testing.T) {
 
 	results := make([][]byte, len(indices))
 	err := r.ReadScattered(context.Background(), indices, 4,
-		func(workerID, inputPos int, data []byte) error {
+		func(inputPos int, data []byte) error {
 			results[inputPos] = append([]byte(nil), data...)
 			return nil
 		})
