@@ -9,8 +9,6 @@ import (
 	"slices"
 	"sync"
 
-	"crypto/sha256"
-
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
 	streamerrors "github.com/tamirms/streamhash/errors"
@@ -390,8 +388,7 @@ func (r *Reader) Verify(ctx context.Context) error {
 		return nil
 	}
 
-	hasher := sha256.New()
-	var lenBuf [4]byte
+	hasher := record.NewContentHasher(r.batchSize)
 	numBatches := (r.totalKeys + r.batchSize - 1) / r.batchSize
 
 	rd := record.Get()
@@ -412,12 +409,17 @@ func (r *Reader) Verify(ctx context.Context) error {
 		}
 
 		for i := range n {
-			record.HashEntry(hasher, &lenBuf, rd.Entry(i))
+			hasher.Add(rd.Entry(i))
 		}
 		batchIdx++
 	}
 
-	return record.VerifyHash(hasher, r.contentHash, "bitmapindex")
+	computed := hasher.Sum()
+	if computed != r.contentHash {
+		return fmt.Errorf("bitmapindex: %w: expected %x, got %x",
+			record.ErrContentHashMismatch, r.contentHash, computed)
+	}
+	return nil
 }
 
 // Close releases all resources. Safe to call multiple times.

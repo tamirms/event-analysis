@@ -491,15 +491,24 @@ Both eventstore and bitmapindex support opt-in SHA-256 content hashing, enabled 
 `ContentHash: true` in writer options. The hash is computed incrementally during writes
 and stored in the packfile metadata (32 bytes after the standard 12-byte header).
 
-For eventstore: each event is hashed with a 4-byte little-endian length prefix:
-`[len_0][event_0][len_1][event_1]...`. Length-prefixing eliminates concatenation
-ambiguity. The hash is independent of block size, compression, and format version.
-Same events in same order = same hash. For concurrent writes, a dedicated hash
-goroutine runs in parallel with the compression pipeline.
+Both use a shared chunked hash scheme (`record.ContentHasher`). Entries are
+length-prefixed and grouped into chunks aligned with record boundaries (blockN for
+eventstore, batchSize for bitmapindex). Each chunk produces a SHA-256 digest; the
+final hash is SHA-256 of the concatenated chunk digests:
 
-For bitmap index: entries are hashed in rank order (0, 1, ..., N-1), each with a
-4-byte little-endian length prefix: `[len_0][fp_0 || bitmap_0]...`. Length-prefixing
-is needed because bitmaps are variable-length.
+```
+chunkDigest_i = SHA-256([4B len][entry_{i*K}] ... [4B len][entry_{i*K+K-1}])
+finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
+K = recordSize (blockN for eventstore, batchSize for bitmapindex)
+```
+
+The hash depends on record size (chunk boundaries), entry order, and entry content.
+Same events with the same record size in the same order = same hash. The hash is
+independent of compression and format version. For concurrent writes, per-worker
+hash goroutines compute chunk digests in parallel with zstd compression.
+
+For bitmap index: entries are hashed in rank order (0, 1, ..., N-1). Each entry
+is `[fingerprint || bitmap]`, hashed as one length-prefixed unit.
 
 SHA-256 was chosen for cross-platform hardware acceleration: Go's `crypto/sha256`
 uses ARM64 SHA2 instructions (~2.4 GB/s on Apple M-series / AWS Graviton) and

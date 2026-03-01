@@ -68,7 +68,7 @@ err := r.ReadScattered(ctx, indices, runtime.NumCPU(),
         rd := record.Get()
         defer record.Put(rd)
         blockIdx := indices[inputPos]
-        n := record.ItemsInRecord(totalEvents, blockSize, blockIdx)
+        n := record.ItemsInRecord(totalItems, blockSize, blockIdx)
         if err := rd.Decode(data, n, compressed); err != nil {
             return err
         }
@@ -172,13 +172,14 @@ func (w *Writer) Append(record []byte) error
 
 // Abort discards the in-progress packfile and removes the temp file.
 // Safe to call after a failed Finish to clean up.
-// No-op after a successful Finish or a previous Abort.
+// No-op only after a successful Finish or a previous Abort.
 func (w *Writer) Abort() error
 
 // Finish writes the index, metadata, and trailer, fsyncs, and
 // atomically renames to the final path. metadata is opaque caller-defined
 // bytes stored in the file (nil for no metadata). Returns an error if
-// the writer has already been finished or aborted.
+// the writer has already been finished or aborted. On failure, the caller
+// should call Abort to clean up the temp file.
 func (w *Writer) Finish(metadata []byte) (Trailer, error)
 ```
 
@@ -258,6 +259,9 @@ var (
     ErrSize         = fmt.Errorf("%w: file size inconsistent with trailer", ErrCorrupt)
     ErrIndexRange   = errors.New("packfile: record index out of range")
 )
+
+// CRC32C computes CRC32C (Castagnoli) of b.
+func CRC32C(b []byte) uint32
 ```
 
 ### intpack (separate package)
@@ -296,7 +300,7 @@ Note: the group size (128 values) is not fixed by intpack — it's a pure codec.
 
 ### record (separate package)
 
-Compression-aware decoder for packfile records containing multiple entries with a trailing FOR-encoded size index. Handles zstd decompression (content checksum provides integrity) and CRC32C verification (uncompressed records). Uses CGo via `zstd/`.
+Compression-aware decoder for packfile records containing multiple entries with a trailing FOR-encoded size index. Handles zstd decompression (content checksum provides integrity) and CRC32C verification (uncompressed records). Uses CGo via `zstd/`. Also provides shared metadata encoding and a chunked SHA-256 content hasher for verifying logical content integrity.
 
 ```go
 package record
@@ -311,8 +315,30 @@ const FlagContentHash uint32 = 1 << 1
 var ErrChecksum = errors.New("record: checksum mismatch")
 
 // ErrContentHashMismatch is returned when a file's content hash does not match
-// the hash stored in metadata. Used by eventstore and bitmapindex Verify().
+// the hash stored in metadata.
 var ErrContentHashMismatch = errors.New("record: content hash mismatch")
+
+// KnownFlags is the set of all metadata flags recognized by the current version.
+const KnownFlags = FlagNoCompression | FlagContentHash
+
+// ContentHasher computes a chunked SHA-256 content hash over a stream of entries.
+// Entries are length-prefixed and grouped into fixed-size chunks; chunk digests
+// are aggregated into a final hash. chunkSize is typically the number of items per record.
+//
+//   chunkDigest_i = SHA-256([4B len][entry_{i*K}] ... [4B len][entry_{i*K+K-1}])
+//   finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
+type ContentHasher struct{ /* unexported */ }
+
+// NewContentHasher creates a ContentHasher with the given chunk size.
+// Panics if chunkSize <= 0.
+func NewContentHasher(chunkSize int) *ContentHasher
+
+// Add appends one logical entry. Parts are concatenated under a single length prefix.
+func (h *ContentHasher) Add(parts ...[]byte)
+
+// Sum flushes any partial chunk and returns the final hash.
+// After calling Sum, the hasher must not be reused (no further Add calls).
+func (h *ContentHasher) Sum() [32]byte
 
 // Decoder decodes packfile records containing multiple entries with a trailing
 // FOR-encoded size index. Handles both zstd-compressed and CRC32C-verified
@@ -619,6 +645,7 @@ The reader maps event indices to block indices using the stored block size:
 ```go
 type EventChunkReader struct {
     pack       *packfile.Reader
+    totalItems int  // from metadata
     blockSize  int  // from metadata
     compressed bool // from metadata flags
 }
@@ -635,9 +662,9 @@ func OpenEventChunk(path string) (*EventChunkReader, error) {
         r.Close()
         return nil, err
     }
-    _ = totalItems
     return &EventChunkReader{
         pack:       r,
+        totalItems: totalItems,
         blockSize:  blockSize,
         compressed: flags&record.FlagNoCompression == 0,
     }, nil
@@ -650,7 +677,7 @@ func (r *EventChunkReader) ReadEvent(eventIdx int) (Event, error) {
     dec := record.Get()
     defer record.Put(dec)
 
-    n := record.ItemsInRecord(totalEvents, r.blockSize, blockIdx)
+    n := record.ItemsInRecord(r.totalItems, r.blockSize, blockIdx)
     if err := dec.ReadAndDecode(r.pack, blockIdx, n, r.compressed); err != nil {
         return Event{}, err
     }

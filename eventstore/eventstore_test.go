@@ -924,6 +924,35 @@ func TestContentHashOrderSensitive(t *testing.T) {
 	}
 }
 
+func TestContentHashNonDefaultBlockSize(t *testing.T) {
+	rng := rand.New(rand.NewSource(110))
+	events := makeEvents(500, rng)
+
+	for _, blockSize := range []int{64, 256, 500} {
+		t.Run(fmt.Sprintf("BlockSize=%d", blockSize), func(t *testing.T) {
+			path := writeTestStoreOpts(t, events, WriterOptions{BlockSize: blockSize, ContentHash: true})
+
+			r := Open(path)
+			defer r.Close()
+
+			hash, ok, err := r.ContentHash()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("expected content hash to be present")
+			}
+			if hash == ([32]byte{}) {
+				t.Fatal("expected non-zero hash")
+			}
+
+			if err := r.Verify(context.Background()); err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+		})
+	}
+}
+
 func TestContentHashCorruption(t *testing.T) {
 	rng := rand.New(rand.NewSource(105))
 	events := makeEvents(200, rng)

@@ -2,7 +2,6 @@ package eventstore
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"iter"
 	"sync"
@@ -130,9 +129,7 @@ func (r *Reader) Verify(ctx context.Context) error {
 		return nil
 	}
 
-	hasher := sha256.New()
-	var lenBuf [4]byte
-
+	hasher := record.NewContentHasher(r.blockN)
 	for ev, err := range r.ReadEvents(0, r.nEvents) {
 		if err != nil {
 			return err
@@ -140,10 +137,14 @@ func (r *Reader) Verify(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		record.HashEntry(hasher, &lenBuf, ev)
+		hasher.Add(ev)
 	}
-
-	return record.VerifyHash(hasher, r.contentHash, "eventstore")
+	computed := hasher.Sum()
+	if computed != r.contentHash {
+		return fmt.Errorf("eventstore: %w: expected %x, got %x",
+			record.ErrContentHashMismatch, r.contentHash, computed)
+	}
+	return nil
 }
 
 // ReadEvent reads a single event by global index.

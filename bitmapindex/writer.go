@@ -11,8 +11,6 @@ import (
 	"os"
 	"slices"
 
-	"crypto/sha256"
-
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/tamirms/streamhash"
 
@@ -186,21 +184,14 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		}
 	}
 
-	// Compute content hash over rank-ordered entries if enabled.
-	var contentHash []byte
+	// Compute chunked content hash over rank-ordered entries if enabled.
+	var contentHash [32]byte
 	if w.contentHash {
-		hasher := sha256.New()
-		var lenBuf [4]byte
-		// Each logical entry is fingerprint + data, hashed as one length-prefixed unit.
-		// Write length prefix, fingerprint, and data as separate Write calls to avoid
-		// copying each entry into a temporary buffer.
+		hasher := record.NewContentHasher(w.batchSize)
 		for i := range totalKeys {
-			binary.LittleEndian.PutUint32(lenBuf[:], uint32(fingerprintSize+len(prepared[i].data)))
-			hasher.Write(lenBuf[:])
-			hasher.Write(prepared[i].fingerprint[:])
-			hasher.Write(prepared[i].data)
+			hasher.Add(prepared[i].fingerprint[:], prepared[i].data)
 		}
-		contentHash = hasher.Sum(nil)
+		contentHash = hasher.Sum()
 	}
 
 	// Group into batch records and write to packfile.
@@ -284,8 +275,8 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	}
 
 	meta := record.EncodeMetadata(totalKeys, batchSize, flags)
-	if contentHash != nil {
-		meta = append(meta, contentHash...)
+	if w.contentHash {
+		meta = append(meta, contentHash[:]...)
 	}
 
 	if _, err := pw.Finish(meta); err != nil {

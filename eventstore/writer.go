@@ -26,9 +26,17 @@ type WriterOptions struct {
 }
 
 type blockResult struct {
-	blockID uint32
-	data    []byte
-	err     error // set by compressWorker on failure
+	blockID   uint32
+	data      []byte   // uncompressed block → compressed block
+	hashSizes []uint32 // event sizes for hash goroutine (reads events from data)
+	digest    [sha256.Size]byte
+	hasHash   bool
+	err       error
+}
+
+type hashWork struct {
+	data      []byte
+	hashSizes []uint32
 }
 
 type Writer struct {
@@ -42,20 +50,27 @@ type Writer struct {
 	noCompress bool             // skip zstd compression
 	compressor *zstd.Compressor // for serial flush path
 
-	// Content hash (opt-in). For concurrent writes, a dedicated goroutine
-	// hashes in parallel with compression.
-	hasher   hash.Hash   // nil when content hashing is disabled; SHA-256
-	hashBuf  []byte      // [u32 len][event]... for current block
-	hashCh   chan []byte  // hash goroutine input (concurrent path only)
-	hashDone chan struct{} // signals hash goroutine completion
+	// Content hash (opt-in).
+	hasher        hash.Hash // final aggregation hasher; nil when disabled
+	serialHashBuf []byte    // reusable buffer for serial path hash chunk
+	sizesPool     sync.Pool // recycled []uint32 buffers for hashSizes
 
 	// Streaming compression pipeline (concurrency > 1).
 	concurrency int
 	nextBlockID uint32
-	workCh      chan blockResult // blockID + uncompressed → compress workers
-	resultCh    chan blockResult // blockID + compressed → writer goroutine
+	workCh      chan blockResult  // blockID + uncompressed → compress workers
+	resultCh    chan blockResult  // blockID + compressed → writer goroutine
 	writerDone  chan error       // writer signals completion (buffered, size 1)
 }
+
+func (w *Writer) getSizes() []uint32 {
+	if p := w.sizesPool.Get(); p != nil {
+		return p.([]uint32)[:w.blockN]
+	}
+	return make([]uint32, w.blockN)
+}
+
+func (w *Writer) putSizes(s []uint32) { w.sizesPool.Put(s) }
 
 // Create starts writing a new eventstore at path.
 func Create(path string, opts WriterOptions) (*Writer, error) {
@@ -83,11 +98,6 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	}
 	if opts.ContentHash {
 		w.hasher = sha256.New()
-		if w.concurrency > 1 {
-			w.hashCh = make(chan []byte, 256)
-			w.hashDone = make(chan struct{})
-			go w.hashWorker()
-		}
 	}
 	if w.concurrency > 1 {
 		w.workCh = make(chan blockResult, w.concurrency)
@@ -100,7 +110,6 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 				w.compressWorker()
 			})
 		}
-		// Close resultCh when all compressors finish, signaling the writer to drain and exit.
 		go func() {
 			compressWg.Wait()
 			close(w.resultCh)
@@ -112,52 +121,126 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 
 // compressWorker reads uncompressed blocks from workCh and sends compressed
 // results to resultCh, preserving the blockID for reordering.
+// When content hashing is enabled, a persistent goroutine builds a
+// length-prefixed buffer from block data and computes a single SHA-256
+// digest per chunk, overlapping with CGo zstd compression.
 func (w *Writer) compressWorker() {
 	c := zstd.NewCompressor()
 	defer c.Close()
+
+	var hashIn chan hashWork
+	var hashOut chan [sha256.Size]byte
+	if w.hasher != nil {
+		hashIn = make(chan hashWork, 1)
+		hashOut = make(chan [sha256.Size]byte, 1)
+		go func() {
+			var lenBuf [4]byte
+			var hashBuf []byte
+			for hw := range hashIn {
+				// Build [4B len][ev₀]...[4B len][evₙ] from block data + sizes.
+			// Same hash format as record.ContentHasher, operating on the flat
+			// buffer directly. Cross-validated by TestContentHashWithConcurrency.
+				hashBuf = hashBuf[:0]
+				offset := 0
+				for _, size := range hw.hashSizes {
+					binary.LittleEndian.PutUint32(lenBuf[:], size)
+					hashBuf = append(hashBuf, lenBuf[:]...)
+					hashBuf = append(hashBuf, hw.data[offset:offset+int(size)]...)
+					offset += int(size)
+				}
+				w.putSizes(hw.hashSizes)
+				hashOut <- sha256.Sum256(hashBuf)
+			}
+		}()
+	}
+
 	for work := range w.workCh {
+		// Send to persistent hash goroutine. It reads work.data
+		// concurrently with c.Encode — both are reads, no race.
+		if work.hashSizes != nil {
+			hashIn <- hashWork{data: work.data, hashSizes: work.hashSizes}
+		}
+
 		compressed, err := c.Encode(work.data)
 		if err != nil {
+			if work.hashSizes != nil {
+				<-hashOut
+			}
 			w.resultCh <- blockResult{blockID: work.blockID, err: fmt.Errorf("eventstore: compress block %d: %w", work.blockID, err)}
 			return
 		}
-		// Copy: compressed aliases c's scratch buffer, but must outlive
-		// until the writer goroutine consumes it.
+
+		// Wait for hash goroutine before overwriting work.data.
+		if work.hashSizes != nil {
+			work.digest = <-hashOut
+			work.hasHash = true
+			work.hashSizes = nil
+		}
 		work.data = append(work.data[:0], compressed...)
 		w.resultCh <- work
+	}
+	if hashIn != nil {
+		close(hashIn)
 	}
 }
 
 // runWriter receives compressed blocks and writes them in blockID order
-// using a reorder buffer.
+// using a reorder buffer. Chunk digests are forwarded to a dedicated
+// aggregation goroutine to keep the writer's critical path free.
 func (w *Writer) runWriter() {
 	defer close(w.writerDone)
 
-	pending := make(map[uint32][]byte)
+	var hashCh chan [sha256.Size]byte
+	var hashDone chan struct{}
+	if w.hasher != nil {
+		hashCh = make(chan [sha256.Size]byte, w.concurrency)
+		hashDone = make(chan struct{})
+		go func() {
+			defer close(hashDone)
+			for d := range hashCh {
+				w.hasher.Write(d[:])
+			}
+		}()
+	}
+
+	pending := make(map[uint32]blockResult)
 	nextBlockID := uint32(0)
 
 	for result := range w.resultCh {
 		if result.err != nil {
+			if hashCh != nil {
+				close(hashCh)
+				<-hashDone
+			}
 			w.writerDone <- result.err
-			// Drain remaining results so compressors don't block.
 			for range w.resultCh {
 			}
 			return
 		}
-		pending[result.blockID] = result.data
+		pending[result.blockID] = result
 
-		// Drain all consecutive ready blocks in order.
-		for data, ok := pending[nextBlockID]; ok; data, ok = pending[nextBlockID] {
+		for br, ok := pending[nextBlockID]; ok; br, ok = pending[nextBlockID] {
 			delete(pending, nextBlockID)
-			if err := w.pw.Append(data); err != nil {
+			if err := w.pw.Append(br.data); err != nil {
+				if hashCh != nil {
+					close(hashCh)
+					<-hashDone
+				}
 				w.writerDone <- err
-				// Drain remaining results so compressors don't block.
 				for range w.resultCh {
 				}
 				return
 			}
+			if br.hasHash {
+				hashCh <- br.digest
+			}
 			nextBlockID++
 		}
+	}
+
+	if hashCh != nil {
+		close(hashCh)
+		<-hashDone
 	}
 }
 
@@ -196,14 +279,22 @@ func (w *Writer) buildBlock() []byte {
 func (w *Writer) flush() error {
 	// Serial path: hash + compress inline.
 	if w.concurrency <= 1 {
-		// Hash directly from w.buf + w.sizes (zero alloc).
 		if w.hasher != nil {
+			// Compute chunk digest over events in w.buf. Same [4B len][entry]...
+			// hash format as record.ContentHasher, operating on the flat buffer
+			// directly. Cross-validated by TestContentHashWithConcurrency.
+			hashBuf := w.serialHashBuf[:0]
 			var lenBuf [4]byte
 			offset := 0
 			for _, size := range w.sizes {
-				record.HashEntry(w.hasher, &lenBuf, w.buf[offset:offset+int(size)])
+				binary.LittleEndian.PutUint32(lenBuf[:], size)
+				hashBuf = append(hashBuf, lenBuf[:]...)
+				hashBuf = append(hashBuf, w.buf[offset:offset+int(size)]...)
 				offset += int(size)
 			}
+			digest := sha256.Sum256(hashBuf)
+			w.hasher.Write(digest[:])
+			w.serialHashBuf = hashBuf
 		}
 
 		block := w.buildBlock()
@@ -222,40 +313,23 @@ func (w *Writer) flush() error {
 		return w.pw.Append(block)
 	}
 
-	// Concurrent path: build hash input before buildBlock resets w.buf/w.sizes.
-	var hashBuf []byte
-	if w.hashCh != nil {
-		hashBuf = w.hashBuf[:0]
-		offset := 0
-		for _, size := range w.sizes {
-			hashBuf = binary.LittleEndian.AppendUint32(hashBuf, size)
-			hashBuf = append(hashBuf, w.buf[offset:offset+int(size)]...)
-			offset += int(size)
-		}
-		w.hashBuf = make([]byte, 0, cap(hashBuf))
+	// Concurrent path: copy sizes (small), hash goroutine reads events
+	// directly from block data.
+	var hashSizes []uint32
+	if w.hasher != nil {
+		hashSizes = w.getSizes()[:len(w.sizes)]
+		copy(hashSizes, w.sizes)
 	}
 
 	block := w.buildBlock()
 
-	// Feed compression first — this is the throughput-critical pipeline.
-	w.workCh <- blockResult{blockID: w.nextBlockID, data: block}
+	w.workCh <- blockResult{
+		blockID:   w.nextBlockID,
+		data:      block,
+		hashSizes: hashSizes,
+	}
 	w.nextBlockID++
-
-	// Send to hash goroutine. Deep hashCh buffer (256) prevents this from
-	// blocking the compression pipeline even when the hash goroutine lags.
-	if hashBuf != nil {
-		w.hashCh <- hashBuf
-	}
 	return nil
-}
-
-// hashWorker processes hash buffers sequentially in a dedicated goroutine.
-// This runs concurrently with compression, hiding hash latency.
-func (w *Writer) hashWorker() {
-	defer close(w.hashDone)
-	for buf := range w.hashCh {
-		w.hasher.Write(buf)
-	}
 }
 
 // Finish flushes any partial block, drains the pipeline, writes metadata,
@@ -267,7 +341,6 @@ func (w *Writer) Finish() error {
 	if w.closed {
 		return errors.New("eventstore: writer is closed")
 	}
-	// Flush any partial block.
 	if len(w.sizes) > 0 {
 		if err := w.flush(); err != nil {
 			w.err = err
@@ -275,17 +348,11 @@ func (w *Writer) Finish() error {
 		}
 	}
 
-	// Drain the hash pipeline (must complete before reading final hash).
-	if w.hashCh != nil {
-		close(w.hashCh)
-		<-w.hashDone
-	}
-
 	// Drain the streaming compression pipeline.
 	if w.workCh != nil {
-		close(w.workCh)       // signal compress workers to stop
-		err := <-w.writerDone // wait for writer to finish
-		w.workCh = nil        // safe now — all workers have exited
+		close(w.workCh)
+		err := <-w.writerDone
+		w.workCh = nil
 		if err != nil {
 			w.err = err
 			return err
@@ -332,10 +399,6 @@ func (w *Writer) Abort() error {
 	if w.compressor != nil {
 		w.compressor.Close()
 		w.compressor = nil
-	}
-	if w.hashCh != nil {
-		close(w.hashCh)
-		<-w.hashDone
 	}
 	if w.workCh != nil {
 		close(w.workCh)
