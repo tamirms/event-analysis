@@ -4,64 +4,69 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
 
-func writeTestPackfile(t *testing.T, records [][]byte, opts WriterOptions) string {
+func writeTestPackfile(t *testing.T, items [][]byte, opts WriterOptions) string {
 	t.Helper()
+	if opts.RecordSize == 0 {
+		opts.RecordSize = 1 // one item per record = raw record behavior
+	}
 	path := filepath.Join(t.TempDir(), "test.pack")
 	w, err := Create(path, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, rec := range records {
-		if err := w.Append(rec); err != nil {
+	for _, item := range items {
+		if err := w.Append(item); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := w.Finish(nil); err != nil {
+	if err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-func makeRecords(n, size int) [][]byte {
-	records := make([][]byte, n)
-	for i := range records {
-		rec := make([]byte, size)
-		rand.Read(rec)
-		records[i] = rec
+func makeItems(n, size int) [][]byte {
+	items := make([][]byte, n)
+	for i := range items {
+		item := make([]byte, size)
+		rand.Read(item)
+		items[i] = item
 	}
-	return records
+	return items
 }
 
 func TestRoundTrip(t *testing.T) {
-	records := makeRecords(500, 1024)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(500, 1024)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	defer r.Close()
 
-	rc, err := r.RecordCount()
+	tc, err := r.TotalItems()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rc != len(records) {
-		t.Fatalf("RecordCount = %d, want %d", rc, len(records))
+	if tc != len(items) {
+		t.Fatalf("TotalItems = %d, want %d", tc, len(items))
 	}
 
-	for i, want := range records {
-		got, err := r.ReadRecord(i, nil)
+	for i, want := range items {
+		got, err := r.ReadItem(i)
 		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
+			t.Fatalf("ReadItem(%d): %v", i, err)
 		}
 		if !bytes.Equal(got, want) {
-			t.Fatalf("ReadRecord(%d): data mismatch", i)
+			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
 }
@@ -72,118 +77,306 @@ func TestEmptyFile(t *testing.T) {
 	r := Open(path)
 	defer r.Close()
 
-	rc, err := r.RecordCount()
+	tc, err := r.TotalItems()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rc != 0 {
-		t.Fatalf("RecordCount = %d, want 0", rc)
+	if tc != 0 {
+		t.Fatalf("TotalItems = %d, want 0", tc)
 	}
 
-	_, err = r.ReadRecord(0, nil)
+	_, err = r.ReadItem(0)
 	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadRecord(0) on empty: got %v, want ErrIndexRange", err)
+		t.Fatalf("ReadItem(0) on empty: got %v, want ErrIndexRange", err)
 	}
 }
 
-func TestSingleRecord(t *testing.T) {
-	records := makeRecords(1, 256)
-	path := writeTestPackfile(t, records, WriterOptions{})
+func TestSingleItem(t *testing.T) {
+	items := makeItems(1, 256)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	defer r.Close()
 
-	rc, err := r.RecordCount()
+	tc, err := r.TotalItems()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rc != 1 {
-		t.Fatalf("RecordCount = %d, want 1", rc)
+	if tc != 1 {
+		t.Fatalf("TotalItems = %d, want 1", tc)
 	}
 
-	got, err := r.ReadRecord(0, nil)
+	got, err := r.ReadItem(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, records[0]) {
+	if !bytes.Equal(got, items[0]) {
 		t.Fatal("data mismatch")
 	}
 }
 
-func TestPartialLastGroup(t *testing.T) {
-	// 200 records = 1 full group (128) + 72 in partial group.
-	records := makeRecords(200, 512)
-	path := writeTestPackfile(t, records, WriterOptions{})
+func TestRecordSize1NoTrailingWaste(t *testing.T) {
+	// With RecordSize=1 and Uncompressed format, each record should be exactly
+	// itemSize + 4 (CRC32C). With trailing FOR it would be itemSize + 6 + 4.
+	// Verify the on-disk record size to confirm the trailing group is skipped.
+	const itemSize = 256
+	items := makeItems(10, itemSize)
+
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 1, Format: Uncompressed})
 
 	r := Open(path)
 	defer r.Close()
 
-	rc, err := r.RecordCount()
+	trailer, err := r.Trailer()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rc != 200 {
-		t.Fatalf("RecordCount = %d, want 200", rc)
+	if trailer.RecordCount != 10 {
+		t.Fatalf("RecordCount = %d, want 10", trailer.RecordCount)
 	}
 
-	// Verify all records.
-	for i, want := range records {
-		got, err := r.ReadRecord(i, nil)
+	// Each uncompressed record: item (256B) + CRC32C (4B) = 260B.
+	// If trailing FOR were present it would be 256 + 6 + 4 = 266B.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSize := fi.Size() - int64(trailer.IndexSize) - int64(trailer.AppDataSize) - trailerSize
+	perRecord := dataSize / int64(trailer.RecordCount)
+	wantPerRecord := int64(itemSize + 4) // item + CRC32C, no trailing FOR
+	if perRecord != wantPerRecord {
+		t.Fatalf("per-record size = %d, want %d (no trailing FOR group)", perRecord, wantPerRecord)
+	}
+
+	// Verify roundtrip.
+	for i, want := range items {
+		got, err := r.ReadItem(i)
 		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
+			t.Fatalf("ReadItem(%d): %v", i, err)
 		}
 		if !bytes.Equal(got, want) {
-			t.Fatalf("ReadRecord(%d): data mismatch", i)
+			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
 }
 
-func TestLargeRecords(t *testing.T) {
-	// Records > 1MB to exceed ReadRecords batch buffer.
-	records := [][]byte{
-		make([]byte, 2*1024*1024), // 2MB
-		make([]byte, 500),         // small
-		make([]byte, 1500*1024),   // 1.5MB
-	}
-	for _, r := range records {
-		rand.Read(r)
-	}
+func TestRawFormat(t *testing.T) {
+	// With Raw format, records are stored as-is: no CRC, no compression.
+	// Per-record size should be exactly itemSize (no CRC overhead).
+	const itemSize = 256
+	items := makeItems(10, itemSize)
 
-	path := writeTestPackfile(t, records, WriterOptions{})
+	path := writeTestPackfile(t, items, WriterOptions{
+		RecordSize: 1,
+		Format:     Raw,
+	})
 
 	r := Open(path)
 	defer r.Close()
 
-	// Point reads.
-	for i, want := range records {
-		got, err := r.ReadRecord(i, nil)
-		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("ReadRecord(%d): data mismatch", i)
-		}
+	trailer, err := r.Trailer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trailer.Format != Raw {
+		t.Fatalf("trailer.Format = %v, want Raw", trailer.Format)
 	}
 
-	// ReadRecords with large records.
+	// Each raw record: item (256B) only. No CRC32C (4B) overhead.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSize := fi.Size() - int64(trailer.IndexSize) - int64(trailer.AppDataSize) - trailerSize
+	perRecord := dataSize / int64(trailer.RecordCount)
+	wantPerRecord := int64(itemSize) // raw: no CRC
+	if perRecord != wantPerRecord {
+		t.Fatalf("per-record size = %d, want %d (raw, no CRC)", perRecord, wantPerRecord)
+	}
+
+	// Verify roundtrip.
+	for i, want := range items {
+		got, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
+		}
+	}
+}
+
+func TestMultiItemRecords(t *testing.T) {
+	// 300 items with recordSize=128 = 2 full records + 44 in partial.
+	items := makeItems(300, 512)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+
+	r := Open(path)
+	defer r.Close()
+
+	tc, err := r.TotalItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc != 300 {
+		t.Fatalf("TotalItems = %d, want 300", tc)
+	}
+
+	// Verify all items.
+	for i, want := range items {
+		got, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
+		}
+	}
+}
+
+func TestReadRange(t *testing.T) {
+	items := makeItems(50, 2048)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 10})
+
+	r := Open(path)
+	defer r.Close()
+
+	// Full range.
 	j := 0
-	for raw, err := range r.ReadRecords(0, 3) {
+	for item, err := range r.ReadRange(0, 50) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(raw, records[j]) {
-			t.Fatalf("ReadRecords[%d]: data mismatch", j)
+		if !bytes.Equal(item, items[j]) {
+			t.Fatalf("ReadRange[%d]: data mismatch", j)
 		}
 		j++
 	}
+	if j != 50 {
+		t.Fatalf("ReadRange yielded %d items, want 50", j)
+	}
+
+	// Partial range crossing record boundary.
+	j = 0
+	for item, err := range r.ReadRange(8, 5) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(item, items[8+j]) {
+			t.Fatalf("ReadRange partial [%d]: data mismatch", j)
+		}
+		j++
+	}
+	if j != 5 {
+		t.Fatalf("ReadRange partial yielded %d, want 5", j)
+	}
+
+	// Early break.
+	j = 0
+	for _, err := range r.ReadRange(0, 50) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		j++
+		if j == 3 {
+			break
+		}
+	}
 	if j != 3 {
-		t.Fatalf("ReadRecords yielded %d records, want 3", j)
+		t.Fatalf("Early break: got %d iterations, want 3", j)
+	}
+
+	// Empty range.
+	j = 0
+	for _, err := range r.ReadRange(0, 0) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		j++
+	}
+	if j != 0 {
+		t.Fatalf("Empty ReadRange yielded %d, want 0", j)
+	}
+}
+
+func TestReadItems(t *testing.T) {
+	items := makeItems(300, 512)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+
+	r := Open(path)
+	defer r.Close()
+
+	// Indices spanning multiple records.
+	indices := []int{0, 1, 127, 128, 200, 299}
+	j := 0
+	for item, err := range r.ReadItems(context.Background(), indices) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(item, items[indices[j]]) {
+			t.Fatalf("ReadItems[%d] (item %d): data mismatch", j, indices[j])
+		}
+		j++
+	}
+	if j != len(indices) {
+		t.Fatalf("ReadItems yielded %d, want %d", j, len(indices))
+	}
+}
+
+func TestReadItemsDuplicatesPanic(t *testing.T) {
+	items := makeItems(100, 100)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+
+	r := Open(path)
+	defer r.Close()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for duplicate indices")
+		}
+	}()
+	for range r.ReadItems(context.Background(), []int{5, 5, 10}) {
+	}
+}
+
+func TestReadItemsUnsortedPanic(t *testing.T) {
+	items := makeItems(300, 100)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+
+	r := Open(path)
+	defer r.Close()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for unsorted indices")
+		}
+	}()
+	for range r.ReadItems(context.Background(), []int{10, 5, 20}) {
+	}
+}
+
+func TestReadItemsEmpty(t *testing.T) {
+	items := makeItems(10, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	j := 0
+	for _, err := range r.ReadItems(context.Background(), nil) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		j++
+	}
+	if j != 0 {
+		t.Fatalf("empty ReadItems yielded %d, want 0", j)
 	}
 }
 
 func TestIndexIntegrity(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(10, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	// Read file, corrupt a byte in the index section, write back.
 	data, err := os.ReadFile(path)
@@ -191,11 +384,12 @@ func TestIndexIntegrity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Index section starts after records, ends before metadata+trailer.
-	// For 10 records of 100 bytes each, records end at byte 1000.
-	// Flip a bit in the first byte after the records.
-	indexStart := 10 * 100
-	if indexStart < len(data)-trailerSize {
+	// Parse trailer to find indexBase.
+	trailerStart := len(data) - trailerSize
+	indexSize := int(binary.LittleEndian.Uint32(data[trailerStart+18:]))
+	appDataSize := int(binary.LittleEndian.Uint32(data[trailerStart+22:]))
+	indexStart := trailerStart - appDataSize - indexSize
+	if indexStart >= 0 && indexStart < trailerStart {
 		data[indexStart] ^= 0xFF
 	}
 
@@ -206,15 +400,15 @@ func TestIndexIntegrity(t *testing.T) {
 
 	r := Open(corruptPath)
 	defer r.Close()
-	_, err = r.RecordCount()
+	_, err = r.TotalItems()
 	if !errors.Is(err, ErrChecksum) {
 		t.Fatalf("Open corrupt index: got %v, want ErrChecksum", err)
 	}
 }
 
 func TestTrailerIntegrity(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(10, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -232,15 +426,15 @@ func TestTrailerIntegrity(t *testing.T) {
 
 	r := Open(corruptPath)
 	defer r.Close()
-	_, err = r.RecordCount()
+	_, err = r.TotalItems()
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Open corrupt trailer: got %v, want ErrCorrupt", err)
 	}
 }
 
 func TestConcurrentReads(t *testing.T) {
-	records := makeRecords(100, 512)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(100, 512)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
 
 	r := Open(path)
 	defer r.Close()
@@ -248,16 +442,16 @@ func TestConcurrentReads(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 100)
 
-	for i := range records {
+	for i := range items {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			got, err := r.ReadRecord(idx, nil)
+			got, err := r.ReadItem(idx)
 			if err != nil {
 				errs <- err
 				return
 			}
-			if !bytes.Equal(got, records[idx]) {
+			if !bytes.Equal(got, items[idx]) {
 				errs <- errors.New("data mismatch")
 			}
 		}(i)
@@ -268,71 +462,6 @@ func TestConcurrentReads(t *testing.T) {
 
 	for err := range errs {
 		t.Fatal(err)
-	}
-}
-
-func TestReadRecordsIterator(t *testing.T) {
-	records := makeRecords(50, 2048)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	// Full range.
-	j := 0
-	for raw, err := range r.ReadRecords(0, 50) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(raw, records[j]) {
-			t.Fatalf("ReadRecords[%d]: data mismatch", j)
-		}
-		j++
-	}
-	if j != 50 {
-		t.Fatalf("ReadRecords yielded %d records, want 50", j)
-	}
-
-	// Partial range.
-	j = 0
-	for raw, err := range r.ReadRecords(10, 5) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(raw, records[10+j]) {
-			t.Fatalf("ReadRecords partial [%d]: data mismatch", j)
-		}
-		j++
-	}
-	if j != 5 {
-		t.Fatalf("ReadRecords partial yielded %d, want 5", j)
-	}
-
-	// Early break.
-	j = 0
-	for _, err := range r.ReadRecords(0, 50) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		j++
-		if j == 3 {
-			break
-		}
-	}
-	if j != 3 {
-		t.Fatalf("Early break: got %d iterations, want 3", j)
-	}
-
-	// Empty range.
-	j = 0
-	for _, err := range r.ReadRecords(0, 0) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		j++
-	}
-	if j != 0 {
-		t.Fatalf("Empty ReadRecords yielded %d, want 0", j)
 	}
 }
 
@@ -353,7 +482,7 @@ func TestAtomicWrite(t *testing.T) {
 	if err := w.Append([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Finish(nil); err != nil {
+	if err := w.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -397,271 +526,54 @@ func TestAbortCleansUp(t *testing.T) {
 	}
 }
 
-func TestMetadataRoundTrip(t *testing.T) {
-	meta := []byte("chunk-meta:version=1,first_ledger=420000")
-	records := makeRecords(5, 100)
-
-	// Write with metadata passed to Finish.
-	path := filepath.Join(t.TempDir(), "test.pack")
-	w, err := Create(path, WriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, rec := range records {
-		if err := w.Append(rec); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := w.Finish(meta); err != nil {
-		t.Fatal(err)
-	}
+func TestReadItemOutOfRange(t *testing.T) {
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	defer r.Close()
 
-	got, err := r.Metadata()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, meta) {
-		t.Fatalf("Metadata mismatch: got %q, want %q", got, meta)
-	}
-}
-
-func TestVariableSizeRecords(t *testing.T) {
-	// Records with varying sizes to exercise FOR compression.
-	records := make([][]byte, 300)
-	for i := range records {
-		size := 5000 + (i % 200) // 5000-5199 bytes
-		rec := make([]byte, size)
-		rand.Read(rec)
-		records[i] = rec
-	}
-
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	for i, want := range records {
-		got, err := r.ReadRecord(i, nil)
-		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("ReadRecord(%d): data mismatch (len got=%d, want=%d)", i, len(got), len(want))
-		}
-	}
-}
-
-func TestUniformSizeRecords(t *testing.T) {
-	// All records same size — exercises width=0→1 path.
-	records := makeRecords(256, 1000)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	for i, want := range records {
-		got, err := r.ReadRecord(i, nil)
-		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("ReadRecord(%d): data mismatch", i)
-		}
-	}
-}
-
-func TestReadRecordOutOfRange(t *testing.T) {
-	records := makeRecords(5, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	_, err := r.ReadRecord(-1, nil)
+	_, err := r.ReadItem(-1)
 	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadRecord(-1): got %v, want ErrIndexRange", err)
+		t.Fatalf("ReadItem(-1): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadRecord(5, nil)
+	_, err = r.ReadItem(5)
 	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadRecord(5): got %v, want ErrIndexRange", err)
+		t.Fatalf("ReadItem(5): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadRecord(100, nil)
+	_, err = r.ReadItem(100)
 	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadRecord(100): got %v, want ErrIndexRange", err)
+		t.Fatalf("ReadItem(100): got %v, want ErrIndexRange", err)
 	}
 }
 
-func TestReadRecordsPanic(t *testing.T) {
-	records := makeRecords(5, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
+func TestReadRangePanic(t *testing.T) {
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	defer r.Close()
 
-	assertPanics := func(name string, f func()) {
-		t.Helper()
-		defer func() {
-			if recover() == nil {
-				t.Fatalf("%s: expected panic", name)
-			}
-		}()
-		f()
-	}
-
-	assertPanics("negative index", func() { for range r.ReadRecords(-1, 1) {} })
-	assertPanics("negative count", func() { for range r.ReadRecords(0, -1) {} })
-	assertPanics("out of range", func() { for range r.ReadRecords(3, 5) {} })
-}
-
-func TestSpeculativeReadFallback(t *testing.T) {
-	// Create enough small records so the FOR index exceeds 256KB,
-	// forcing Open to fall back to a separate read for the index.
-	// Each FOR group (128 records) uses 5 + (w*128+7)/8 bytes.
-	// With sizes 10-59, w=6 → ~101 bytes/group.
-	// 256KB / 101 ≈ 2596 groups → ~332K records to exceed.
-	n := 350_000
-	records := make([][]byte, n)
-	for i := range records {
-		size := 10 + (i % 50) // variable sizes to exercise FOR encoding
-		rec := make([]byte, size)
-		for j := range rec {
-			rec[j] = byte(i + j)
-		}
-		records[i] = rec
-	}
-
-	path := filepath.Join(t.TempDir(), "test.pack")
-	w, err := Create(path, WriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, rec := range records {
-		if err := w.Append(rec); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := w.Finish([]byte("large-index-test")); err != nil {
-		t.Fatal(err)
-	}
-
-	r := Open(path)
-	defer r.Close()
-
-	rc, err := r.RecordCount()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rc != n {
-		t.Fatalf("RecordCount = %d, want %d", rc, n)
-	}
-
-	meta, err := r.Metadata()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(meta, []byte("large-index-test")) {
-		t.Fatalf("Metadata mismatch")
-	}
-
-	// Verify the index actually exceeds speculative read size.
-	trailer, err := r.Trailer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trailer.IndexSize <= 256*1024 {
-		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", trailer.IndexSize)
-	}
-
-	// Verify all records via ReadRecords iterator.
-	j := 0
-	for got, err := range r.ReadRecords(0, n) {
-		if err != nil {
-			t.Fatalf("ReadRecords[%d]: %v", j, err)
-		}
-		if !bytes.Equal(got, records[j]) {
-			t.Fatalf("ReadRecords[%d]: data mismatch (got %d bytes, want %d)", j, len(got), len(records[j]))
-		}
-		j++
-	}
-	if j != n {
-		t.Fatalf("ReadRecords yielded %d, want %d", j, n)
-	}
-}
-
-func TestSpeculativeReadFallbackNoMetadata(t *testing.T) {
-	// Same as above but with no metadata — exercises the fallback path
-	// where the index overshoot bytes are zeros (from make) rather than
-	// metadata bytes.
-	n := 350_000
-	records := make([][]byte, n)
-	for i := range records {
-		size := 10 + (i % 50)
-		rec := make([]byte, size)
-		for j := range rec {
-			rec[j] = byte(i + j)
-		}
-		records[i] = rec
-	}
-
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	rc, err := r.RecordCount()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rc != n {
-		t.Fatalf("RecordCount = %d, want %d", rc, n)
-	}
-
-	meta, err := r.Metadata()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(meta) != 0 {
-		t.Fatalf("Metadata should be empty, got %d bytes", len(meta))
-	}
-
-	trailer, err := r.Trailer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if trailer.IndexSize <= 256*1024 {
-		t.Fatalf("IndexSize = %d, expected > 256KB to exercise fallback", trailer.IndexSize)
-	}
-
-	// Spot-check records near group boundaries (128-record groups in FOR index).
-	for _, i := range []int{0, 1, 127, 128, 129, 255, 256, n/2, n - 2, n - 1} {
-		got, err := r.ReadRecord(i, nil)
-		if err != nil {
-			t.Fatalf("ReadRecord(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, records[i]) {
-			t.Fatalf("ReadRecord(%d): data mismatch", i)
-		}
-	}
+	assertPanics(t, "negative start", func() { for range r.ReadRange(-1, 1) {} })
+	assertPanics(t, "negative count", func() { for range r.ReadRange(0, -1) {} })
+	assertPanics(t, "out of range", func() { for range r.ReadRange(3, 5) {} })
 }
 
 func TestOpenBadPath(t *testing.T) {
 	r := Open("/nonexistent/path/to/file.pack")
 	defer r.Close()
 
-	_, err := r.ReadRecord(0, nil)
+	_, err := r.ReadItem(0)
 	if err == nil {
 		t.Fatal("expected error for bad path")
 	}
 }
 
 func TestCloseBeforeRead(t *testing.T) {
-	records := makeRecords(5, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	if err := r.Close(); err != nil {
@@ -670,8 +582,8 @@ func TestCloseBeforeRead(t *testing.T) {
 }
 
 func TestDoubleClose(t *testing.T) {
-	records := makeRecords(5, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
 
 	r := Open(path)
 	err1 := r.Close()
@@ -681,398 +593,434 @@ func TestDoubleClose(t *testing.T) {
 	}
 }
 
-// --- partitionRuns tests ---
+// --- Content Hash Tests ---
 
-func TestPartitionRuns(t *testing.T) {
-	tests := []struct {
-		name      string
-		indices   []int
-		maxRunLen int
-		want      []workItem
-	}{
-		{"empty", nil, 100, nil},
-		{"single", []int{5}, 100, []workItem{{0, 5, 1}}},
-		{"all_consecutive", []int{3, 4, 5, 6, 7}, 100, []workItem{{0, 3, 5}}},
-		{"all_scattered", []int{0, 5, 10, 20}, 100, []workItem{
-			{0, 0, 1}, {1, 5, 1}, {2, 10, 1}, {3, 20, 1},
-		}},
-		{"mixed", []int{0, 1, 2, 5, 6, 10}, 100, []workItem{
-			{0, 0, 3}, {3, 5, 2}, {5, 10, 1},
-		}},
-		{"two_elements_consecutive", []int{7, 8}, 100, []workItem{{0, 7, 2}}},
-		{"two_elements_scattered", []int{3, 9}, 100, []workItem{{0, 3, 1}, {1, 9, 1}}},
-		// Run splitting: 10 consecutive indices split into chunks of 3.
-		{"split_consecutive", []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, 3, []workItem{
-			{0, 0, 3}, {3, 3, 3}, {6, 6, 3}, {9, 9, 1},
-		}},
-		// Run splitting: only long runs are split, short runs and isolated indices are unchanged.
-		{"split_mixed", []int{0, 1, 2, 3, 4, 10, 11, 20}, 3, []workItem{
-			{0, 0, 3}, {3, 3, 2}, {5, 10, 2}, {7, 20, 1},
-		}},
-		// maxRunLen=1 degenerates to all-scattered.
-		{"split_max1", []int{0, 1, 2}, 1, []workItem{
-			{0, 0, 1}, {1, 1, 1}, {2, 2, 1},
-		}},
+func TestContentHashRoundTrip(t *testing.T) {
+	items := makeItems(500, 200)
+	path := writeTestPackfile(t, items, WriterOptions{ContentHash: true})
+
+	r := Open(path)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := partitionRuns(tt.indices, tt.maxRunLen)
-			if len(got) != len(tt.want) {
-				t.Fatalf("len = %d, want %d: %+v", len(got), len(tt.want), got)
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestContentHashDeterministic(t *testing.T) {
+	items := makeItems(500, 200)
+	path1 := writeTestPackfile(t, items, WriterOptions{ContentHash: true})
+	path2 := writeTestPackfile(t, items, WriterOptions{ContentHash: true})
+
+	r1 := Open(path1)
+	defer r1.Close()
+	r2 := Open(path2)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("hashes differ: %x vs %x", hash1, hash2)
+	}
+}
+
+func TestContentHashDisabled(t *testing.T) {
+	items := makeItems(100, 200)
+	path := writeTestPackfile(t, items, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	_, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected no content hash when disabled")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify should return nil when no hash stored: %v", err)
+	}
+}
+
+func TestContentHashCorruption(t *testing.T) {
+	items := makeItems(200, 200)
+	path := writeTestPackfile(t, items, WriterOptions{ContentHash: true})
+
+	r := Open(path)
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify before corruption: %v", err)
+	}
+	r.Close()
+
+	fileData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Content hash is at trailer bytes [26:58]. Corrupt it and recompute CRC
+	// so the test validates hash mismatch, not CRC failure.
+	trailerStart := len(fileData) - trailerSize
+	fileData[trailerStart+26] ^= 0xFF
+
+	// Recompute trailer CRC over (appData || trailer[0:60]).
+	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	crc := crc32.New(crc32cTable)
+	if appDataSize > 0 {
+		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
+	}
+	crc.Write(fileData[trailerStart : trailerStart+60])
+	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
+
+	corruptedPath := filepath.Join(t.TempDir(), "corrupted.pack")
+	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r = Open(corruptedPath)
+	defer r.Close()
+
+	verifyErr := r.Verify(context.Background())
+	if verifyErr == nil {
+		t.Fatal("expected error from corrupted hash")
+	}
+	if !errors.Is(verifyErr, ErrContentHashMismatch) {
+		t.Fatalf("expected ErrContentHashMismatch, got: %v", verifyErr)
+	}
+}
+
+func TestContentHashWithConcurrency(t *testing.T) {
+	items := makeItems(500, 200)
+
+	serialPath := writeTestPackfile(t, items, WriterOptions{ContentHash: true})
+	parallelPath := writeTestPackfile(t, items, WriterOptions{ContentHash: true, Concurrency: 4})
+
+	r1 := Open(serialPath)
+	defer r1.Close()
+	r2 := Open(parallelPath)
+	defer r2.Close()
+
+	hash1, _, err := r1.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, _, err := r2.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("serial vs parallel hashes differ: %x vs %x", hash1, hash2)
+	}
+
+	if err := r2.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify parallel: %v", err)
+	}
+}
+
+func TestContentHashUncompressed(t *testing.T) {
+	items := makeItems(500, 200)
+	path := writeTestPackfile(t, items, WriterOptions{ContentHash: true, Format: Uncompressed})
+
+	r := Open(path)
+	defer r.Close()
+
+	hash, ok, err := r.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected content hash to be present")
+	}
+	if hash == ([32]byte{}) {
+		t.Fatal("expected non-zero hash")
+	}
+
+	if err := r.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestUncompressedRoundTrip(t *testing.T) {
+	items := makeItems(500, 200)
+	path := writeTestPackfile(t, items, WriterOptions{Format: Uncompressed, Concurrency: 4})
+
+	r := Open(path)
+	defer r.Close()
+
+	tc, err := r.TotalItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc != 500 {
+		t.Fatalf("TotalItems = %d, want 500", tc)
+	}
+
+	for i, want := range items {
+		got, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
+		}
+	}
+}
+
+func TestParallelCompressionRoundTrip(t *testing.T) {
+	items := makeItems(500, 200)
+	path := writeTestPackfile(t, items, WriterOptions{Concurrency: 4})
+
+	r := Open(path)
+	defer r.Close()
+
+	tc, err := r.TotalItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc != 500 {
+		t.Fatalf("TotalItems = %d, want 500", tc)
+	}
+
+	for i, want := range items {
+		got, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
+		}
+	}
+}
+
+func TestSmallRecordSize(t *testing.T) {
+	items := makeItems(20, 200)
+	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 3})
+
+	r := Open(path)
+	defer r.Close()
+
+	tc, err := r.TotalItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc != 20 {
+		t.Fatalf("TotalItems = %d, want 20", tc)
+	}
+
+	for i, want := range items {
+		got, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
+		}
+	}
+}
+
+func TestContentHashNonDefaultRecordSize(t *testing.T) {
+	items := makeItems(500, 200)
+
+	for _, recordSize := range []int{64, 256, 500} {
+		t.Run(fmt.Sprintf("RecordSize=%d", recordSize), func(t *testing.T) {
+			path := writeTestPackfile(t, items, WriterOptions{RecordSize: recordSize, ContentHash: true})
+
+			r := Open(path)
+			defer r.Close()
+
+			hash, ok, err := r.ContentHash()
+			if err != nil {
+				t.Fatal(err)
 			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Fatalf("item[%d] = %+v, want %+v", i, got[i], tt.want[i])
-				}
+			if !ok {
+				t.Fatal("expected content hash to be present")
+			}
+			if hash == ([32]byte{}) {
+				t.Fatal("expected non-zero hash")
+			}
+
+			if err := r.Verify(context.Background()); err != nil {
+				t.Fatalf("Verify: %v", err)
 			}
 		})
 	}
 }
 
-// --- ReadScattered tests ---
+func TestFileTooShort(t *testing.T) {
+	// A file shorter than 64 bytes (trailer size) must trigger ErrSize.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "short.pack")
 
-func TestReadScatteredAllConsecutive(t *testing.T) {
-	records := makeRecords(100, 1024)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	if err := os.WriteFile(path, make([]byte, 63), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	r := Open(path)
 	defer r.Close()
 
-	indices := make([]int, 50)
-	for i := range indices {
-		indices[i] = 10 + i // 10..59
+	_, err := r.TotalItems()
+	if !errors.Is(err, ErrSize) {
+		t.Fatalf("expected ErrSize for short file, got %v", err)
 	}
+}
 
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 4,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
+func TestTrailer(t *testing.T) {
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	trailer, err := r.Trailer()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// With RecordSize=1, each item = one record.
+	if trailer.RecordCount != 5 {
+		t.Fatalf("RecordCount = %d, want 5", trailer.RecordCount)
+	}
+	if trailer.TotalItems != 5 {
+		t.Fatalf("TotalItems = %d, want 5", trailer.TotalItems)
+	}
+	if trailer.RecordSize != 1 {
+		t.Fatalf("RecordSize = %d, want 1", trailer.RecordSize)
+	}
+	if trailer.AppDataSize != 0 {
+		t.Fatalf("AppDataSize = %d, want 0", trailer.AppDataSize)
+	}
+	if trailer.Format != Compressed {
+		t.Fatalf("expected Format=Compressed, got %v", trailer.Format)
+	}
+	if trailer.HasContentHash {
+		t.Fatal("expected HasContentHash=false")
+	}
+}
 
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d: data mismatch", idx)
+func TestAppDataRoundTrip(t *testing.T) {
+	appData := []byte("hello-app-data-1234567890")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "appdata.pack")
+
+	w, err := Create(path, WriterOptions{RecordSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := makeItems(5, 100)
+	for _, item := range items {
+		if err := w.Append(item); err != nil {
+			t.Fatal(err)
 		}
 	}
-}
-
-func TestReadScatteredMixed(t *testing.T) {
-	records := makeRecords(100, 512)
-	path := writeTestPackfile(t, records, WriterOptions{})
+	if err := w.Finish(appData); err != nil {
+		t.Fatal(err)
+	}
 
 	r := Open(path)
 	defer r.Close()
 
-	// Mix of consecutive runs and isolated indices.
-	indices := []int{0, 1, 2, 10, 20, 21, 22, 23, 50, 99}
-
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 4,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
+	got, err := r.AppData()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Equal(got, appData) {
+		t.Fatalf("AppData mismatch: got %q, want %q", got, appData)
+	}
 
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
+	// Verify items still readable.
+	for i, want := range items {
+		item, err := r.ReadItem(i)
+		if err != nil {
+			t.Fatalf("ReadItem(%d): %v", i, err)
+		}
+		if !bytes.Equal(item, want) {
+			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
+
+	trailer, err := r.Trailer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trailer.AppDataSize != uint32(len(appData)) {
+		t.Fatalf("trailer.AppDataSize = %d, want %d", trailer.AppDataSize, len(appData))
+	}
 }
 
-func TestReadScatteredAllScattered(t *testing.T) {
-	records := makeRecords(100, 256)
-	path := writeTestPackfile(t, records, WriterOptions{})
+func TestAppDataCorruption(t *testing.T) {
+	appData := []byte("important-metadata")
 
-	r := Open(path)
-	defer r.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "appdata.pack")
 
-	indices := []int{0, 10, 30, 50, 70, 99}
+	w, err := Create(path, WriterOptions{RecordSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append([]byte("item")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(appData); err != nil {
+		t.Fatal(err)
+	}
 
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 4,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
+	fileData, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
-		}
+	// Corrupt a byte in the app data section.
+	trailerStart := len(fileData) - trailerSize
+	appDataSz := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	if appDataSz == 0 {
+		t.Fatal("expected non-zero appDataSize")
 	}
-}
+	fileData[trailerStart-appDataSz] ^= 0xFF
 
-func TestReadScatteredSingle(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	var got []byte
-	err := r.ReadScattered(context.Background(), []int{5}, 4,
-		func(inputPos int, data []byte) error {
-			got = append([]byte(nil), data...)
-			return nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, records[5]) {
-		t.Fatal("data mismatch")
-	}
-}
-
-func TestReadScatteredEmpty(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	err := r.ReadScattered(context.Background(), nil, 4,
-		func(inputPos int, data []byte) error {
-			t.Fatal("should not be called")
-			return nil
-		})
-	if err != nil {
+	corruptedPath := filepath.Join(t.TempDir(), "corrupted.pack")
+	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	err = r.ReadScattered(context.Background(), []int{}, 4,
-		func(inputPos int, data []byte) error {
-			t.Fatal("should not be called")
-			return nil
-		})
+	r := Open(corruptedPath)
+	defer r.Close()
+
+	_, err = r.TotalItems()
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("expected ErrChecksum for corrupted app data, got %v", err)
+	}
+}
+
+func TestAppDataEmpty(t *testing.T) {
+	items := makeItems(5, 100)
+	path := writeTestPackfile(t, items, WriterOptions{})
+
+	r := Open(path)
+	defer r.Close()
+
+	got, err := r.AppData()
 	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestReadScatteredHighConcurrency(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	indices := []int{1, 5, 8}
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 100,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d: data mismatch", idx)
-		}
-	}
-}
-
-func TestReadScatteredConcurrency(t *testing.T) {
-	records := makeRecords(100, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	// All scattered so each is a separate work item.
-	indices := make([]int, 20)
-	for i := range indices {
-		indices[i] = i * 5
-	}
-
-	// Verify that all records are read correctly with concurrency.
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 4,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
-		}
-	}
-}
-
-func TestReadScatteredContextCancel(t *testing.T) {
-	records := makeRecords(100, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	indices := make([]int, 50)
-	for i := range indices {
-		indices[i] = i * 2
-	}
-
-	err := r.ReadScattered(ctx, indices, 4,
-		func(inputPos int, data []byte) error {
-			return nil
-		})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want context.Canceled", err)
-	}
-}
-
-func TestReadScatteredProcessError(t *testing.T) {
-	records := makeRecords(100, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	// All scattered to maximize work items.
-	indices := make([]int, 50)
-	for i := range indices {
-		indices[i] = i * 2
-	}
-
-	sentinel := fmt.Errorf("process error")
-	err := r.ReadScattered(context.Background(), indices, 1,
-		func(inputPos int, data []byte) error {
-			if inputPos == 3 {
-				return sentinel
-			}
-			return nil
-		})
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("got %v, want sentinel error", err)
-	}
-}
-
-func TestReadScatteredOutOfRange(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	err := r.ReadScattered(context.Background(), []int{10}, 1,
-		func(inputPos int, data []byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("got %v, want ErrIndexRange", err)
-	}
-
-	err = r.ReadScattered(context.Background(), []int{-1}, 1,
-		func(inputPos int, data []byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("got %v, want ErrIndexRange for -1", err)
-	}
-}
-
-func TestReadScatteredUnsortedPanic(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic for unsorted indices")
-		}
-	}()
-
-	r.ReadScattered(context.Background(), []int{5, 3}, 1,
-		func(inputPos int, data []byte) error { return nil })
-}
-
-func TestReadScatteredDuplicatePanic(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic for duplicate indices")
-		}
-	}()
-
-	r.ReadScattered(context.Background(), []int{3, 3}, 1,
-		func(inputPos int, data []byte) error { return nil })
-}
-
-func TestReadScatteredZeroConcurrency(t *testing.T) {
-	records := makeRecords(10, 100)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	indices := []int{0, 3, 7}
-	results := make([][]byte, len(indices))
-	// concurrency=0 should be clamped to 1, not panic.
-	err := r.ReadScattered(context.Background(), indices, 0,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d: data mismatch", idx)
-		}
-	}
-}
-
-func TestReadScatteredCrossFORGroupBoundary(t *testing.T) {
-	// 300 records spans multiple FOR groups (each 128 records).
-	// Consecutive range 120..179 crosses the group boundary at 128.
-	records := makeRecords(300, 512)
-	path := writeTestPackfile(t, records, WriterOptions{})
-
-	r := Open(path)
-	defer r.Close()
-
-	indices := make([]int, 60)
-	for i := range indices {
-		indices[i] = 120 + i // 120..179, crosses boundary at 128
-	}
-
-	results := make([][]byte, len(indices))
-	err := r.ReadScattered(context.Background(), indices, 4,
-		func(inputPos int, data []byte) error {
-			results[inputPos] = append([]byte(nil), data...)
-			return nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i, idx := range indices {
-		if !bytes.Equal(results[i], records[idx]) {
-			t.Fatalf("index %d (pos %d): data mismatch", idx, i)
-		}
+	if got != nil {
+		t.Fatalf("expected nil app data, got %d bytes", len(got))
 	}
 }

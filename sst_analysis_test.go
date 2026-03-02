@@ -69,7 +69,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 
 	for _, n := range blockSizes {
 		esPath := filepath.Join(dir, fmt.Sprintf("batch_%d.events", n))
-		ew, err := eventstore.Create(esPath, eventstore.WriterOptions{BlockSize: n})
+		ew, err := eventstore.Create(esPath, eventstore.WriterOptions{RecordSize: n})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,7 +108,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 			totalFOR += int64(len(encoded))
 		}
 
-		compData := fi.Size() - int64(trailer.IndexSize) - int64(trailer.MetadataSize) - 32 // 32 = trailerSize
+		compData := fi.Size() - int64(trailer.IndexSize) - int64(trailer.AppDataSize) - 64 // 64 = trailerSize
 		ratio := float64(totalRawBytes) / float64(fi.Size())
 
 		br := batchResult{

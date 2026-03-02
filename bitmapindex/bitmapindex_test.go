@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,8 +15,9 @@ import (
 
 	"github.com/tamir/events-analysis/event"
 	"github.com/tamir/events-analysis/packfile"
-	"github.com/tamir/events-analysis/record"
 )
+
+var testCRC32CTable = crc32.MakeTable(crc32.Castagnoli)
 
 // makeTestEvent builds a minimal Event with the given contractID and topics.
 func makeTestEvent(contractID []byte, topics ...[]byte) *event.Event {
@@ -381,15 +383,6 @@ func TestCorruptionDetected(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	// Read the raw record to find its location in the file.
-	pack := packfile.Open(dataPath)
-	rec, err := pack.ReadRecord(0, nil)
-	if err != nil {
-		pack.Close()
-		t.Fatalf("ReadRecord: %v", err)
-	}
-	pack.Close()
-
 	// Verify it works before corruption.
 	r := Open(mphfPath, dataPath)
 	bm, err := r.Lookup(FieldContractID, cid)
@@ -401,17 +394,12 @@ func TestCorruptionDetected(t *testing.T) {
 	}
 	r.Close()
 
-	// Corrupt a byte in the compressed record data.
+	// Corrupt a byte in the first record data (byte 0 of the file).
 	fileData, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-
-	recIdx := bytes.Index(fileData, rec[:5])
-	if recIdx < 0 {
-		t.Fatal("could not find record in packfile")
-	}
-	fileData[recIdx+4] ^= 0xFF
+	fileData[0] ^= 0xFF
 
 	corruptedDataPath := filepath.Join(dir, "corrupted.bitmaps")
 	if err := os.WriteFile(corruptedDataPath, fileData, 0644); err != nil {
@@ -772,26 +760,28 @@ func TestMetadataValidation(t *testing.T) {
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
 	mphfPath, _ := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	// Create a packfile with missing metadata.
-	noMetaPath := filepath.Join(dir, "nometa.bitmaps")
-	pw, err := packfile.Create(noMetaPath, packfile.WriterOptions{})
+	// Create a plain packfile with non-bitmapindex content (no fingerprint prefix).
+	// When the bitmapindex reader does Lookup, the fingerprint check should fail
+	// and return ErrKeyNotFound.
+	plainPath := filepath.Join(dir, "plain.bitmaps")
+	pw, err := packfile.Create(plainPath, packfile.WriterOptions{RecordSize: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = pw.Append([]byte{0x01, 0x00}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pw.Finish(nil); err != nil {
+	if err = pw.Finish(nil); err != nil {
 		t.Fatal(err)
 	}
 
-	r := Open(mphfPath, noMetaPath)
+	r := Open(mphfPath, plainPath)
 	defer r.Close()
 	_, err = r.Lookup(FieldContractID, bytes.Repeat([]byte{0x01}, 32))
 	if err == nil {
-		t.Fatal("expected error for missing metadata")
+		t.Fatal("expected error for non-bitmapindex packfile")
 	}
-	t.Logf("missing metadata: %v", err)
+	t.Logf("non-bitmapindex packfile: %v", err)
 }
 
 func TestMetadataFlags(t *testing.T) {
@@ -800,35 +790,33 @@ func TestMetadataFlags(t *testing.T) {
 	contracts := [][]byte{bytes.Repeat([]byte{0x01}, 32)}
 	mphfPath, dataPath := buildTestIndex(t, dir, contracts, WriterOptions{})
 
-	pack := packfile.Open(dataPath)
-	meta, err := pack.Metadata()
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec, err := pack.ReadRecord(0, nil)
-	pack.Close()
+	// Read the raw file bytes and locate the trailer.
+	fileData, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify FlagNoCompression is accepted (it's the default now).
-	flags := binary.LittleEndian.Uint32(meta[8:12])
-	if flags != record.FlagNoCompression {
-		t.Fatalf("expected FlagNoCompression in metadata, got %08x", flags)
+	// Parse 64-byte trailer. Flags are at offset 5.
+	trailerStart := len(fileData) - 64
+	flags := fileData[trailerStart+5]
+	if flags&0x1 == 0 {
+		t.Fatalf("expected uncompressed flag (bit 0) in trailer, got %02x", flags)
 	}
 
 	// Set an unknown flag (bit 2) — must be rejected.
-	binary.LittleEndian.PutUint32(meta[8:12], 0x00000004)
+	// Also recompute the CRC so this tests flag rejection, not CRC failure.
+	fileData[trailerStart+5] = 0x04
+
+	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	crc := crc32.New(testCRC32CTable)
+	if appDataSize > 0 {
+		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
+	}
+	crc.Write(fileData[trailerStart : trailerStart+60])
+	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
 
 	tamperedPath := filepath.Join(dir, "tampered.bitmaps")
-	pw, err := packfile.Create(tamperedPath, packfile.WriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = pw.Append(rec); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pw.Finish(meta); err != nil {
+	if err := os.WriteFile(tamperedPath, fileData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -994,23 +982,24 @@ func TestContentHashCorruption(t *testing.T) {
 	}
 	r.Close()
 
-	// Corrupt the stored SHA-256 hash in metadata. The metadata is located at
-	// fileSize - trailerSize(32) - metadataSize. The hash starts at byte 12
-	// within the metadata (after the 12-byte standard header).
+	// Corrupt the content hash in the trailer (bytes [26:58] from trailer start).
+	// Recompute CRC so the test validates hash mismatch, not CRC failure.
 	fileData, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	trailerStart := len(fileData) - 32
-	metadataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+14:]))
-	if metadataSize < 44 {
-		t.Fatalf("unexpected metadataSize %d (want >= 44)", metadataSize)
-	}
+	trailerStart := len(fileData) - 64
+	fileData[trailerStart+26] ^= 0xFF
 
-	// Flip a byte in the stored SHA-256 hash (byte 12 of metadata = first hash byte).
-	metadataStart := trailerStart - metadataSize
-	fileData[metadataStart+12] ^= 0xFF
+	// Recompute trailer CRC.
+	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	crc := crc32.New(testCRC32CTable)
+	if appDataSize > 0 {
+		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
+	}
+	crc.Write(fileData[trailerStart : trailerStart+60])
+	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
 
 	corruptedPath := filepath.Join(dir, "corrupted.bitmaps")
 	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
@@ -1024,7 +1013,7 @@ func TestContentHashCorruption(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from corrupted hash")
 	}
-	if !errors.Is(err, record.ErrContentHashMismatch) {
+	if !errors.Is(err, packfile.ErrContentHashMismatch) {
 		t.Fatalf("expected ErrContentHashMismatch, got: %v", err)
 	}
 }

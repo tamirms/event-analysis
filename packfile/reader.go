@@ -4,17 +4,17 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"iter"
 	"os"
 	"sync"
 	"sync/atomic"
-
-	"github.com/tamir/events-analysis/intpack"
 )
 
 const (
 	readBufSize         = 1 << 20    // 1MB
 	speculativeReadSize = 256 * 1024 // 256KB speculative read for Open
+	defaultConcurrency  = 8
 )
 
 var readBufPool = sync.Pool{
@@ -26,15 +26,19 @@ var readBufPool = sync.Pool{
 
 // openResult holds everything produced by doOpen.
 type openResult struct {
-	file      ReadAtCloser
-	trailer   Trailer
-	metadata  []byte
-	indexBase int64
-	offsets   []int64
-	err       error
+	file    ReadAtCloser
+	trailer Trailer
+	offsets []int64
+	appData []byte
+
+	// Decoded from trailer for internal use (int casts of uint32 trailer fields).
+	totalItems int
+	recordSize int
+
+	err error
 }
 
-// Reader provides random access to records in a packfile.
+// Reader provides random access to items in a packfile.
 // Safe for concurrent use by multiple goroutines.
 //
 // Open returns immediately; all file I/O runs in a background goroutine.
@@ -44,24 +48,29 @@ type Reader struct {
 	ch        <-chan openResult
 	once      sync.Once
 	closeOnce sync.Once
-	file      ReadAtCloser
-	trailer   Trailer
-	metadata  []byte
-	indexBase int64
-	offsets   []int64
-	openErr   error
-	closeErr  error
+
+	openResult  // embedded: file, trailer, offsets, metadata fields
+	concurrency int
+
+	openErr  error
+	closeErr error
+}
+
+// ReaderOption configures Reader behavior.
+type ReaderOption func(*Reader)
+
+// WithConcurrency sets the max parallel goroutines for ReadItems.
+// Values less than 1 are clamped to 1. Default 8.
+func WithConcurrency(n int) ReaderOption {
+	return func(r *Reader) { r.concurrency = n }
 }
 
 // drain receives the goroutine result and populates all Reader fields.
 func (r *Reader) drain() {
 	res := <-r.ch
-	r.file = res.file
-	r.trailer = res.trailer
-	r.metadata = res.metadata
-	r.indexBase = res.indexBase
-	r.offsets = res.offsets
 	r.openErr = res.err
+	res.err = nil
+	r.openResult = res
 }
 
 // waitOpen blocks until the background Open goroutine has finished.
@@ -71,11 +80,20 @@ func (r *Reader) waitOpen() error {
 }
 
 // Open returns a Reader immediately. All file I/O (open, stat, speculative
-// read, trailer parse, index decode) runs in a background goroutine.
-// Open never fails; errors are deferred to the first method that needs
-// the result. Close must always be called.
-func Open(path string) *Reader {
+// read, trailer parse, index decode, app data read) runs in a background
+// goroutine. Open never fails; errors are deferred to the first method that
+// needs the result. Close must always be called.
+func Open(path string, opts ...ReaderOption) *Reader {
+	r := &Reader{concurrency: defaultConcurrency}
+	for _, opt := range opts {
+		opt(r)
+	}
+	if r.concurrency < 1 {
+		r.concurrency = 1
+	}
+
 	ch := make(chan openResult, 1)
+	r.ch = ch
 	go func() {
 		defer func() {
 			if rv := recover(); rv != nil {
@@ -84,7 +102,7 @@ func Open(path string) *Reader {
 		}()
 		ch <- doOpen(path)
 	}()
-	return &Reader{ch: ch}
+	return r
 }
 
 // doOpen performs all synchronous I/O for opening a packfile.
@@ -119,7 +137,7 @@ func doOpen(path string) openResult {
 		return openResult{err: err}
 	}
 
-	// Parse trailer from last 32 bytes of speculativeBuf.
+	// Parse 64-byte trailer from end of speculativeBuf.
 	tb := speculativeBuf[len(speculativeBuf)-trailerSize:]
 
 	m := binary.LittleEndian.Uint32(tb[0:])
@@ -130,41 +148,60 @@ func doOpen(path string) openResult {
 	if v != version {
 		return openResult{err: ErrVersion}
 	}
+	flags := tb[5]
 	recordCount := int(binary.LittleEndian.Uint32(tb[6:]))
-	indexSize := int(binary.LittleEndian.Uint32(tb[10:]))
-	metadataSize := int(binary.LittleEndian.Uint32(tb[14:]))
-	storedTrailerCRC := binary.LittleEndian.Uint32(tb[18:])
+	totalItems := int(binary.LittleEndian.Uint32(tb[10:]))
+	recordSize := int(binary.LittleEndian.Uint32(tb[14:]))
+	indexSize := int(binary.LittleEndian.Uint32(tb[18:]))
+	appDataSize := int(binary.LittleEndian.Uint32(tb[22:]))
+	var contentHash [32]byte
+	copy(contentHash[:], tb[26:58])
+	storedCRC := binary.LittleEndian.Uint32(tb[60:])
 
-	if storedTrailerCRC != CRC32C(tb[0:18]) {
-		return openResult{err: ErrChecksum}
+	// Validate flags.
+	if flags&^knownFlags != 0 {
+		return openResult{err: fmt.Errorf("packfile: unknown trailer flags: %02x", flags)}
+	}
+	hasContentHash := flags&flagContentHash != 0
+	var format RecordFormat
+	switch {
+	case flags&flagNoCompression == 0:
+		format = Compressed
+	case flags&flagNoCRC != 0:
+		format = Raw
+	default:
+		format = Uncompressed
+	}
+	if !hasContentHash {
+		contentHash = [32]byte{}
 	}
 
-	indexBase := fileSize - int64(trailerSize) - int64(metadataSize) - int64(indexSize)
+	indexBase := fileSize - int64(trailerSize) - int64(appDataSize) - int64(indexSize)
 	if indexBase < 0 {
 		return openResult{err: ErrSize}
 	}
 
-	// Tail = index + metadata + trailer. Check if speculativeBuf captured it all.
-	tailSize := int64(indexSize) + int64(metadataSize) + int64(trailerSize)
+	// Tail = index + appData + trailer.
+	tailSize := int64(indexSize) + int64(appDataSize) + int64(trailerSize)
 
 	var indexBuf []byte
-	var metadata []byte
+	var appData []byte
 
 	if tailSize <= speculativeSize {
-		// Everything is in speculativeBuf — no additional reads needed.
+		// Everything is in speculativeBuf.
 		tailStart := len(speculativeBuf) - int(tailSize)
 
 		indexBuf = make([]byte, indexSize+7) // +7 for safe 8-byte overshoot
 		copy(indexBuf, speculativeBuf[tailStart:tailStart+indexSize])
 
-		if metadataSize > 0 {
-			metadata = make([]byte, metadataSize)
-			metaStart := tailStart + indexSize
-			copy(metadata, speculativeBuf[metaStart:metaStart+metadataSize])
+		if appDataSize > 0 {
+			appData = make([]byte, appDataSize)
+			adStart := tailStart + indexSize
+			copy(appData, speculativeBuf[adStart:adStart+appDataSize])
 		}
 	} else {
-		// Index + metadata too large for speculativeBuf — single fallback read.
-		readSize := indexSize + metadataSize
+		// Index + appData too large for speculativeBuf — single fallback read.
+		readSize := indexSize + appDataSize
 		buf := make([]byte, readSize+7) // +7 for safe 8-byte overshoot in DecodeGroup
 		if readSize > 0 {
 			if _, err := f.ReadAt(buf[:readSize], indexBase); err != nil {
@@ -173,10 +210,20 @@ func doOpen(path string) openResult {
 		}
 
 		indexBuf = buf[:indexSize+7]
-		if metadataSize > 0 {
-			metadata = make([]byte, metadataSize)
-			copy(metadata, buf[indexSize:indexSize+metadataSize])
+		if appDataSize > 0 {
+			appData = make([]byte, appDataSize)
+			copy(appData, buf[indexSize:indexSize+appDataSize])
 		}
+	}
+
+	// CRC verification: CRC32C(appData || trailer[0:60]) == storedCRC.
+	crc := crc32.New(crc32cTable)
+	if appDataSize > 0 {
+		crc.Write(appData)
+	}
+	crc.Write(tb[:60])
+	if crc.Sum32() != storedCRC {
+		return openResult{err: ErrChecksum}
 	}
 
 	offsets, err := decodeIndex(indexBuf, recordCount, indexSize, indexBase)
@@ -184,123 +231,111 @@ func doOpen(path string) openResult {
 		return openResult{err: err}
 	}
 
-	cleanup = false
-	return openResult{
+	// Validate recordSize.
+	if recordSize <= 0 && recordCount > 0 {
+		return openResult{err: fmt.Errorf("packfile: invalid recordSize %d in trailer", recordSize)}
+	}
+
+	// Cross-validate: number of records implied by totalItems must match recordCount.
+	if recordSize > 0 {
+		expectedRecords := (totalItems + recordSize - 1) / recordSize
+		if totalItems == 0 {
+			expectedRecords = 0
+		}
+		if expectedRecords != recordCount {
+			return openResult{err: fmt.Errorf("packfile: trailer says %d items / %d recordSize = %d records, but packfile has %d records",
+				totalItems, recordSize, expectedRecords, recordCount)}
+		}
+	}
+
+	res := openResult{
 		file: f,
 		trailer: Trailer{
-			Version:         v,
-			RecordCount:     uint32(recordCount),
-			IndexSize:       uint32(indexSize),
-			MetadataSize:    uint32(metadataSize),
-			TrailerChecksum: storedTrailerCRC,
+			Version:        v,
+			RecordCount:    uint32(recordCount),
+			TotalItems:     uint32(totalItems),
+			RecordSize:     uint32(recordSize),
+			IndexSize:      uint32(indexSize),
+			AppDataSize:    uint32(appDataSize),
+			ContentHash:    contentHash,
+			Format:         format,
+			HasContentHash: hasContentHash,
+			Checksum:       storedCRC,
 		},
-		metadata:  metadata,
-		indexBase: indexBase,
-		offsets:   offsets,
+		offsets:    offsets,
+		appData:    appData,
+		totalItems: totalItems,
+		recordSize: recordSize,
 	}
+
+	// Default recordSize for empty files (writer stores the configured value,
+	// e.g. 128, but a hand-crafted file could have 0). Patch both the internal
+	// field and the Trailer to keep them consistent.
+	if res.recordSize == 0 {
+		res.recordSize = 1
+		res.trailer.RecordSize = 1
+	}
+
+	cleanup = false
+	return res
 }
 
-func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([]int64, error) {
-	if indexSize < 4 {
-		return nil, fmt.Errorf("%w: index too small (%d bytes)", ErrCorrupt, indexSize)
-	}
-
-	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
-	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
-	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
-	maxRecords := maxGroups * groupSize
-	if recordCount > maxRecords {
-		return nil, fmt.Errorf("%w: recordCount %d implausible for indexSize %d", ErrCorrupt, recordCount, indexSize)
-	}
-
-	// Verify CRC32C over raw index bytes (all groups, excluding trailing 4-byte CRC).
-	payloadLen := indexSize - 4
-	storedCRC := binary.LittleEndian.Uint32(buf[payloadLen:])
-	if storedCRC != CRC32C(buf[:payloadLen]) {
-		return nil, ErrChecksum
-	}
-
-	offsets := make([]int64, recordCount+1)
-	idx := 0
-	pos := 0
-	offset := int64(0)
-
-	groupCount := (recordCount + groupSize - 1) / groupSize
-
-	var values []uint32
-	for g := range groupCount {
-		limit := groupSize
-		if g == groupCount-1 && recordCount%groupSize != 0 {
-			limit = recordCount % groupSize
-		}
-
-		if pos >= payloadLen {
-			return nil, fmt.Errorf("%w: index decode overran payload at group %d (pos %d >= %d)", ErrCorrupt, g, pos, payloadLen)
-		}
-
-		var size int
-		var err error
-		values, size, err = intpack.DecodeGroup(buf[pos:], limit, values)
-		if err != nil {
-			return nil, fmt.Errorf("%w: index group %d: %w", ErrCorrupt, g, err)
-		}
-		for _, v := range values {
-			offsets[idx] = offset
-			idx++
-			offset += int64(v)
-		}
-		pos += size
-	}
-
-	// Structural sanity check: running sum must arrive at indexBase.
-	if offset != indexBase {
-		return nil, fmt.Errorf("%w: final offset %d != indexBase %d", ErrCorrupt, offset, indexBase)
-	}
-	offsets[recordCount] = indexBase
-
-	return offsets, nil
-}
-
-func (r *Reader) resolveOffsetPair(index int) (start, end int64, err error) {
-	if index < 0 || index >= int(r.trailer.RecordCount) {
-		return 0, 0, fmt.Errorf("%w: %d not in [0, %d)",
-			ErrIndexRange, index, r.trailer.RecordCount)
-	}
-	return r.offsets[index], r.offsets[index+1], nil
-}
-
-// ReadRecord reads a single record into a caller-provided buffer.
-// Returns a slice of buf (possibly reallocated if buf is too small).
-// Caller must reassign: buf, err = r.ReadRecord(index, buf)
-//
-// Note: the packfile format does not include per-record checksums.
-// Data integrity for individual records must be provided by an upper
-// layer (e.g. zstd content checksums in the eventstore package).
-func (r *Reader) ReadRecord(index int, buf []byte) ([]byte, error) {
+// TotalItems returns the total number of logical items in the packfile.
+func (r *Reader) TotalItems() (int, error) {
 	if err := r.waitOpen(); err != nil {
-		return buf, err
+		return 0, err
 	}
-	start, end, err := r.resolveOffsetPair(index)
-	if err != nil {
-		return buf, err
-	}
-	size := int(end - start)
-	if cap(buf) < size {
-		buf = make([]byte, size)
-	} else {
-		buf = buf[:size]
-	}
-	if _, err := r.file.ReadAt(buf, start); err != nil {
-		return buf, err
-	}
-	return buf, nil
+	return r.totalItems, nil
 }
 
-// ReadRecords returns an iterator over count consecutive records
-// starting at index. Reads in batches using a pooled 1MB buffer.
-// Each yielded []byte is valid only until the next iteration —
-// copy if you need to retain it. Safe to break early. Thread-safe.
-func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
+// getDecoder returns a pooled decoder configured for this reader's format.
+func (r *Reader) getDecoder() *decoder {
+	rd := getDecoder()
+	rd.format = r.trailer.Format
+	rd.totalItems = r.totalItems
+	rd.recordSize = r.recordSize
+	return rd
+}
+
+// ReadItem reads a single item by global index.
+// Returns ErrIndexRange if index is out of [0, TotalItems).
+// The caller owns the returned slice.
+func (r *Reader) ReadItem(index int) ([]byte, error) {
+	if err := r.waitOpen(); err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= r.totalItems {
+		return nil, ErrIndexRange
+	}
+
+	recordIdx := index / r.recordSize
+	localIdx := index % r.recordSize
+
+	rd := r.getDecoder()
+	defer putDecoder(rd)
+
+	start, end := r.offsets[recordIdx], r.offsets[recordIdx+1]
+	size := int(end - start)
+	if cap(rd.scratch) < size {
+		rd.scratch = make([]byte, size)
+	} else {
+		rd.scratch = rd.scratch[:size]
+	}
+	if _, err := r.file.ReadAt(rd.scratch, start); err != nil {
+		return nil, err
+	}
+	if err := rd.Decode(rd.scratch, recordIdx); err != nil {
+		return nil, err
+	}
+	return rd.EntryCopy(localIdx), nil
+}
+
+// ReadRange returns an iterator over count contiguous items starting at start.
+// Consecutive records are coalesced into single ReadAt calls using a pooled
+// 1MB buffer, minimizing I/O syscalls for large ranges.
+// Each yielded []byte is valid only until the next iteration — copy if you
+// need to retain it. Safe to break early. Thread-safe.
+func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
 		if count == 0 {
 			return
@@ -311,39 +346,63 @@ func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
 			return
 		}
 
-		if index < 0 || count < 0 || index+count > int(r.trailer.RecordCount) {
-			panic(fmt.Sprintf("packfile: ReadRecords(%d, %d) out of range [0, %d)",
-				index, count, r.trailer.RecordCount))
+		if start < 0 || count < 0 || start > r.totalItems || count > r.totalItems-start {
+			panic(fmt.Sprintf("packfile: ReadRange(%d, %d) out of range [0, %d)",
+				start, count, r.totalItems))
 		}
+
+		firstRecord := start / r.recordSize
+		lastRecord := (start + count - 1) / r.recordSize
+		end := start + count // one past last item
+
+		rd := r.getDecoder()
+		defer putDecoder(rd)
 
 		bp := readBufPool.Get().(*[]byte)
 		buf := *bp
 		defer readBufPool.Put(bp)
 
-		i := index
-		end := index + count
+		globalIdx := start
 
-		for i < end {
-			// Compute batch: consecutive records fitting in buf.
-			// batchEnd is exclusive — batch covers [batchStart, batchEnd).
-			batchStart := i
+		// yieldRecord decodes a record and yields the items within the
+		// [globalIdx, end) range. Returns false if the consumer broke early.
+		yieldRecord := func(recData []byte, recIdx int) bool {
+			if err := rd.Decode(recData, recIdx); err != nil {
+				yield(nil, err)
+				return false
+			}
+			recStart := recIdx * r.recordSize
+			lo := globalIdx - recStart
+			hi := min(len(rd.sizes), end-recStart)
+			for i := lo; i < hi; i++ {
+				if !yield(rd.Entry(i), nil) {
+					return false
+				}
+				globalIdx++
+			}
+			return true
+		}
+
+		// Batch consecutive records into single ReadAt calls.
+		batchStart := firstRecord
+		for batchStart <= lastRecord {
 			batchEnd := batchStart + 1
-			for batchEnd < end && r.offsets[batchEnd+1]-r.offsets[batchStart] <= int64(len(buf)) {
+			for batchEnd <= lastRecord && r.offsets[batchEnd+1]-r.offsets[batchStart] <= int64(len(buf)) {
 				batchEnd++
 			}
 
 			// If a single record exceeds the buffer, allocate one-off.
-			recSize := r.offsets[batchStart+1] - r.offsets[batchStart]
-			if recSize > int64(len(buf)) {
-				oneOff := make([]byte, recSize)
+			recBytes := r.offsets[batchStart+1] - r.offsets[batchStart]
+			if recBytes > int64(len(buf)) {
+				oneOff := make([]byte, recBytes)
 				if _, err := r.file.ReadAt(oneOff, r.offsets[batchStart]); err != nil {
 					yield(nil, err)
 					return
 				}
-				if !yield(oneOff, nil) {
+				if !yieldRecord(oneOff, batchStart) {
 					return
 				}
-				i = batchStart + 1
+				batchStart++
 				continue
 			}
 
@@ -355,26 +414,244 @@ func (r *Reader) ReadRecords(index, count int) iter.Seq2[[]byte, error] {
 				return
 			}
 
-			// Yield subslices.
 			for j := batchStart; j < batchEnd; j++ {
 				lo := r.offsets[j] - r.offsets[batchStart]
 				hi := r.offsets[j+1] - r.offsets[batchStart]
-				if !yield(readBuf[lo:hi], nil) {
+				if !yieldRecord(readBuf[lo:hi], j) {
 					return
 				}
 			}
 
-			i = batchEnd
+			batchStart = batchEnd
 		}
 	}
 }
 
-// RecordCount returns the number of records in the packfile.
-func (r *Reader) RecordCount() (int, error) {
-	if err := r.waitOpen(); err != nil {
-		return 0, err
+// ReadItems reads items at scattered indices with parallel I/O + decode,
+// yielding results in index order. Each yielded []byte is valid only until
+// the next iteration — copy if you need to retain it.
+//
+// Indices are grouped by record, then consecutive records are partitioned
+// into I/O batches (≤ 1MB each) upfront. Workers claim batches via a simple
+// atomic counter — no CAS coalescing needed.
+//
+// indices must be sorted ascending with no duplicates.
+// Panics if any index is out of [0, TotalItems) or if indices are not sorted/unique.
+func (r *Reader) ReadItems(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
+	return func(yield func([]byte, error) bool) {
+		if len(indices) == 0 {
+			return
+		}
+
+		if err := r.waitOpen(); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		// Validate bounds and sorted+unique invariant.
+		for i, idx := range indices {
+			if idx < 0 || idx >= r.totalItems {
+				panic(fmt.Sprintf("packfile: ReadItems index %d out of range [0, %d)",
+					idx, r.totalItems))
+			}
+			if i > 0 && indices[i] <= indices[i-1] {
+				panic(fmt.Sprintf("packfile: ReadItems indices not sorted/unique at position %d: %d <= %d",
+					i, indices[i], indices[i-1]))
+			}
+		}
+
+		// Partition indices into I/O batches in a single pass. Consecutive
+		// records whose total bytes ≤ readBufSize share a batch (single
+		// ReadAt). Non-consecutive records, buffer overflow, or exceeding
+		// the per-batch item cap start a new batch. The cap ensures enough
+		// batches for full worker utilization.
+		type ioBatch struct {
+			idxStart    int // first position in indices[]
+			idxEnd      int // one past last position in indices[]
+			firstRecord int // first record in batch (for ReadAt offset)
+			lastRecord  int // last record in batch (for ReadAt end)
+		}
+		maxPerBatch := max(1, (len(indices)+r.concurrency-1)/r.concurrency)
+		batches := make([]ioBatch, 0, r.concurrency)
+		batchIdxStart := 0
+		firstRec := indices[0] / r.recordSize
+		lastRec := firstRec
+		batchBytes := r.offsets[firstRec+1] - r.offsets[firstRec]
+
+		for i := 1; i < len(indices); i++ {
+			rec := indices[i] / r.recordSize
+			if rec == lastRec {
+				continue // same record, extend batch
+			}
+			recBytes := r.offsets[rec+1] - r.offsets[rec]
+			if rec == lastRec+1 &&
+				batchBytes+recBytes <= int64(readBufSize) &&
+				i-batchIdxStart < maxPerBatch {
+				batchBytes += recBytes
+				lastRec = rec
+			} else {
+				batches = append(batches, ioBatch{batchIdxStart, i, firstRec, lastRec})
+				batchIdxStart = i
+				firstRec = rec
+				lastRec = rec
+				batchBytes = recBytes
+			}
+		}
+		batches = append(batches, ioBatch{batchIdxStart, len(indices), firstRec, lastRec})
+
+		// Early check: if context is already canceled, return the error immediately.
+		if err := ctx.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		// Batch-level pipeline. Workers send one result
+		// per I/O batch (not per record), eliminating per-record channel
+		// ops, decoder pool round-trips, and reorder map operations.
+		type batchResult struct {
+			batchIdx int
+			items    [][]byte
+			err      error
+		}
+
+		numWorkers := min(len(batches), r.concurrency)
+		resultCh := make(chan batchResult, numWorkers)
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Workers: claim batches via atomic counter, read + decode entire
+		// batch, copy requested items, send one result per batch.
+		var nextBatch atomic.Int64
+		var wg sync.WaitGroup
+		wg.Add(numWorkers)
+		for range numWorkers {
+			go func() {
+				defer wg.Done()
+				rd := r.getDecoder()
+				defer putDecoder(rd)
+				bp := readBufPool.Get().(*[]byte)
+				buf := *bp
+				defer func() { *bp = buf; readBufPool.Put(bp) }()
+
+				for {
+					bi := int(nextBatch.Add(1)) - 1
+					if bi >= len(batches) || ctx.Err() != nil {
+						return
+					}
+					batch := batches[bi]
+
+					readStart := r.offsets[batch.firstRecord]
+					readEnd := r.offsets[batch.lastRecord+1]
+					readSize := readEnd - readStart
+
+					var readBuf []byte
+					if readSize <= int64(len(buf)) {
+						readBuf = buf[:readSize]
+					} else {
+						readBuf = make([]byte, readSize)
+					}
+
+					if _, err := r.file.ReadAt(readBuf, readStart); err != nil {
+						resultCh <- batchResult{batchIdx: bi, err: err}
+						return
+					}
+
+					// Decode records on demand, copy requested items.
+					items := make([][]byte, 0, batch.idxEnd-batch.idxStart)
+					prevRec := -1
+					for k := batch.idxStart; k < batch.idxEnd; k++ {
+						rec, localIdx := indices[k]/r.recordSize, indices[k]%r.recordSize
+						if rec != prevRec {
+							recOff := r.offsets[rec] - readStart
+							recEnd := r.offsets[rec+1] - readStart
+							if err := rd.Decode(readBuf[recOff:recEnd], rec); err != nil {
+								resultCh <- batchResult{batchIdx: bi, err: err}
+								return
+							}
+							prevRec = rec
+						}
+						items = append(items, rd.EntryCopy(localIdx))
+					}
+					resultCh <- batchResult{batchIdx: bi, items: items}
+				}
+			}()
+		}
+		go func() { wg.Wait(); close(resultCh) }()
+
+		// Consumer: inline reorder at batch granularity.
+		pending := make(map[int]batchResult)
+		nextIdx := 0
+		for res := range resultCh {
+			if res.err != nil {
+				cancel()
+				yield(nil, res.err)
+				for range resultCh {} // drain so workers can exit
+				return
+			}
+			pending[res.batchIdx] = res
+			for br, ok := pending[nextIdx]; ok; br, ok = pending[nextIdx] {
+				delete(pending, nextIdx)
+				for _, item := range br.items {
+					if !yield(item, nil) {
+						cancel()
+						for range resultCh {} // drain so workers can exit
+						return
+					}
+				}
+				nextIdx++
+			}
+		}
 	}
-	return int(r.trailer.RecordCount), nil
+}
+
+// ContentHash returns the SHA-256 content hash stored in the trailer, if present.
+func (r *Reader) ContentHash() ([32]byte, bool, error) {
+	if err := r.waitOpen(); err != nil {
+		return [32]byte{}, false, err
+	}
+	return r.trailer.ContentHash, r.trailer.HasContentHash, nil
+}
+
+// AppData returns the app data section, or nil if appDataSize == 0.
+func (r *Reader) AppData() ([]byte, error) {
+	if err := r.waitOpen(); err != nil {
+		return nil, err
+	}
+	return r.appData, nil
+}
+
+// Verify recomputes the SHA-256 content hash by streaming all items and
+// compares it to the hash stored in the trailer. Returns nil if no hash is
+// stored or if the hash matches.
+func (r *Reader) Verify(ctx context.Context) error {
+	if err := r.waitOpen(); err != nil {
+		return err
+	}
+	if !r.trailer.HasContentHash {
+		return nil
+	}
+
+	hasher := newContentHasher(r.recordSize)
+	i := 0
+	for item, err := range r.ReadRange(0, r.totalItems) {
+		if err != nil {
+			return err
+		}
+		hasher.Add(item)
+		i++
+		if i%r.recordSize == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+	}
+	computed := hasher.Sum()
+	if computed != r.trailer.ContentHash {
+		return fmt.Errorf("packfile: %w: expected %x, got %x",
+			ErrContentHashMismatch, r.trailer.ContentHash, computed)
+	}
+	return nil
 }
 
 // Trailer returns the parsed trailer.
@@ -383,19 +660,6 @@ func (r *Reader) Trailer() (Trailer, error) {
 		return Trailer{}, err
 	}
 	return r.trailer, nil
-}
-
-// Metadata returns a copy of the opaque metadata stored in the packfile.
-func (r *Reader) Metadata() ([]byte, error) {
-	if err := r.waitOpen(); err != nil {
-		return nil, err
-	}
-	if r.metadata == nil {
-		return nil, nil
-	}
-	out := make([]byte, len(r.metadata))
-	copy(out, r.metadata)
-	return out, nil
 }
 
 // Close releases all resources. Safe to call multiple times.
@@ -408,187 +672,4 @@ func (r *Reader) Close() error {
 		}
 	})
 	return r.closeErr
-}
-
-// workItem represents a contiguous run of record indices to read.
-type workItem struct {
-	inputStart  int // position in the original indices slice
-	recordStart int // first record index
-	count       int // number of consecutive records
-}
-
-// partitionRuns scans sorted, unique indices and partitions them into
-// consecutive runs, splitting runs longer than maxRunLen so that multiple
-// workers can process chunks of a large consecutive run in parallel.
-// Each run of count consecutive records starting at recordStart maps
-// back to indices[inputStart:inputStart+count].
-func partitionRuns(indices []int, maxRunLen int) []workItem {
-	if len(indices) == 0 {
-		return nil
-	}
-	items := make([]workItem, 0, len(indices)/2+1)
-	runStart := 0
-	for i := 1; i < len(indices); i++ {
-		if indices[i] != indices[i-1]+1 {
-			appendRuns(&items, runStart, indices[runStart], i-runStart, maxRunLen)
-			runStart = i
-		}
-	}
-	appendRuns(&items, runStart, indices[runStart], len(indices)-runStart, maxRunLen)
-	return items
-}
-
-// appendRuns adds one or more workItems for a consecutive run, splitting
-// it into chunks of at most maxRunLen records.
-func appendRuns(items *[]workItem, inputStart, recordStart, count, maxRunLen int) {
-	for count > 0 {
-		n := min(count, maxRunLen)
-		*items = append(*items, workItem{
-			inputStart:  inputStart,
-			recordStart: recordStart,
-			count:       n,
-		})
-		inputStart += n
-		recordStart += n
-		count -= n
-	}
-}
-
-// ReadScattered reads records at the given sorted, unique indices with
-// parallel I/O. It coalesces consecutive indices into batch reads and
-// distributes work across goroutines.
-//
-// process is called exactly once per element of indices:
-//   - inputPos: position in the indices slice.
-//   - data: the raw record bytes. Borrowed — do not retain after return.
-//
-// process may be called from multiple goroutines concurrently when
-// concurrency > 1; it must be safe for concurrent use.
-//
-// indices must be sorted ascending with no duplicates (panics otherwise).
-// Returns ErrIndexRange if any index is out of [0, RecordCount).
-// Context cancellation is checked between work items.
-func (r *Reader) ReadScattered(
-	ctx context.Context,
-	indices []int,
-	concurrency int,
-	process func(inputPos int, data []byte) error,
-) error {
-	if len(indices) == 0 {
-		return nil
-	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-
-	if err := r.waitOpen(); err != nil {
-		return err
-	}
-
-	rc := int(r.trailer.RecordCount)
-
-	// Validate bounds and sorted+unique invariant.
-	for i, idx := range indices {
-		if idx < 0 || idx >= rc {
-			return fmt.Errorf("%w: %d not in [0, %d)", ErrIndexRange, idx, rc)
-		}
-		if i > 0 && indices[i] <= indices[i-1] {
-			panic(fmt.Sprintf("packfile: ReadScattered indices not sorted/unique at position %d: %d <= %d",
-				i, indices[i], indices[i-1]))
-		}
-	}
-
-	// Split consecutive runs so each worker gets roughly equal chunks.
-	// This preserves batch I/O for cold storage while parallelizing
-	// decompression across workers for warm cache.
-	maxRunLen := max((len(indices)+concurrency-1)/concurrency, 1)
-	items := partitionRuns(indices, maxRunLen)
-
-	numWorkers := min(len(items), concurrency)
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var nextItem atomic.Int64
-	var wg sync.WaitGroup
-	var errOnce sync.Once
-	var firstErr error
-
-	wg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer wg.Done()
-			// Use pooled 1MB buffer for single-record reads to avoid
-			// per-goroutine allocation that becomes GC pressure across
-			// many ReadScattered calls. Released before ReadRecords
-			// (which uses its own pooled buffer) to avoid doubling memory.
-			bp := readBufPool.Get().(*[]byte)
-			buf := (*bp)[:0]
-			hasBuf := true
-			returnBuf := func() {
-				if hasBuf {
-					*bp = buf
-					readBufPool.Put(bp)
-					hasBuf = false
-				}
-			}
-			defer returnBuf()
-
-			for {
-				wi := int(nextItem.Add(1)) - 1
-				if wi >= len(items) || ctx.Err() != nil {
-					return
-				}
-
-				item := items[wi]
-
-				if item.count == 1 {
-					// Re-acquire buffer if we released it for a previous ReadRecords call.
-					if !hasBuf {
-						bp = readBufPool.Get().(*[]byte)
-						buf = (*bp)[:0]
-						hasBuf = true
-					}
-					// Single record: use ReadRecord with reusable worker buffer.
-					var err error
-					buf, err = r.ReadRecord(item.recordStart, buf)
-					if err != nil {
-						errOnce.Do(func() { firstErr = err })
-						cancel()
-						return
-					}
-					if err := process(item.inputStart, buf); err != nil {
-						errOnce.Do(func() { firstErr = err })
-						cancel()
-						return
-					}
-				} else {
-					// Release our buffer before ReadRecords, which acquires
-					// its own pooled buffer internally.
-					returnBuf()
-					// Consecutive run: batch read via ReadRecords.
-					i := 0
-					for data, err := range r.ReadRecords(item.recordStart, item.count) {
-						if err != nil {
-							errOnce.Do(func() { firstErr = err })
-							cancel()
-							return
-						}
-						if err := process(item.inputStart+i, data); err != nil {
-							errOnce.Do(func() { firstErr = err })
-							cancel()
-							return
-						}
-						i++
-					}
-				}
-			}
-		}()
-	}
-	wg.Wait()
-
-	if firstErr != nil {
-		return firstErr
-	}
-	return ctx.Err()
 }

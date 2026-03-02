@@ -18,26 +18,46 @@ const (
 	magic       = 0x534C4348 // "SLCH"
 	version     = 1
 	groupSize   = 128 // values per FOR group in the index section
-	trailerSize = 32
+	trailerSize = 64
 )
+
+// RecordFormat describes how records are stored on disk.
+type RecordFormat int
+
+const (
+	// Compressed: zstd-compressed records (default). Integrity is provided
+	// by zstd's built-in content checksum.
+	Compressed RecordFormat = iota
+
+	// Uncompressed: records stored as-is with a trailing 4-byte CRC32C.
+	Uncompressed
+
+	// Raw: records stored as-is with no integrity wrapper. Use when items
+	// are already compressed or checksummed.
+	Raw
+)
+
+// On-disk flag bits (uint8 at trailer offset 5).
+const (
+	flagNoCompression uint8 = 1 << 0
+	flagContentHash   uint8 = 1 << 1
+	flagNoCRC         uint8 = 1 << 2
+)
+
+const knownFlags = flagNoCompression | flagContentHash | flagNoCRC
 
 // Trailer holds the parsed trailer fields.
 type Trailer struct {
-	Version         uint8
-	RecordCount     uint32
-	IndexSize       uint32
-	MetadataSize    uint32
-	TrailerChecksum uint32
-}
-
-// WriterOptions configures how the packfile is written.
-type WriterOptions struct {
-	// BytesPerSync initiates background writeback of dirty pages every N bytes
-	// written. On Linux this uses sync_file_range(SYNC_FILE_RANGE_WRITE) which
-	// is non-blocking — it tells the kernel to start flushing without waiting.
-	// This spreads I/O across the write phase so the final fdatasync in Finish()
-	// has less data to flush. 0 disables (default).
-	BytesPerSync int
+	Version        uint8
+	RecordCount    uint32
+	TotalItems     uint32
+	RecordSize     uint32
+	IndexSize      uint32
+	AppDataSize    uint32
+	ContentHash    [32]byte
+	Format         RecordFormat
+	HasContentHash bool
+	Checksum       uint32
 }
 
 // Errors

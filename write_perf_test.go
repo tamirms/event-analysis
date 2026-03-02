@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tamir/events-analysis/eventstore"
+	"github.com/tamir/events-analysis/packfile"
 )
 
 // TestWriteThroughput measures end-to-end write throughput across concurrency
@@ -100,7 +101,7 @@ func TestWriteThroughput(t *testing.T) {
 		p := dir + "/bench.events"
 
 		start := time.Now()
-		ew, err := eventstore.Create(p, eventstore.WriterOptions{NoCompression: true})
+		ew, err := eventstore.Create(p, eventstore.WriterOptions{Format: packfile.Uncompressed})
 		if err != nil {
 			t.Fatal(err)
 		}

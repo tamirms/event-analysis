@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 
@@ -32,6 +32,18 @@ func setupBenchData(b *testing.B) {
 	if setupErr != nil {
 		b.Fatal(setupErr)
 	}
+}
+
+func mustEventCount(b *testing.B, r eventstore.StoreReader) int {
+	b.Helper()
+	n, err := r.EventCount()
+	if err != nil {
+		b.Fatalf("EventCount failed: %v", err)
+	}
+	if n == 0 {
+		b.Fatal("EventCount returned 0 — fixture is corrupt or missing")
+	}
+	return n
 }
 
 func doSetup() error {
@@ -141,11 +153,16 @@ func benchSeqRead(b *testing.B, r eventstore.StoreReader, n int) {
 	b.ResetTimer()
 
 	for b.Loop() {
+		count := 0
 		for ev, err := range r.ReadEvents(0, n) {
 			if err != nil {
 				b.Fatal(err)
 			}
 			_ = ev
+			count++
+		}
+		if count == 0 {
+			b.Fatal("ReadEvents yielded 0 items")
 		}
 	}
 }
@@ -154,7 +171,7 @@ func BenchmarkPackfileSeqRead(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchSeqRead(b, er, n)
 }
 
@@ -162,7 +179,7 @@ func BenchmarkRocksDBSeqRead(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchSeqRead(b, r, n)
 }
 
@@ -191,17 +208,22 @@ func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 
 	for b.Loop() {
 		indices := generateScatteredIndices(rng, numIndices, n)
+		count := 0
 		for ev, err := range r.ReadIndices(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
 			_ = ev
+			count++
+		}
+		if count != numIndices {
+			b.Fatalf("ReadIndices yielded %d items, want %d", count, numIndices)
 		}
 	}
 }
 
-// benchReadIndicesConsecutive reads indices that span consecutive blocks,
-// exercising the batch I/O path in ReadScattered.
+// benchReadIndicesConsecutive reads indices that span consecutive records,
+// exercising the batch I/O path in ReadItems.
 func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) {
 	b.Helper()
 	const blockSize = 128
@@ -218,14 +240,22 @@ func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) 
 			break
 		}
 	}
+	if len(indices) == 0 {
+		b.Fatal("no valid indices — fixture has fewer events than expected")
+	}
 	b.ResetTimer()
 
 	for b.Loop() {
+		count := 0
 		for ev, err := range r.ReadIndices(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
 			_ = ev
+			count++
+		}
+		if count != len(indices) {
+			b.Fatalf("ReadIndices yielded %d items, want %d", count, len(indices))
 		}
 	}
 }
@@ -257,12 +287,18 @@ func benchParallelReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 		rng := rand.New(rand.NewSource(rand.Int63()))
 		for pb.Next() {
 			indices := generateScatteredIndices(rng, numIndices, n)
+			count := 0
 			for ev, err := range r.ReadIndices(context.Background(), indices) {
 				if err != nil {
 					b.Error(err)
 					return
 				}
 				_ = ev
+				count++
+			}
+			if count != numIndices {
+				b.Errorf("ReadIndices yielded %d items, want %d", count, numIndices)
+				return
 			}
 		}
 	})
@@ -274,7 +310,7 @@ func BenchmarkPackfileRandomRead(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchRandomRead(b, er, n)
 }
 
@@ -282,7 +318,7 @@ func BenchmarkRocksDBRandomRead(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchRandomRead(b, r, n)
 }
 
@@ -292,7 +328,7 @@ func BenchmarkPackfileParallelRead(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchParallelRead(b, er, n)
 }
 
@@ -300,7 +336,7 @@ func BenchmarkRocksDBParallelRead(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchParallelRead(b, r, n)
 }
 
@@ -312,11 +348,16 @@ func benchReadBatch128(b *testing.B, r eventstore.StoreReader) {
 	b.ResetTimer()
 
 	for b.Loop() {
+		count := 0
 		for ev, err := range r.ReadEvents(0, batchSize) {
 			if err != nil {
 				b.Fatal(err)
 			}
 			_ = ev
+			count++
+		}
+		if count != batchSize {
+			b.Fatalf("ReadEvents yielded %d items, want %d", count, batchSize)
 		}
 	}
 }
@@ -345,11 +386,16 @@ func benchRangeScan128(b *testing.B, r eventstore.StoreReader, n int) {
 
 	for b.Loop() {
 		start := rng.Intn(n - scanLen)
+		count := 0
 		for ev, err := range r.ReadEvents(start, scanLen) {
 			if err != nil {
 				b.Fatal(err)
 			}
 			_ = ev
+			count++
+		}
+		if count != scanLen {
+			b.Fatalf("ReadEvents yielded %d items, want %d", count, scanLen)
 		}
 	}
 }
@@ -358,7 +404,7 @@ func BenchmarkPackfileRangeScan128(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchRangeScan128(b, er, n)
 }
 
@@ -366,7 +412,7 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchRangeScan128(b, r, n)
 }
 
@@ -382,7 +428,7 @@ func generateScatteredIndices(rng *rand.Rand, n, total int) []int {
 	for idx := range m {
 		indices = append(indices, idx)
 	}
-	sort.Ints(indices)
+	slices.Sort(indices)
 	return indices
 }
 
@@ -390,7 +436,7 @@ func BenchmarkPackfileReadIndices(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchReadIndices(b, er, n)
 }
 
@@ -398,7 +444,7 @@ func BenchmarkRocksDBReadIndices(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchReadIndices(b, r, n)
 }
 
@@ -406,7 +452,7 @@ func BenchmarkPackfileReadIndicesConsecutive(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchReadIndicesConsecutive(b, er, n)
 }
 
@@ -414,7 +460,7 @@ func BenchmarkRocksDBReadIndicesConsecutive(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchReadIndicesConsecutive(b, r, n)
 }
 
@@ -422,7 +468,7 @@ func BenchmarkPackfileParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
-	n, _ := er.EventCount()
+	n := mustEventCount(b, er)
 	benchParallelReadIndices(b, er, n)
 }
 
@@ -430,7 +476,7 @@ func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
-	n, _ := r.EventCount()
+	n := mustEventCount(b, r)
 	benchParallelReadIndices(b, r, n)
 }
 

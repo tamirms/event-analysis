@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -14,8 +15,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tamir/events-analysis/record"
+	"github.com/tamir/events-analysis/packfile"
 )
+
+var testCRC32CTable = crc32.MakeTable(crc32.Castagnoli)
 
 func makeEvents(n int, rng *rand.Rand) [][]byte {
 	events := make([][]byte, n)
@@ -28,14 +31,14 @@ func makeEvents(n int, rng *rand.Rand) [][]byte {
 	return events
 }
 
-func writeTestStore(t *testing.T, events [][]byte, blockSize int) string {
-	return writeTestStoreOpts(t, events, WriterOptions{BlockSize: blockSize})
+func writeTestStore(t *testing.T, events [][]byte, recordSize int) string {
+	return writeTestStoreOpts(t, events, WriterOptions{RecordSize: recordSize})
 }
 
 func TestRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	events := makeEvents(500, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -63,7 +66,7 @@ func TestPartialLastBatch(t *testing.T) {
 	rng := rand.New(rand.NewSource(43))
 	// 300 events = 2 full batches of 128 + 44 in partial
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -90,7 +93,7 @@ func TestPartialLastBatch(t *testing.T) {
 func TestReadEventsFullRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(44))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -113,12 +116,12 @@ func TestReadEventsFullRange(t *testing.T) {
 func TestReadEventsPartialRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(45))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
 
-	// Read events 120-200 (crosses block boundary at 128)
+	// Read events 120-200 (crosses record boundary at 128)
 	j := 0
 	for ev, err := range r.ReadEvents(120, 80) {
 		if err != nil {
@@ -137,7 +140,7 @@ func TestReadEventsPartialRange(t *testing.T) {
 func TestReadEventsEarlyBreak(t *testing.T) {
 	rng := rand.New(rand.NewSource(46))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -161,7 +164,7 @@ func TestReadEventsEarlyBreak(t *testing.T) {
 func TestReadEventsEmpty(t *testing.T) {
 	rng := rand.New(rand.NewSource(47))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -181,7 +184,7 @@ func TestReadEventsEmpty(t *testing.T) {
 func TestReadIndicesScattered(t *testing.T) {
 	rng := rand.New(rand.NewSource(48))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -206,7 +209,7 @@ func TestReadIndicesScattered(t *testing.T) {
 func TestReadIndicesDuplicatesPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(49))
 	events := makeEvents(100, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -223,7 +226,7 @@ func TestReadIndicesDuplicatesPanic(t *testing.T) {
 func TestReadIndicesUnsortedPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(50))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -240,7 +243,7 @@ func TestReadIndicesUnsortedPanic(t *testing.T) {
 func TestReadIndicesEarlyBreak(t *testing.T) {
 	rng := rand.New(rand.NewSource(51))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -277,7 +280,7 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 }
 
 func TestEmptyStore(t *testing.T) {
-	path := writeTestStore(t, nil, DefaultBlockSize)
+	path := writeTestStore(t, nil, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -299,7 +302,7 @@ func TestEmptyStore(t *testing.T) {
 func TestOutOfRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(53))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -323,7 +326,7 @@ func TestOutOfRange(t *testing.T) {
 func TestReadEventsPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(54))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -355,7 +358,7 @@ func TestReadEventsPanic(t *testing.T) {
 func TestSingleEvent(t *testing.T) {
 	rng := rand.New(rand.NewSource(55))
 	events := makeEvents(1, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -369,10 +372,10 @@ func TestSingleEvent(t *testing.T) {
 	}
 }
 
-func TestSmallBlockSize(t *testing.T) {
+func TestSmallRecordSize(t *testing.T) {
 	rng := rand.New(rand.NewSource(56))
 	events := makeEvents(20, rng)
-	path := writeTestStore(t, events, 3) // 3 events per block
+	path := writeTestStore(t, events, 3) // 3 events per record
 
 	r := Open(path)
 	defer r.Close()
@@ -395,7 +398,7 @@ func TestSmallBlockSize(t *testing.T) {
 		}
 	}
 
-	// Test ReadEvents across block boundary
+	// Test ReadEvents across record boundary
 	j := 0
 	for ev, err := range r.ReadEvents(2, 5) {
 		if err != nil {
@@ -411,11 +414,11 @@ func TestSmallBlockSize(t *testing.T) {
 	}
 }
 
-func TestCreateInvalidBlockSize(t *testing.T) {
+func TestCreateInvalidRecordSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.events")
-	_, err := Create(path, WriterOptions{BlockSize: -1})
+	_, err := Create(path, WriterOptions{RecordSize: -1})
 	if err == nil {
-		t.Fatal("expected error for negative blockSize")
+		t.Fatal("expected error for negative recordSize")
 	}
 }
 
@@ -475,13 +478,13 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNoCompressionRoundTrip(t *testing.T) {
+func TestUncompressedRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
 	events := makeEvents(500, rng)
 
 	// Test with Concurrency set — verifies it's correctly forced to serial.
 	path := filepath.Join(t.TempDir(), "nocomp.events")
-	w, err := Create(path, WriterOptions{NoCompression: true, Concurrency: 4})
+	w, err := Create(path, WriterOptions{Format: packfile.Uncompressed, Concurrency: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,12 +548,12 @@ func TestNoCompressionRoundTrip(t *testing.T) {
 func TestReadIndicesAllFromSingleBlock(t *testing.T) {
 	rng := rand.New(rand.NewSource(57))
 	events := makeEvents(200, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
 
-	// All indices from the first block
+	// All indices from the first record
 	indices := make([]int, 128)
 	for i := range indices {
 		indices[i] = i
@@ -573,7 +576,7 @@ func TestReadIndicesAllFromSingleBlock(t *testing.T) {
 func TestReadIndicesEmpty(t *testing.T) {
 	rng := rand.New(rand.NewSource(58))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -591,10 +594,10 @@ func TestReadIndicesEmpty(t *testing.T) {
 }
 
 func TestExactBlockMultiple(t *testing.T) {
-	// 256 events with blockSize=128 = exactly 2 full blocks, no partial
+	// 256 events with recordSize=128 = exactly 2 full records, no partial
 	rng := rand.New(rand.NewSource(59))
 	events := makeEvents(256, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -635,7 +638,7 @@ func TestExactBlockMultiple(t *testing.T) {
 func TestReadIndicesConcurrent(t *testing.T) {
 	rng := rand.New(rand.NewSource(60))
 	events := makeEvents(500, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -687,7 +690,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 func TestReadIndicesPreCanceled(t *testing.T) {
 	rng := rand.New(rand.NewSource(61))
 	events := makeEvents(100, rng)
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -717,7 +720,7 @@ func TestUniformSizeEvents(t *testing.T) {
 	for i := range events {
 		events[i] = fmt.Appendf(nil, "event-%04d-padding-data-here!", i)
 	}
-	path := writeTestStore(t, events, DefaultBlockSize)
+	path := writeTestStore(t, events, DefaultRecordSize)
 
 	r := Open(path)
 	defer r.Close()
@@ -875,10 +878,10 @@ func TestContentHashWithConcurrency(t *testing.T) {
 	}
 }
 
-func TestContentHashWithNoCompression(t *testing.T) {
+func TestContentHashUncompressed(t *testing.T) {
 	rng := rand.New(rand.NewSource(104))
 	events := makeEvents(500, rng)
-	path := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true, NoCompression: true})
+	path := writeTestStoreOpts(t, events, WriterOptions{ContentHash: true, Format: packfile.Uncompressed})
 
 	r := Open(path)
 	defer r.Close()
@@ -924,13 +927,13 @@ func TestContentHashOrderSensitive(t *testing.T) {
 	}
 }
 
-func TestContentHashNonDefaultBlockSize(t *testing.T) {
+func TestContentHashNonDefaultRecordSize(t *testing.T) {
 	rng := rand.New(rand.NewSource(110))
 	events := makeEvents(500, rng)
 
-	for _, blockSize := range []int{64, 256, 500} {
-		t.Run(fmt.Sprintf("BlockSize=%d", blockSize), func(t *testing.T) {
-			path := writeTestStoreOpts(t, events, WriterOptions{BlockSize: blockSize, ContentHash: true})
+	for _, recordSize := range []int{64, 256, 500} {
+		t.Run(fmt.Sprintf("RecordSize=%d", recordSize), func(t *testing.T) {
+			path := writeTestStoreOpts(t, events, WriterOptions{RecordSize: recordSize, ContentHash: true})
 
 			r := Open(path)
 			defer r.Close()
@@ -965,24 +968,24 @@ func TestContentHashCorruption(t *testing.T) {
 	}
 	r.Close()
 
-	// Corrupt the stored SHA-256 hash in metadata. The metadata is located at
-	// fileSize - trailerSize(32) - metadataSize. The hash starts at byte 12
-	// within the metadata (after the 12-byte standard header).
+	// Corrupt the content hash in the trailer (bytes [26:58] from trailer start).
+	// We also recompute the trailer CRC so the test validates hash mismatch, not CRC.
 	fileData, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Parse metadataSize from the trailer (bytes 14-18 from trailer start).
-	trailerStart := len(fileData) - 32
-	metadataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+14:]))
-	if metadataSize < 44 {
-		t.Fatalf("unexpected metadataSize %d (want >= 44)", metadataSize)
-	}
+	trailerStart := len(fileData) - 64
+	fileData[trailerStart+26] ^= 0xFF
 
-	// Flip a byte in the stored SHA-256 hash (byte 12 of metadata = first hash byte).
-	metadataStart := trailerStart - metadataSize
-	fileData[metadataStart+12] ^= 0xFF
+	// Recompute trailer CRC over (appData || trailer[0:60]).
+	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	crc := crc32.New(testCRC32CTable)
+	if appDataSize > 0 {
+		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
+	}
+	crc.Write(fileData[trailerStart : trailerStart+60])
+	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
 
 	corruptedPath := filepath.Join(t.TempDir(), "corrupted.events")
 	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
@@ -996,7 +999,7 @@ func TestContentHashCorruption(t *testing.T) {
 	if verifyErr == nil {
 		t.Fatal("expected error from corrupted hash")
 	}
-	if !errors.Is(verifyErr, record.ErrContentHashMismatch) {
+	if !errors.Is(verifyErr, packfile.ErrContentHashMismatch) {
 		t.Fatalf("expected ErrContentHashMismatch, got: %v", verifyErr)
 	}
 }

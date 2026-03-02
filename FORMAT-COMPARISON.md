@@ -65,12 +65,12 @@ The performance gap is structural, not tunable:
   dominates CPU overhead. 1,000 scattered reads: ~333ms for both.
 - **Parallel scattered reads:** Under 32-core parallel load with 50 indices, RocksDB's
   `BatchedMultiGetCF` nearly matches packfile's work-stealing (45µs vs 42µs).
-- **Consecutive block reads (warm):** 1,000 consecutive blocks: packfile's ReadScattered
+- **Consecutive block reads (warm):** 1,000 consecutive blocks: packfile's ReadItems
   batch I/O (2.5ms) nearly matches RocksDB's block cache locality (2.3ms). Both are
   decompression-bound (~1,000 zstd block decompressions each). Packfile splits large
   consecutive runs across workers for parallel decompression; RocksDB benefits from
   sequential prefetch in its block cache. On cold EBS, packfile pulls ahead (47ms vs
-  IOPS-limited scattered reads at 98ms) because batch `ReadRecords` is bandwidth-optimal.
+  IOPS-limited scattered reads at 98ms) because batch ReadRange is bandwidth-optimal.
 - **EBS writes:** Packfile at 8 goroutines (821 MB/s) is now 1.09x faster than RocksDB at 8
   threads (756 MB/s) on EBS, thanks to `sync_file_range(SYNC_FILE_RANGE_WRITE)` which initiates
   background writeback every 1MB during the append phase. Before this optimization, RocksDB was
@@ -90,42 +90,48 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/ + intpack/ + record/) | 1,281 | — |
+| Core format (packfile/ + intpack/) | ~1,500 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
-| Eventstore impl | 600 | 401 |
-| Bitmapindex impl | 754 | 344 |
-| **Total implementation** | **2,854** | **901** |
+| Eventstore impl (thin facade) | ~150 | 401 |
+| Bitmapindex impl | ~520 | 344 |
+| **Total implementation** | **~2,390** | **901** |
 
-RocksDB requires **~3x less code** because RocksDB handles block management, compression,
+RocksDB requires **~2.6x less code** because RocksDB handles block management, compression,
 checksums, index construction, and file format details internally. The packfile stack implements
-all of these in Go:
+all of these:
 
 - Frame-of-Reference encoding/decoding (intpack/: 186 lines)
-- Record decoding with zstd + CRC32C + trailing FOR index (record/: 193 lines)
-- Block accumulation and streaming compression pipeline (eventstore/writer.go: 275 lines)
-- Block decompression with pooled Decoders (eventstore/reader.go: 292 lines)
-- Consecutive-run coalescing + work-stealing parallel I/O (packfile/reader.go — ReadScattered)
-- MPHF construction and query (bitmapindex/writer.go: 274 lines, reader.go: 416 lines)
+- Record decoding with zstd + CRC32C + trailing FOR index (packfile/decoder.go)
+- Item accumulation, record building, and streaming compression pipeline (packfile/writer.go)
+- Item-level access with pooled Decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
+- Streaming pipeline with work-stealing parallel I/O + reorder (packfile/reader.go — ReadItems)
+- Metadata encoding, content hashing (packfile/metadata.go)
+- MPHF construction and query (bitmapindex/writer.go, reader.go)
 - Atomic write with temp file + rename + directory fsync (packfile/writer.go)
 - CRC32C checksums and trailer parsing (packfile/reader.go, packfile.go)
+
+Note: eventstore is now a thin facade (~150 lines total for reader + writer) that delegates
+entirely to packfile. The record-level logic (compression, batching, content hashing) that
+was previously in eventstore has been absorbed into packfile.
 
 ### Complexity Comparison
 
 | Aspect | Packfile | RocksDB |
 |--------|----------|---------|
-| **Compression pipeline** | Bounded channel + N workers + reorder buffer | `SetCompressionOptionsParallelThreads(N)` |
-| **Parallel read** | ReadScattered: consecutive-run batching + work-stealing | `BatchedMultiGetCF` with sorted input |
-| **Block buffer management** | sync.Pool + runtime.SetFinalizer for CGO objects | Handled internally by RocksDB |
+| **Compression pipeline** | Bounded channel + N workers + reorder buffer (packfile.Writer) | `SetCompressionOptionsParallelThreads(N)` |
+| **Parallel read** | ReadItems: record grouping + work-stealing parallel I/O | `BatchedMultiGetCF` with sorted input |
+| **Block buffer management** | sync.Pool for Decoder (owns ZSTD_DCtx) + read buffers | Handled internally by RocksDB |
 | **Index format** | FOR-128 encoding, speculative read at open | B-tree block index (automatic) |
 | **Write atomicity** | Manual temp file + rename + dir fsync | `IngestSST` with `MoveFiles(true)` |
 | **Checksums** | Manual CRC32C of index + trailer | Automatic per-block (configurable) |
 
 The packfile's complexity is concentrated in two areas that are difficult to get right:
-(1) the concurrent compression pipeline with in-order reordering, and (2) ReadScattered
-(consecutive-run batching + work-stealing dispatch in packfile/reader.go), shared by both
-eventstore and bitmapindex. These are well-tested but represent significant ongoing
-maintenance surface.
+(1) the concurrent compression pipeline with in-order reordering (packfile/writer.go), and
+(2) the ReadItems streaming pipeline (work-stealing workers → reorder goroutine → ordered output
+channel in packfile/reader.go). Both are well-tested and shared by all callers (eventstore
+and bitmapindex are thin facades). This consolidation reduces maintenance surface compared
+to the previous architecture where this logic was duplicated.
 
 RocksDB delegates these concerns to a mature, battle-tested C++ library. The tradeoff is
 a heavy CGO dependency (see Dependencies below) and less control over performance-critical
@@ -491,15 +497,15 @@ Both eventstore and bitmapindex support opt-in SHA-256 content hashing, enabled 
 `ContentHash: true` in writer options. The hash is computed incrementally during writes
 and stored in the packfile metadata (32 bytes after the standard 12-byte header).
 
-Both use a shared chunked hash scheme (`record.ContentHasher`). Entries are
-length-prefixed and grouped into chunks aligned with record boundaries (blockN for
-eventstore, batchSize for bitmapindex). Each chunk produces a SHA-256 digest; the
+Both use a shared chunked hash scheme (packfile's internal `ContentHasher`). Entries are
+length-prefixed and grouped into chunks aligned with record boundaries (RecordSize for
+eventstore, BatchSize for bitmapindex). Each chunk produces a SHA-256 digest; the
 final hash is SHA-256 of the concatenated chunk digests:
 
 ```
 chunkDigest_i = SHA-256([4B len][entry_{i*K}] ... [4B len][entry_{i*K+K-1}])
 finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
-K = recordSize (blockN for eventstore, batchSize for bitmapindex)
+K = RecordSize (BatchSize for bitmapindex)
 ```
 
 The hash depends on record size (chunk boundaries), entry order, and entry content.

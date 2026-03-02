@@ -1,4 +1,4 @@
-package record
+package packfile
 
 import (
 	"encoding/binary"
@@ -6,11 +6,8 @@ import (
 	"testing"
 
 	"github.com/tamir/events-analysis/intpack"
-	"github.com/tamir/events-analysis/packfile"
 	"github.com/tamir/events-analysis/zstd"
 )
-
-// Use the package-level crc32cTable directly (same package test).
 
 // buildRecord constructs a raw record from entries: [entry0][entry1]...[trailing FOR sizes].
 func buildRecord(entries [][]byte) []byte {
@@ -22,6 +19,13 @@ func buildRecord(entries [][]byte) []byte {
 	}
 	buf = append(buf, intpack.EncodeTrailingGroup(sizes)...)
 	return buf
+}
+
+// configTestDecoder sets up a decoder to decode a single record containing n items.
+func configTestDecoder(rd *decoder, n int, format RecordFormat) {
+	rd.format = format
+	rd.totalItems = n
+	rd.recordSize = n
 }
 
 func TestDecoderCompressed(t *testing.T) {
@@ -37,10 +41,11 @@ func TestDecoderCompressed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
+	configTestDecoder(rd, len(entries), Compressed)
 
-	if err := rd.Decode(compressed, len(entries), true); err != nil {
+	if err := rd.Decode(compressed, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
@@ -67,13 +72,14 @@ func TestDecoderUncompressed(t *testing.T) {
 	raw := buildRecord(entries)
 
 	// Append CRC32C.
-	crc := packfile.CRC32C(raw)
+	crc := CRC32C(raw)
 	raw = binary.LittleEndian.AppendUint32(raw, crc)
 
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
+	configTestDecoder(rd, len(entries), Uncompressed)
 
-	if err := rd.Decode(raw, len(entries), false); err != nil {
+	if err := rd.Decode(raw, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
@@ -87,16 +93,17 @@ func TestDecoderUncompressed(t *testing.T) {
 func TestDecoderCRC32CCorruption(t *testing.T) {
 	entries := [][]byte{[]byte("data")}
 	raw := buildRecord(entries)
-	crc := packfile.CRC32C(raw)
+	crc := CRC32C(raw)
 	raw = binary.LittleEndian.AppendUint32(raw, crc)
 
 	// Corrupt a byte in the payload.
 	raw[0] ^= 0xFF
 
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
+	configTestDecoder(rd, 1, Uncompressed)
 
-	err := rd.Decode(raw, 1, false)
+	err := rd.Decode(raw, 0)
 	if err == nil {
 		t.Fatal("expected CRC32C error")
 	}
@@ -106,37 +113,39 @@ func TestDecoderCRC32CCorruption(t *testing.T) {
 }
 
 func TestDecoderCRC32CShortRecord(t *testing.T) {
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
+	configTestDecoder(rd, 1, Uncompressed)
 
 	// 4 bytes = too short (need at least 5: 1 payload + 4 CRC).
-	err := rd.Decode([]byte{1, 2, 3, 4}, 1, false)
+	err := rd.Decode([]byte{1, 2, 3, 4}, 0)
 	if err == nil {
 		t.Fatal("expected error for short record")
 	}
 
 	// 0 bytes.
-	err = rd.Decode(nil, 1, false)
+	err = rd.Decode(nil, 0)
 	if err == nil {
 		t.Fatal("expected error for nil record")
 	}
 }
 
 func TestDecoderPool(t *testing.T) {
-	entries := [][]byte{[]byte("pooled")}
+	entries := [][]byte{[]byte("pooled"), []byte("data")}
 	raw := buildRecord(entries)
 	compressed, err := zstd.Encode(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	rd := Get()
-	if err := rd.Decode(compressed, 1, true); err != nil {
-		Put(rd)
+	rd := getDecoder()
+	configTestDecoder(rd, len(entries), Compressed)
+	if err := rd.Decode(compressed, 0); err != nil {
+		putDecoder(rd)
 		t.Fatal(err)
 	}
 	got := rd.EntryCopy(0)
-	Put(rd)
+	putDecoder(rd)
 
 	if string(got) != "pooled" {
 		t.Fatalf("got %q, want %q", got, "pooled")
@@ -151,9 +160,10 @@ func TestEntryBoundsCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
-	if err := rd.Decode(compressed, 3, true); err != nil {
+	configTestDecoder(rd, 3, Compressed)
+	if err := rd.Decode(compressed, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -178,6 +188,47 @@ func assertPanics(t *testing.T, name string, f func()) {
 	f()
 }
 
+func TestDecoderNoTrailingSizes(t *testing.T) {
+	// When recordSize=1, the entire decompressed payload is one item (no size table).
+	payload := []byte("single-item-payload")
+	compressed, err := zstd.Encode(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rd := newDecoder()
+	defer rd.Close()
+	configTestDecoder(rd, 1, Compressed)
+
+	if err := rd.Decode(compressed, 0); err != nil {
+		t.Fatal(err)
+	}
+	got := rd.Entry(0)
+	if string(got) != string(payload) {
+		t.Errorf("Entry(0) = %q, want %q", got, payload)
+	}
+}
+
+func TestDecoderRaw(t *testing.T) {
+	// When format=Raw, the data is used as-is (no decompression, no CRC).
+	entries := [][]byte{[]byte("raw"), []byte("data")}
+	raw := buildRecord(entries)
+
+	rd := newDecoder()
+	defer rd.Close()
+	configTestDecoder(rd, len(entries), Raw)
+
+	if err := rd.Decode(raw, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range entries {
+		got := rd.Entry(i)
+		if string(got) != string(want) {
+			t.Errorf("Entry(%d) = %q, want %q", i, got, want)
+		}
+	}
+}
+
 // --- Metadata tests ---
 
 func TestItemsInRecord(t *testing.T) {
@@ -199,9 +250,9 @@ func TestItemsInRecord(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ItemsInRecord(tt.total, tt.recordSize, tt.recordIdx)
+			got := itemsInRecord(tt.total, tt.recordSize, tt.recordIdx)
 			if got != tt.want {
-				t.Errorf("ItemsInRecord(%d, %d, %d) = %d, want %d",
+				t.Errorf("itemsInRecord(%d, %d, %d) = %d, want %d",
 					tt.total, tt.recordSize, tt.recordIdx, got, tt.want)
 			}
 		})
@@ -219,10 +270,11 @@ func TestDecoderReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rd := New()
+	rd := newDecoder()
 	defer rd.Close()
+	configTestDecoder(rd, 5, Compressed)
 
-	if err := rd.Decode(comp1, 5, true); err != nil {
+	if err := rd.Decode(comp1, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries1 {
@@ -239,7 +291,9 @@ func TestDecoderReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := rd.Decode(comp2, 2, true); err != nil {
+	rd.totalItems = 2
+	rd.recordSize = 2
+	if err := rd.Decode(comp2, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries2 {
@@ -254,39 +308,10 @@ func TestDecoderReuse(t *testing.T) {
 
 func TestItemsInRecordPanics(t *testing.T) {
 	// recordSize <= 0 should panic.
-	assertPanics(t, "recordSize=0", func() { ItemsInRecord(10, 0, 0) })
-	assertPanics(t, "recordSize=-1", func() { ItemsInRecord(10, -1, 0) })
+	assertPanics(t, "recordSize=0", func() { itemsInRecord(10, 0, 0) })
+	assertPanics(t, "recordSize=-1", func() { itemsInRecord(10, -1, 0) })
 
 	// recordIdx out of range should panic.
-	assertPanics(t, "recordIdx=5", func() { ItemsInRecord(300, 128, 5) })
-	assertPanics(t, "recordIdx=-1", func() { ItemsInRecord(300, 128, -1) })
-}
-
-func TestEncodeDecodeMetadata(t *testing.T) {
-	tests := []struct {
-		totalItems int
-		recordSize int
-		flags      uint32
-	}{
-		{1000, 128, 0},
-		{0, 64, FlagNoCompression},
-		{8700000, 256, 0},
-		{1, 1, 0xFFFFFFFF},
-	}
-	for _, tt := range tests {
-		total, recSize, flags, err := DecodeMetadata(EncodeMetadata(tt.totalItems, tt.recordSize, tt.flags))
-		if err != nil {
-			t.Fatalf("DecodeMetadata: %v", err)
-		}
-		if total != tt.totalItems || recSize != tt.recordSize || flags != tt.flags {
-			t.Errorf("round-trip mismatch: got (%d, %d, %d), want (%d, %d, %d)",
-				total, recSize, flags, tt.totalItems, tt.recordSize, tt.flags)
-		}
-	}
-
-	// Too-short metadata.
-	_, _, _, err := DecodeMetadata(make([]byte, 11))
-	if err == nil {
-		t.Error("expected error for short metadata")
-	}
+	assertPanics(t, "recordIdx=5", func() { itemsInRecord(300, 128, 5) })
+	assertPanics(t, "recordIdx=-1", func() { itemsInRecord(300, 128, -1) })
 }

@@ -124,7 +124,7 @@ enabling O(1) positional lookup via prefix-sum decode.
 
 For each batch size N in {32, 64, 128, 256, 512}:
 
-1. **Batch approach**: Write an eventstore via `eventstore.Create()` with `BlockSize=N`.
+1. **Batch approach**: Write an eventstore via `eventstore.Create()` with `RecordSize=N`.
    Read back the packfile trailer to extract the inter-batch index size. Compute
    intra-batch FOR-N overhead by encoding each block's event sizes via
    `packfile.EncodeGroup()`. Total file size from `os.Stat()`.

@@ -17,7 +17,7 @@ type StoreWriter interface {
 // Data lifetime:
 //   - ReadEvent returns a caller-owned copy.
 //   - ReadEvents yields slices valid only until the next iteration.
-//   - ReadIndices yields caller-owned copies.
+//   - ReadIndices yields slices valid only until the next iteration.
 type StoreReader interface {
 	EventCount() (int, error)
 	ReadEvent(index int) ([]byte, error)

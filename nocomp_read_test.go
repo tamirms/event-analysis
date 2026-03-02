@@ -12,6 +12,7 @@ import (
 
 	"github.com/tamir/events-analysis/eventstore"
 	rocksdbES "github.com/tamir/events-analysis/eventstore/rocksdb"
+	"github.com/tamir/events-analysis/packfile"
 )
 
 // TestReadThroughputNoCompression measures read throughput for packfile and
@@ -42,7 +43,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 	packPath := filepath.Join(packDir, "bench.events")
 	{
 		start := time.Now()
-		ew, err := eventstore.Create(packPath, eventstore.WriterOptions{NoCompression: true})
+		ew, err := eventstore.Create(packPath, eventstore.WriterOptions{Format: packfile.Uncompressed})
 		if err != nil {
 			t.Fatal(err)
 		}
