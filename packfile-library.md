@@ -55,10 +55,13 @@ w.Append(fingerprint[:], bitmapData) // concatenated as one entry
 r := packfile.Open("events-00042.pack")
 defer r.Close()
 
-event, _ := r.ReadItem(42) // caller owns the returned slice
+r.ReadItem(42, func(event []byte) error {
+    processEvent(event) // valid only for the duration of this call — copy if needed
+    return nil
+})
 ```
 
-`Open` returns immediately — all I/O runs in a background goroutine. `ReadItem` maps the item index to its record, reads and decodes the record, and extracts the item. The caller owns the returned slice.
+`Open` returns immediately — all I/O runs in a background goroutine. `ReadItem` maps the item index to its record, reads and decodes the record, and passes the item to the callback. The entry slice is borrowed from an internal decoder buffer and must not be retained after the callback returns.
 
 ### Reading: Sequential Scan
 
@@ -80,7 +83,7 @@ Safe to break early. No cleanup required. Each yielded `[]byte` is valid only un
 
 ### Reading: Scattered Access
 
-A bitmap query produces a set of item indices scattered across the file. `ReadItems` reads them with parallel I/O and decode, yielding results in index order:
+A bitmap query produces a set of item indices scattered across the file. `ReadItems` reads them with parallel I/O and decode, calling a callback for each item:
 
 ```go
 r := packfile.Open("events-00042.pack", packfile.WithConcurrency(8))
@@ -89,15 +92,14 @@ defer r.Close()
 // indices from bitmap intersection — sorted, unique, possibly non-contiguous
 indices := bitmapResult.ToSortedSlice()
 
-for event, err := range r.ReadItems(ctx, indices) {
-    if err != nil {
-        return err
-    }
-    processEvent(event) // valid only until next iteration
-}
+results := make([][]byte, len(indices))
+r.ReadItems(ctx, indices, func(pos int, entry []byte) error {
+    results[pos] = append([]byte(nil), entry...) // copy — entry is borrowed
+    return nil
+})
 ```
 
-`ReadItems` groups indices by record, then partitions consecutive records into I/O batches (≤ 1MB each) upfront. Workers claim batches via a simple atomic counter — no CAS needed. Results are yielded in the original index order.
+`ReadItems` groups indices by record, then partitions consecutive records into I/O batches (≤ 1MB each) upfront. Workers claim batches via a simple atomic counter. The callback is called concurrently from multiple goroutines in arbitrary order; `pos` identifies which index the entry corresponds to.
 
 ### Content Hash Verification
 
@@ -130,12 +132,15 @@ r := packfile.Open("bitmaps.pack")
 defer r.Close()
 
 slot := mphf.Lookup("USD")
-data, _ := r.ReadItem(slot) // serialized bitmap
+r.ReadItem(slot, func(data []byte) error {
+    bitmap.UnmarshalBinary(data) // data is borrowed — copy if needed
+    return nil
+})
 ```
 
 ## Goals
 
-- **O(1) random access by ordinal index.** Every `ReadItem` maps index to record via arithmetic, then reads and decodes a single record.
+- **O(1) random access by ordinal index.** Every `ReadItem` call maps index to record via arithmetic, then reads and decodes a single record.
 - **Minimal I/O.** The full index loads in one disk read on open (~112KB for 68K event blocks). After that, one disk read per record, exact size, no over-read.
 - **Compact index.** Index size depends on max record size, not file size. A file with 20KB records uses 15-bit deltas whether the file is 500MB or 50GB.
 - **Immutable after write.** No updates, no deletes. Simple, safe, predictable.
@@ -248,22 +253,28 @@ func Open(path string, opts ...ReaderOption) *Reader
 // TotalItems returns the total number of logical items in the packfile.
 func (r *Reader) TotalItems() (int, error)
 
-// ReadItem reads a single item by global index.
-// Returns ErrIndexRange if index is out of [0, TotalItems).
-// The caller owns the returned slice.
-func (r *Reader) ReadItem(index int) ([]byte, error)
+// ReadItem reads a single item by global index and passes it to fn.
+// The []byte passed to fn is borrowed and must not be retained after fn
+// returns — copy if needed. Returns ErrIndexRange if index is out of
+// [0, TotalItems).
+func (r *Reader) ReadItem(index int, fn func([]byte) error) error
 
 // ReadRange returns an iterator over count contiguous items starting at start.
 // Each yielded []byte is valid only until the next iteration — copy if you
 // need to retain it. Safe to break early. Thread-safe.
 func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error]
 
-// ReadItems reads items at scattered indices with parallel I/O + decode,
-// yielding results in index order. Each yielded []byte is valid only until
-// the next iteration — copy if you need to retain it.
+// ReadItems reads items at scattered indices with parallel I/O and calls
+// fn for each item. fn receives the position in the original indices slice
+// and a borrowed entry slice valid only for the duration of the call — copy
+// if needed.
+//
+// fn is called concurrently from multiple goroutines, in arbitrary order.
+// The pos argument identifies which index the entry corresponds to.
+//
 // indices must be sorted ascending with no duplicates.
 // Panics if any index is out of range or indices are not sorted/unique.
-func (r *Reader) ReadItems(ctx context.Context, indices []int) iter.Seq2[[]byte, error]
+func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
 
 // ContentHash returns the SHA-256 content hash stored in the trailer, if present.
 func (r *Reader) ContentHash() ([32]byte, bool, error)
@@ -518,7 +529,7 @@ On open, the reader issues a single pread of the last `min(256KB, fileSize)` byt
 
 ### ReadItem
 
-Maps item index to record index (`i / RecordSize`), gets a pooled `decoder`, reads the record via `ReadAt`, decodes (decompresses + extracts item sizes from the trailing size table), and returns the item at `i % RecordSize` as an owned copy. Returns the decoder to the pool.
+Maps item index to record index (`i / RecordSize`), gets a pooled `decoder`, reads the record via `ReadAt`, decodes (decompresses + extracts item sizes from the trailing size table), and passes the item at `i % RecordSize` to the caller's callback as a borrowed slice. The decoder stays alive during the callback, so the entry is valid for its duration. Returns the decoder to the pool after the callback returns.
 
 ### ReadRange
 
@@ -526,19 +537,13 @@ Sequential iteration with batch I/O. Computes the first and last record for the 
 
 ### ReadItems
 
-Two-pass setup then streaming pipeline:
+Single-pass setup then parallel execution:
 
-**Pass 1**: Group indices by record (O(n) linear scan — indices are sorted).
+**Setup**: Linear scan over sorted indices to partition into I/O batches. Consecutive records whose total bytes ≤ 1MB share a batch (single ReadAt). Non-consecutive records or buffer overflow start a new batch.
 
-**Pass 2**: Partition groups into I/O batches — consecutive groups whose total record bytes ≤ 1MB share a batch (single ReadAt). Non-consecutive groups or buffer overflow start a new batch. This is a simple linear scan over the small groups slice.
+**Execution**: Workers (up to `concurrency` goroutines) claim batches via an atomic counter. Each worker reads the coalesced byte range with a single ReadAt into a pooled 1MB buffer, decodes each record in the batch, and calls `fn(pos, entry)` directly with the borrowed entry. Oversized single records get one-off allocations.
 
-**Pipeline**:
-
-1. **Workers** (concurrency goroutines, work-stealing via atomic counter): each claims a batch index via `atomic.Add`, reads the coalesced byte range with a single ReadAt into a pooled 1MB buffer, then decodes each record in the batch. Oversized single records get one-off allocations. Sends decoded records (with pooled decoders) to `resultCh`.
-2. **Reorder goroutine**: receives from `resultCh`, uses a pending map + nextIdx counter to flush consecutive ready results to `outCh` in order.
-3. **Iterator**: yields entries (borrowed slices into decoder buffer) from `outCh`, returns each decoder to the pool after all entries from that record are consumed.
-
-Early break calls `cancel()` on the context, stopping workers. Decoders are drained and returned to the pool.
+No channels, no reorder goroutine — workers call `fn` directly. The caller handles ordering via the `pos` argument (position in the original indices slice). On error or context cancellation, an atomic flag stops remaining workers. A `sync.Once` captures the first error.
 
 ### Parallel Compression Pipeline
 
@@ -559,7 +564,7 @@ Before decoding the index, the reader validates that `recordCount` is plausible 
 
 ### Concurrency
 
-Safe for concurrent use after `Open`. The decoded `[]int64` offset table and metadata are immutable. Each `ReadItem` issues a stateless `ReadAt` (pread) with a pooled decoder. `ReadRange` borrows a pooled buffer and decoder. `ReadItems` coordinates parallel workers internally.
+Safe for concurrent use after `Open`. The decoded `[]int64` offset table and metadata are immutable. `ReadItem` issues a stateless `ReadAt` (pread) with a pooled decoder, calls the callback, and returns the decoder to the pool. `ReadRange` borrows a pooled buffer and decoder. `ReadItems` coordinates parallel workers internally — each worker has its own pooled decoder and buffer.
 
 ### Decoder Pool
 

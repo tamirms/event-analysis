@@ -297,15 +297,16 @@ func (r *Reader) getDecoder() *decoder {
 	return rd
 }
 
-// ReadItem reads a single item by global index.
-// Returns ErrIndexRange if index is out of [0, TotalItems).
-// The caller owns the returned slice.
-func (r *Reader) ReadItem(index int) ([]byte, error) {
+// ReadItem reads a single item by global index and passes it to fn.
+// The []byte passed to fn is borrowed and must not be retained after fn
+// returns — copy if needed. Returns ErrIndexRange if index is out of
+// [0, TotalItems).
+func (r *Reader) ReadItem(index int, fn func([]byte) error) error {
 	if err := r.waitOpen(); err != nil {
-		return nil, err
+		return err
 	}
 	if index < 0 || index >= r.totalItems {
-		return nil, ErrIndexRange
+		return ErrIndexRange
 	}
 
 	recordIdx := index / r.recordSize
@@ -322,12 +323,12 @@ func (r *Reader) ReadItem(index int) ([]byte, error) {
 		rd.scratch = rd.scratch[:size]
 	}
 	if _, err := r.file.ReadAt(rd.scratch, start); err != nil {
-		return nil, err
+		return err
 	}
 	if err := rd.Decode(rd.scratch, recordIdx); err != nil {
-		return nil, err
+		return err
 	}
-	return rd.EntryCopy(localIdx), nil
+	return fn(rd.Entry(localIdx))
 }
 
 // ReadRange returns an iterator over count contiguous items starting at start.
@@ -427,182 +428,146 @@ func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error] {
 	}
 }
 
-// ReadItems reads items at scattered indices with parallel I/O + decode,
-// yielding results in index order. Each yielded []byte is valid only until
-// the next iteration — copy if you need to retain it.
+// ReadItems reads items at scattered indices with parallel I/O and calls
+// fn for each item. fn receives the position in the original indices slice and
+// a borrowed entry slice valid only for the duration of the call — copy if
+// needed.
 //
-// Indices are grouped by record, then consecutive records are partitioned
-// into I/O batches (≤ 1MB each) upfront. Workers claim batches via a simple
-// atomic counter — no CAS coalescing needed.
+// fn is called concurrently from multiple goroutines, in arbitrary order.
+// The pos argument identifies which index the entry corresponds to.
 //
 // indices must be sorted ascending with no duplicates.
 // Panics if any index is out of [0, TotalItems) or if indices are not sorted/unique.
-func (r *Reader) ReadItems(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
-	return func(yield func([]byte, error) bool) {
-		if len(indices) == 0 {
-			return
+func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error {
+	if len(indices) == 0 {
+		return nil
+	}
+
+	if err := r.waitOpen(); err != nil {
+		return err
+	}
+
+	// Validate bounds and sorted+unique invariant.
+	for i, idx := range indices {
+		if idx < 0 || idx >= r.totalItems {
+			panic(fmt.Sprintf("packfile: ReadItems index %d out of range [0, %d)",
+				idx, r.totalItems))
 		}
-
-		if err := r.waitOpen(); err != nil {
-			yield(nil, err)
-			return
-		}
-
-		// Validate bounds and sorted+unique invariant.
-		for i, idx := range indices {
-			if idx < 0 || idx >= r.totalItems {
-				panic(fmt.Sprintf("packfile: ReadItems index %d out of range [0, %d)",
-					idx, r.totalItems))
-			}
-			if i > 0 && indices[i] <= indices[i-1] {
-				panic(fmt.Sprintf("packfile: ReadItems indices not sorted/unique at position %d: %d <= %d",
-					i, indices[i], indices[i-1]))
-			}
-		}
-
-		// Partition indices into I/O batches in a single pass. Consecutive
-		// records whose total bytes ≤ readBufSize share a batch (single
-		// ReadAt). Non-consecutive records, buffer overflow, or exceeding
-		// the per-batch item cap start a new batch. The cap ensures enough
-		// batches for full worker utilization.
-		type ioBatch struct {
-			idxStart    int // first position in indices[]
-			idxEnd      int // one past last position in indices[]
-			firstRecord int // first record in batch (for ReadAt offset)
-			lastRecord  int // last record in batch (for ReadAt end)
-		}
-		maxPerBatch := max(1, (len(indices)+r.concurrency-1)/r.concurrency)
-		batches := make([]ioBatch, 0, r.concurrency)
-		batchIdxStart := 0
-		firstRec := indices[0] / r.recordSize
-		lastRec := firstRec
-		batchBytes := r.offsets[firstRec+1] - r.offsets[firstRec]
-
-		for i := 1; i < len(indices); i++ {
-			rec := indices[i] / r.recordSize
-			if rec == lastRec {
-				continue // same record, extend batch
-			}
-			recBytes := r.offsets[rec+1] - r.offsets[rec]
-			if rec == lastRec+1 &&
-				batchBytes+recBytes <= int64(readBufSize) &&
-				i-batchIdxStart < maxPerBatch {
-				batchBytes += recBytes
-				lastRec = rec
-			} else {
-				batches = append(batches, ioBatch{batchIdxStart, i, firstRec, lastRec})
-				batchIdxStart = i
-				firstRec = rec
-				lastRec = rec
-				batchBytes = recBytes
-			}
-		}
-		batches = append(batches, ioBatch{batchIdxStart, len(indices), firstRec, lastRec})
-
-		// Early check: if context is already canceled, return the error immediately.
-		if err := ctx.Err(); err != nil {
-			yield(nil, err)
-			return
-		}
-
-		// Batch-level pipeline. Workers send one result
-		// per I/O batch (not per record), eliminating per-record channel
-		// ops, decoder pool round-trips, and reorder map operations.
-		type batchResult struct {
-			batchIdx int
-			items    [][]byte
-			err      error
-		}
-
-		numWorkers := min(len(batches), r.concurrency)
-		resultCh := make(chan batchResult, numWorkers)
-
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		// Workers: claim batches via atomic counter, read + decode entire
-		// batch, copy requested items, send one result per batch.
-		var nextBatch atomic.Int64
-		var wg sync.WaitGroup
-		wg.Add(numWorkers)
-		for range numWorkers {
-			go func() {
-				defer wg.Done()
-				rd := r.getDecoder()
-				defer putDecoder(rd)
-				bp := readBufPool.Get().(*[]byte)
-				buf := *bp
-				defer func() { *bp = buf; readBufPool.Put(bp) }()
-
-				for {
-					bi := int(nextBatch.Add(1)) - 1
-					if bi >= len(batches) || ctx.Err() != nil {
-						return
-					}
-					batch := batches[bi]
-
-					readStart := r.offsets[batch.firstRecord]
-					readEnd := r.offsets[batch.lastRecord+1]
-					readSize := readEnd - readStart
-
-					var readBuf []byte
-					if readSize <= int64(len(buf)) {
-						readBuf = buf[:readSize]
-					} else {
-						readBuf = make([]byte, readSize)
-					}
-
-					if _, err := r.file.ReadAt(readBuf, readStart); err != nil {
-						resultCh <- batchResult{batchIdx: bi, err: err}
-						return
-					}
-
-					// Decode records on demand, copy requested items.
-					items := make([][]byte, 0, batch.idxEnd-batch.idxStart)
-					prevRec := -1
-					for k := batch.idxStart; k < batch.idxEnd; k++ {
-						rec, localIdx := indices[k]/r.recordSize, indices[k]%r.recordSize
-						if rec != prevRec {
-							recOff := r.offsets[rec] - readStart
-							recEnd := r.offsets[rec+1] - readStart
-							if err := rd.Decode(readBuf[recOff:recEnd], rec); err != nil {
-								resultCh <- batchResult{batchIdx: bi, err: err}
-								return
-							}
-							prevRec = rec
-						}
-						items = append(items, rd.EntryCopy(localIdx))
-					}
-					resultCh <- batchResult{batchIdx: bi, items: items}
-				}
-			}()
-		}
-		go func() { wg.Wait(); close(resultCh) }()
-
-		// Consumer: inline reorder at batch granularity.
-		pending := make(map[int]batchResult)
-		nextIdx := 0
-		for res := range resultCh {
-			if res.err != nil {
-				cancel()
-				yield(nil, res.err)
-				for range resultCh {} // drain so workers can exit
-				return
-			}
-			pending[res.batchIdx] = res
-			for br, ok := pending[nextIdx]; ok; br, ok = pending[nextIdx] {
-				delete(pending, nextIdx)
-				for _, item := range br.items {
-					if !yield(item, nil) {
-						cancel()
-						for range resultCh {} // drain so workers can exit
-						return
-					}
-				}
-				nextIdx++
-			}
+		if i > 0 && indices[i] <= indices[i-1] {
+			panic(fmt.Sprintf("packfile: ReadItems indices not sorted/unique at position %d: %d <= %d",
+				i, indices[i], indices[i-1]))
 		}
 	}
+
+	// Batch partitioning for concurrent I/O.
+	type ioBatch struct {
+		idxStart    int
+		idxEnd      int
+		firstRecord int
+		lastRecord  int
+	}
+	maxPerBatch := max(1, (len(indices)+r.concurrency-1)/r.concurrency)
+	batches := make([]ioBatch, 0, r.concurrency)
+	batchIdxStart := 0
+	firstRec := indices[0] / r.recordSize
+	lastRec := firstRec
+	batchBytes := r.offsets[firstRec+1] - r.offsets[firstRec]
+
+	for i := 1; i < len(indices); i++ {
+		rec := indices[i] / r.recordSize
+		if rec == lastRec {
+			continue
+		}
+		recBytes := r.offsets[rec+1] - r.offsets[rec]
+		if rec == lastRec+1 &&
+			batchBytes+recBytes <= int64(readBufSize) &&
+			i-batchIdxStart < maxPerBatch {
+			batchBytes += recBytes
+			lastRec = rec
+		} else {
+			batches = append(batches, ioBatch{batchIdxStart, i, firstRec, lastRec})
+			batchIdxStart = i
+			firstRec = rec
+			lastRec = rec
+			batchBytes = recBytes
+		}
+	}
+	batches = append(batches, ioBatch{batchIdxStart, len(indices), firstRec, lastRec})
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	numWorkers := min(len(batches), r.concurrency)
+	var nextBatch atomic.Int64
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	var cancelled atomic.Bool
+
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			rd := r.getDecoder()
+			defer putDecoder(rd)
+			bp := readBufPool.Get().(*[]byte)
+			buf := *bp
+			defer func() { *bp = buf; readBufPool.Put(bp) }()
+
+			for {
+				bi := int(nextBatch.Add(1)) - 1
+				if bi >= len(batches) || cancelled.Load() {
+					return
+				}
+				if ctx.Err() != nil {
+					errOnce.Do(func() { firstErr = ctx.Err() })
+					cancelled.Store(true)
+					return
+				}
+				batch := batches[bi]
+
+				readStart := r.offsets[batch.firstRecord]
+				readEnd := r.offsets[batch.lastRecord+1]
+				readSize := readEnd - readStart
+
+				var readBuf []byte
+				if readSize <= int64(len(buf)) {
+					readBuf = buf[:readSize]
+				} else {
+					readBuf = make([]byte, readSize)
+				}
+
+				if _, err := r.file.ReadAt(readBuf, readStart); err != nil {
+					errOnce.Do(func() { firstErr = err })
+					cancelled.Store(true)
+					return
+				}
+
+				prevRec := -1
+				for k := batch.idxStart; k < batch.idxEnd; k++ {
+					rec, localIdx := indices[k]/r.recordSize, indices[k]%r.recordSize
+					if rec != prevRec {
+						recOff := r.offsets[rec] - readStart
+						recEnd := r.offsets[rec+1] - readStart
+						if err := rd.Decode(readBuf[recOff:recEnd], rec); err != nil {
+							errOnce.Do(func() { firstErr = err })
+							cancelled.Store(true)
+							return
+						}
+						prevRec = rec
+					}
+					if err := fn(k, rd.Entry(localIdx)); err != nil {
+						errOnce.Do(func() { firstErr = err })
+						cancelled.Store(true)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // ContentHash returns the SHA-256 content hash stored in the trailer, if present.

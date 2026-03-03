@@ -104,8 +104,8 @@ all of these:
 - Frame-of-Reference encoding/decoding (intpack/: 186 lines)
 - Record decoding with zstd + CRC32C + trailing FOR index (packfile/decoder.go)
 - Item accumulation, record building, and streaming compression pipeline (packfile/writer.go)
-- Item-level access with pooled Decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
-- Streaming pipeline with work-stealing parallel I/O + reorder (packfile/reader.go — ReadItems)
+- Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
+- Work-stealing parallel I/O with direct callback (packfile/reader.go — ReadItems)
 - Metadata encoding, content hashing (packfile/metadata.go)
 - MPHF construction and query (bitmapindex/writer.go, reader.go)
 - Atomic write with temp file + rename + directory fsync (packfile/writer.go)
@@ -120,7 +120,7 @@ was previously in eventstore has been absorbed into packfile.
 | Aspect | Packfile | RocksDB |
 |--------|----------|---------|
 | **Compression pipeline** | Bounded channel + N workers + reorder buffer (packfile.Writer) | `SetCompressionOptionsParallelThreads(N)` |
-| **Parallel read** | ReadItems: record grouping + work-stealing parallel I/O | `BatchedMultiGetCF` with sorted input |
+| **Parallel read** | ReadItems: record grouping + work-stealing parallel I/O + direct callback | `BatchedMultiGetCF` with sorted input |
 | **Block buffer management** | sync.Pool for Decoder (owns ZSTD_DCtx) + read buffers | Handled internally by RocksDB |
 | **Index format** | FOR-128 encoding, speculative read at open | B-tree block index (automatic) |
 | **Write atomicity** | Manual temp file + rename + dir fsync | `IngestSST` with `MoveFiles(true)` |
@@ -128,8 +128,8 @@ was previously in eventstore has been absorbed into packfile.
 
 The packfile's complexity is concentrated in two areas that are difficult to get right:
 (1) the concurrent compression pipeline with in-order reordering (packfile/writer.go), and
-(2) the ReadItems streaming pipeline (work-stealing workers → reorder goroutine → ordered output
-channel in packfile/reader.go). Both are well-tested and shared by all callers (eventstore
+(2) ReadItems parallel I/O (work-stealing workers calling a callback directly with borrowed
+entries in packfile/reader.go). Both are well-tested and shared by all callers (eventstore
 and bitmapindex are thin facades). This consolidation reduces maintenance surface compared
 to the previous architecture where this logic was duplicated.
 

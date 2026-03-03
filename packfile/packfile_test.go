@@ -45,6 +45,18 @@ func makeItems(n, size int) [][]byte {
 	return items
 }
 
+func readItemCopy(t *testing.T, r *Reader, index int) []byte {
+	t.Helper()
+	var got []byte
+	if err := r.ReadItem(index, func(entry []byte) error {
+		got = append([]byte(nil), entry...)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadItem(%d): %v", index, err)
+	}
+	return got
+}
+
 func TestRoundTrip(t *testing.T) {
 	items := makeItems(500, 1024)
 	path := writeTestPackfile(t, items, WriterOptions{})
@@ -61,11 +73,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -85,7 +93,7 @@ func TestEmptyFile(t *testing.T) {
 		t.Fatalf("TotalItems = %d, want 0", tc)
 	}
 
-	_, err = r.ReadItem(0)
+	err = r.ReadItem(0, func([]byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadItem(0) on empty: got %v, want ErrIndexRange", err)
 	}
@@ -106,11 +114,7 @@ func TestSingleItem(t *testing.T) {
 		t.Fatalf("TotalItems = %d, want 1", tc)
 	}
 
-	got, err := r.ReadItem(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, items[0]) {
+	if got := readItemCopy(t, r, 0); !bytes.Equal(got, items[0]) {
 		t.Fatal("data mismatch")
 	}
 }
@@ -150,11 +154,7 @@ func TestRecordSize1NoTrailingWaste(t *testing.T) {
 
 	// Verify roundtrip.
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -196,11 +196,7 @@ func TestRawFormat(t *testing.T) {
 
 	// Verify roundtrip.
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -224,11 +220,7 @@ func TestMultiItemRecords(t *testing.T) {
 
 	// Verify all items.
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -308,18 +300,18 @@ func TestReadItems(t *testing.T) {
 
 	// Indices spanning multiple records.
 	indices := []int{0, 1, 127, 128, 200, 299}
-	j := 0
-	for item, err := range r.ReadItems(context.Background(), indices) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(item, items[indices[j]]) {
-			t.Fatalf("ReadItems[%d] (item %d): data mismatch", j, indices[j])
-		}
-		j++
+	got := make([][]byte, len(indices))
+	err := r.ReadItems(context.Background(), indices, func(pos int, entry []byte) error {
+		got[pos] = append([]byte(nil), entry...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if j != len(indices) {
-		t.Fatalf("ReadItems yielded %d, want %d", j, len(indices))
+	for j, idx := range indices {
+		if !bytes.Equal(got[j], items[idx]) {
+			t.Fatalf("ReadItems[%d] (item %d): data mismatch", j, idx)
+		}
 	}
 }
 
@@ -335,8 +327,7 @@ func TestReadItemsDuplicatesPanic(t *testing.T) {
 			t.Fatal("expected panic for duplicate indices")
 		}
 	}()
-	for range r.ReadItems(context.Background(), []int{5, 5, 10}) {
-	}
+	r.ReadItems(context.Background(), []int{5, 5, 10}, func(int, []byte) error { return nil })
 }
 
 func TestReadItemsUnsortedPanic(t *testing.T) {
@@ -351,8 +342,7 @@ func TestReadItemsUnsortedPanic(t *testing.T) {
 			t.Fatal("expected panic for unsorted indices")
 		}
 	}()
-	for range r.ReadItems(context.Background(), []int{10, 5, 20}) {
-	}
+	r.ReadItems(context.Background(), []int{10, 5, 20}, func(int, []byte) error { return nil })
 }
 
 func TestReadItemsEmpty(t *testing.T) {
@@ -362,15 +352,16 @@ func TestReadItemsEmpty(t *testing.T) {
 	r := Open(path)
 	defer r.Close()
 
-	j := 0
-	for _, err := range r.ReadItems(context.Background(), nil) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		j++
+	called := false
+	err := r.ReadItems(context.Background(), nil, func(int, []byte) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if j != 0 {
-		t.Fatalf("empty ReadItems yielded %d, want 0", j)
+	if called {
+		t.Fatal("empty ReadItems should not call fn")
 	}
 }
 
@@ -446,8 +437,11 @@ func TestConcurrentReads(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			got, err := r.ReadItem(idx)
-			if err != nil {
+			var got []byte
+			if err := r.ReadItem(idx, func(entry []byte) error {
+				got = append([]byte(nil), entry...)
+				return nil
+			}); err != nil {
 				errs <- err
 				return
 			}
@@ -533,17 +527,17 @@ func TestReadItemOutOfRange(t *testing.T) {
 	r := Open(path)
 	defer r.Close()
 
-	_, err := r.ReadItem(-1)
+	err := r.ReadItem(-1, func([]byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadItem(-1): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadItem(5)
+	err = r.ReadItem(5, func([]byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadItem(5): got %v, want ErrIndexRange", err)
 	}
 
-	_, err = r.ReadItem(100)
+	err = r.ReadItem(100, func([]byte) error { return nil })
 	if !errors.Is(err, ErrIndexRange) {
 		t.Fatalf("ReadItem(100): got %v, want ErrIndexRange", err)
 	}
@@ -565,7 +559,7 @@ func TestOpenBadPath(t *testing.T) {
 	r := Open("/nonexistent/path/to/file.pack")
 	defer r.Close()
 
-	_, err := r.ReadItem(0)
+	err := r.ReadItem(0, func([]byte) error { return nil })
 	if err == nil {
 		t.Fatal("expected error for bad path")
 	}
@@ -774,11 +768,7 @@ func TestUncompressedRoundTrip(t *testing.T) {
 	}
 
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -800,11 +790,7 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 	}
 
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -826,11 +812,7 @@ func TestSmallRecordSize(t *testing.T) {
 	}
 
 	for i, want := range items {
-		got, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}
@@ -947,11 +929,7 @@ func TestAppDataRoundTrip(t *testing.T) {
 
 	// Verify items still readable.
 	for i, want := range items {
-		item, err := r.ReadItem(i)
-		if err != nil {
-			t.Fatalf("ReadItem(%d): %v", i, err)
-		}
-		if !bytes.Equal(item, want) {
+		if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
 			t.Fatalf("ReadItem(%d): data mismatch", i)
 		}
 	}

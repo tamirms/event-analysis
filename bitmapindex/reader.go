@@ -159,12 +159,18 @@ func (r *Reader) Lookup(f Field, key []byte) (*roaring.Bitmap, error) {
 		return nil, fmt.Errorf("bitmapindex: MPHF query: %w", err)
 	}
 
-	entry, err := r.pr.ReadItem(int(rank))
-	if err != nil {
+	var bm *roaring.Bitmap
+	if err := r.pr.ReadItem(int(rank), func(entry []byte) error {
+		var err error
+		bm, err = verifyAndDeserialize(entry, hk[:])
+		return err
+	}); err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			return nil, ErrKeyNotFound
+		}
 		return nil, fmt.Errorf("bitmapindex: read rank %d: %w", rank, err)
 	}
-
-	return verifyAndDeserialize(entry, hk[:])
+	return bm, nil
 }
 
 // LookupKeys returns bitmaps for multiple keys with parallel I/O.
@@ -225,17 +231,13 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 		}
 	}
 
-	// Stream items and match back to found keys.
-	g := 0
-	for entry, err := range r.pr.ReadItems(ctx, indices) {
-		if err != nil {
-			return nil, err
-		}
-		// All found entries for this rank are in found[groupStart[g]..next).
-		start := groupStart[g]
+	// Process items via callback — avoids per-item copy.
+	// fn is called concurrently; each outIdx is unique, so writes to out[] are safe.
+	if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
+		start := groupStart[pos]
 		end := len(found)
-		if g+1 < len(groupStart) {
-			end = groupStart[g+1]
+		if pos+1 < len(groupStart) {
+			end = groupStart[pos+1]
 		}
 		for k := start; k < end; k++ {
 			bm, err := verifyAndDeserialize(entry, found[k].hk[:])
@@ -243,11 +245,13 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 				if errors.Is(err, ErrKeyNotFound) {
 					continue
 				}
-				return nil, err
+				return err
 			}
 			out[found[k].outIdx] = bm
 		}
-		g++
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return out, nil

@@ -54,11 +54,17 @@ func (r *Reader) EventCount() (int, error) {
 // ReadEvent reads a single event by global index.
 // The caller owns the returned slice.
 func (r *Reader) ReadEvent(index int) ([]byte, error) {
-	data, err := r.pr.ReadItem(index)
-	if errors.Is(err, packfile.ErrIndexRange) {
-		return nil, ErrIndexRange
+	var data []byte
+	if err := r.pr.ReadItem(index, func(entry []byte) error {
+		data = append([]byte(nil), entry...)
+		return nil
+	}); err != nil {
+		if errors.Is(err, packfile.ErrIndexRange) {
+			return nil, ErrIndexRange
+		}
+		return nil, err
 	}
-	return data, err
+	return data, nil
 }
 
 // ReadEvents returns an iterator over count contiguous events starting at start.
@@ -69,9 +75,26 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 
 // ReadIndices reads events at scattered indices with parallel I/O.
 // indices must be sorted ascending with no duplicates.
-// Each yielded []byte is valid only until the next iteration — copy if needed.
+// Each yielded []byte is owned by the caller.
 func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
-	return r.pr.ReadItems(ctx, indices)
+	return func(yield func([]byte, error) bool) {
+		if len(indices) == 0 {
+			return
+		}
+		results := make([][]byte, len(indices))
+		if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
+			results[pos] = append([]byte(nil), entry...)
+			return nil
+		}); err != nil {
+			yield(nil, err)
+			return
+		}
+		for _, item := range results {
+			if !yield(item, nil) {
+				return
+			}
+		}
+	}
 }
 
 // ContentHash returns the SHA-256 content hash stored in the trailer, if present.
