@@ -807,11 +807,8 @@ func TestMetadataFlags(t *testing.T) {
 	// Also recompute the CRC so this tests flag rejection, not CRC failure.
 	fileData[trailerStart+5] = 0x04
 
-	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	// Recompute trailer CRC over trailer[0:60] only.
 	crc := crc32.New(testCRC32CTable)
-	if appDataSize > 0 {
-		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
-	}
 	crc.Write(fileData[trailerStart : trailerStart+60])
 	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
 
@@ -993,11 +990,8 @@ func TestContentHashCorruption(t *testing.T) {
 	fileData[trailerStart+26] ^= 0xFF
 
 	// Recompute trailer CRC.
-	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
+	// Recompute trailer CRC over trailer[0:60] only.
 	crc := crc32.New(testCRC32CTable)
-	if appDataSize > 0 {
-		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
-	}
 	crc.Write(fileData[trailerStart : trailerStart+60])
 	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
 

@@ -3,10 +3,9 @@
 // relative to the group minimum, requiring only ceil(log2(max-min)) bits
 // per value.
 //
-// Two formats are provided:
-//   - Standard: [1B width][4B min LE][packed residuals] — width-first for streaming decode.
-//   - Trailing: [4B min LE][packed residuals][1B width] — width-last for appending after
-//     variable-length data (used by record-level size indexes).
+// Layout: [packed residuals][1B width][4B min LE]
+// Width and min are always the final 5 bytes, so callers can locate metadata
+// from the tail of any buffer without knowing the packed size upfront.
 package intpack
 
 import (
@@ -15,103 +14,43 @@ import (
 	"math/bits"
 )
 
-// EncodeGroup FOR-encodes values into one group: [1B W][4B min LE][packed residuals].
+// EncodeGroup FOR-encodes values into one group: [packed residuals][1B W][4B min LE].
 // W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
 // Panics if len(values) == 0.
 func EncodeGroup(values []uint32) []byte {
 	minVal, width := rangeWidth(values)
 	packSize := (int(width)*len(values) + 7) / 8
-	buf := make([]byte, 5+packSize+7) // header + packed + 7 overshoot for safe writes
-
-	buf[0] = width
-	binary.LittleEndian.PutUint32(buf[1:], minVal)
-	packResiduals(buf, 5, values, minVal, width)
-
-	return buf[:5+packSize]
+	buf := make([]byte, packSize+5+7) // packed + footer(1B W, 4B min) + 7 overshoot for safe writes
+	packResiduals(buf, 0, values, minVal, width)
+	buf[packSize] = width
+	binary.LittleEndian.PutUint32(buf[packSize+1:], minVal)
+	return buf[:packSize+5]
 }
 
-// DecodeGroup FOR-decodes one group of n values from data into dst.
-// Returns values (possibly reallocated if dst is too small), bytes consumed,
-// and any error. data must have 7 bytes of overshoot past the encoded
-// payload for safe 8-byte reads.
-func DecodeGroup(data []byte, n int, dst []uint32) (values []uint32, size int, err error) {
+// DecodeGroup FOR-decodes one group of n values from the tail of buf.
+// buf must end at the last byte of [min] (the byte before any trailing CRC or other data).
+// Returns decoded values (written into dst[0:n], reallocating if cap(dst) < n),
+// bytes consumed from the tail, and any error.
+func DecodeGroup(buf []byte, n int, dst []uint32) (values []uint32, consumed int, err error) {
 	if n <= 0 {
 		return dst, 0, fmt.Errorf("intpack: DecodeGroup n must be > 0, got %d", n)
 	}
-	if len(data) < 5 {
-		return dst, 0, fmt.Errorf("intpack: DecodeGroup data too short (%d bytes, need >= 5)", len(data))
+	if len(buf) < 5 {
+		return dst, 0, fmt.Errorf("intpack: DecodeGroup buf too short (%d bytes, need >= 5)", len(buf))
+	}
+	width := uint64(buf[len(buf)-5])
+	if width > 32 {
+		return dst, 0, fmt.Errorf("intpack: invalid FOR width %d (max 32)", width)
+	}
+	groupMin := binary.LittleEndian.Uint32(buf[len(buf)-4:])
+	packSize := (int(width)*n + 7) / 8
+	consumed = packSize + 5
+	if len(buf) < consumed {
+		return dst, 0, fmt.Errorf("intpack: DecodeGroup buf too short for payload (%d bytes, need >= %d)", len(buf), consumed)
 	}
 	dst = ensureCap(dst, n)
-	w := uint64(data[0])
-	if w > 32 {
-		return dst, 0, fmt.Errorf("intpack: invalid FOR width %d (max 32)", w)
-	}
-	groupMin := binary.LittleEndian.Uint32(data[1:])
-	packSize := (int(w)*n + 7) / 8
-	if len(data) < 5+packSize {
-		return dst, 0, fmt.Errorf("intpack: DecodeGroup data too short for payload (%d bytes, need >= %d)", len(data), 5+packSize)
-	}
-	unpackResiduals(data[5:], n, w, groupMin, dst)
-	return dst, 5 + packSize, nil
-}
-
-// EncodeTrailingGroup FOR-encodes values into trailing format:
-// [4B min LE][packed residuals][1B W]
-// W is the last byte, suitable for appending after variable-length data.
-// Panics if len(values) == 0.
-func EncodeTrailingGroup(values []uint32) []byte {
-	minVal, width := rangeWidth(values)
-	packSize := (int(width)*len(values) + 7) / 8
-	buf := make([]byte, 4+packSize+1+7) // min + packed + W + 7 overshoot for safe writes
-
-	binary.LittleEndian.PutUint32(buf[0:], minVal)
-	packResiduals(buf, 4, values, minVal, width)
-	buf[4+packSize] = width
-
-	return buf[:4+packSize+1]
-}
-
-// DecodeTrailingGroup decodes a trailing FOR group from the end of data.
-// The trailing format is [4B min LE][packed residuals][1B W] appended after
-// variable-length data entries. n is the number of values.
-// Returns decoded sizes (possibly reallocated). Validates that sum(sizes)
-// equals the data length preceding the trailing group.
-func DecodeTrailingGroup(data []byte, n int, sizes []uint32) ([]uint32, error) {
-	if n <= 0 {
-		return sizes, fmt.Errorf("intpack: DecodeTrailingGroup n must be > 0, got %d", n)
-	}
-	if len(data) < 6 { // minimum: 1 data byte + 4B min + 1B W
-		return sizes, fmt.Errorf("intpack: data too small for trailing FOR group (%d bytes)", len(data))
-	}
-
-	w := uint64(data[len(data)-1]) // W is the last byte
-	if w > 32 {
-		return sizes, fmt.Errorf("intpack: invalid FOR width %d in trailing group (max 32)", w)
-	}
-	packSize := (int(w)*n + 7) / 8
-	indexSize := 4 + packSize + 1 // min(4) + packed + W(1)
-
-	if indexSize > len(data) {
-		return sizes, fmt.Errorf("intpack: trailing FOR index size %d exceeds data size %d", indexSize, len(data))
-	}
-
-	dataEnd := len(data) - indexSize
-	groupMin := binary.LittleEndian.Uint32(data[dataEnd:])
-	packed := data[dataEnd+4 : len(data)-1]
-
-	sizes = ensureCap(sizes, n)
-	unpackResiduals(packed, n, w, groupMin, sizes)
-
-	// Validate sum(sizes) == dataEnd.
-	sum := 0
-	for _, s := range sizes {
-		sum += int(s)
-	}
-	if sum != dataEnd {
-		return sizes, fmt.Errorf("intpack: trailing FOR size sum %d != data end %d", sum, dataEnd)
-	}
-
-	return sizes, nil
+	unpackResiduals(buf[len(buf)-5-packSize:len(buf)-5], n, width, groupMin, dst)
+	return dst, consumed, nil
 }
 
 // rangeWidth computes the minimum value and the bit width needed to

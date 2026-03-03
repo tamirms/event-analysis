@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"iter"
 	"os"
 	"sync"
@@ -191,7 +190,7 @@ func doOpen(path string) openResult {
 		// Everything is in speculativeBuf.
 		tailStart := len(speculativeBuf) - int(tailSize)
 
-		indexBuf = make([]byte, indexSize+7) // +7 for safe 8-byte overshoot
+		indexBuf = make([]byte, indexSize)
 		copy(indexBuf, speculativeBuf[tailStart:tailStart+indexSize])
 
 		if appDataSize > 0 {
@@ -202,27 +201,23 @@ func doOpen(path string) openResult {
 	} else {
 		// Index + appData too large for speculativeBuf — single fallback read.
 		readSize := indexSize + appDataSize
-		buf := make([]byte, readSize+7) // +7 for safe 8-byte overshoot in DecodeGroup
+		buf := make([]byte, readSize)
 		if readSize > 0 {
 			if _, err := f.ReadAt(buf[:readSize], indexBase); err != nil {
 				return openResult{err: err}
 			}
 		}
 
-		indexBuf = buf[:indexSize+7]
+		indexBuf = buf[:indexSize]
 		if appDataSize > 0 {
 			appData = make([]byte, appDataSize)
 			copy(appData, buf[indexSize:indexSize+appDataSize])
 		}
 	}
 
-	// CRC verification: CRC32C(appData || trailer[0:60]) == storedCRC.
-	crc := crc32.New(crc32cTable)
-	if appDataSize > 0 {
-		crc.Write(appData)
-	}
-	crc.Write(tb[:60])
-	if crc.Sum32() != storedCRC {
+	// CRC verification: CRC32C(trailer[0:60]) == storedCRC.
+	// App data integrity is the caller's responsibility.
+	if CRC32C(tb[:60]) != storedCRC {
 		return openResult{err: ErrChecksum}
 	}
 

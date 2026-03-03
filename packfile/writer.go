@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"math"
 	"math/rand"
 	"os"
@@ -47,7 +46,8 @@ type WriterOptions struct {
 
 type blockResult struct {
 	blockID   uint32
-	data      []byte   // uncompressed block → compressed block
+	data      []byte   // payload → compressed payload
+	forIndex  []byte   // FOR index: [packed][1B W][4B min][4B CRC32C]; nil when recordSize==1
 	hashSizes []uint32 // entry sizes for hash goroutine
 	digest    [sha256.Size]byte
 	hasHash   bool
@@ -197,6 +197,7 @@ func (w *Writer) compressWorker() {
 			hashIn <- hashWork{data: work.data, hashSizes: work.hashSizes}
 		}
 
+		// Compress payload only; the FOR index is never compressed.
 		compressed, err := c.Encode(work.data)
 		if err != nil {
 			if work.hashSizes != nil {
@@ -211,7 +212,9 @@ func (w *Writer) compressWorker() {
 			work.hasHash = true
 			work.hashSizes = nil
 		}
-		work.data = append(work.data[:0], compressed...)
+		// Assemble: compressed payload + uncompressed FOR index.
+		work.data = append(append(work.data[:0], compressed...), work.forIndex...)
+		work.forIndex = nil
 		w.resultCh <- work
 	}
 }
@@ -310,59 +313,59 @@ func (w *Writer) closeCompressor() {
 	}
 }
 
-// buildBlock assembles the current buffer into an uncompressed record.
-// When recordSize == 1, the trailing FOR size index is omitted — the single
-// item's length equals the decompressed payload length.
-func (w *Writer) buildBlock() []byte {
-	var block []byte
-	if w.recordSize == 1 {
-		block = make([]byte, len(w.buf))
-		copy(block, w.buf)
-	} else {
-		trailing := intpack.EncodeTrailingGroup(w.sizes)
-		block = make([]byte, len(w.buf)+len(trailing))
-		copy(block, w.buf)
-		copy(block[len(w.buf):], trailing)
-	}
+// buildBlock extracts the current payload buffer and (for recordSize>1) encodes
+// the FOR index. Returns them separately: the FOR index is never compressed and
+// always carries its own CRC32C.
+func (w *Writer) buildBlock() (payload []byte, forIndex []byte) {
+	payload = make([]byte, len(w.buf))
+	copy(payload, w.buf)
 	w.buf = w.buf[:0]
+	if w.recordSize > 1 {
+		encoded := intpack.EncodeGroup(w.sizes)
+		forIndex = binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
+	}
 	w.sizes = w.sizes[:0]
-	return block
+	return
 }
 
 func (w *Writer) flush() error {
 	// Serial path: compress inline. Content hash is handled by serialHasher in Append.
 	if w.concurrency <= 1 {
-		block := w.buildBlock()
+		payload, forIndex := w.buildBlock()
+		var block []byte
 		switch w.format {
 		case Compressed:
 			if w.compressor == nil {
 				w.compressor = zstd.NewCompressor()
 			}
-			var err error
-			block, err = w.compressor.Encode(block)
+			compressed, err := w.compressor.Encode(payload)
 			if err != nil {
 				return err
 			}
+			block = append(compressed, forIndex...)
 		case Uncompressed:
-			block = binary.LittleEndian.AppendUint32(block, CRC32C(block))
+			// CRC_items covers payload only; FOR index has its own CRC.
+			payload = binary.LittleEndian.AppendUint32(payload, CRC32C(payload))
+			block = append(payload, forIndex...)
 		case Raw:
-			// no-op: raw bytes
+			block = append(payload, forIndex...)
 		}
 		return w.writeBlock(block)
 	}
 
-	// Concurrent path.
+	// Concurrent path (Compressed-only: Create sets conc=0 for other formats).
 	var hashSizes []uint32
 	if w.contentHash {
 		hashSizes = w.getSizes()[:len(w.sizes)]
 		copy(hashSizes, w.sizes)
 	}
 
-	block := w.buildBlock()
+	payload, forIndex := w.buildBlock()
 
 	w.workCh <- blockResult{
 		blockID:   w.nextBlockID,
-		data:      block,
+		data:      payload,
+		forIndex:  forIndex,
 		hashSizes: hashSizes,
 	}
 	w.nextBlockID++
@@ -462,13 +465,8 @@ func (w *Writer) Finish(appData []byte) error {
 	copy(trailer[26:58], hash[:])                                         // contentHash (zeroed if unused)
 	// trailer[58:60] reserved (zero)
 
-	// CRC32C over (appData || trailer[0:60]).
-	crc := crc32.New(crc32cTable)
-	if appDataSize > 0 {
-		crc.Write(appData)
-	}
-	crc.Write(trailer[:60])
-	binary.LittleEndian.PutUint32(trailer[60:], crc.Sum32())
+	// CRC32C over trailer[0:60] only. App data integrity is the caller's responsibility.
+	binary.LittleEndian.PutUint32(trailer[60:], CRC32C(trailer[:60]))
 
 	if _, err := w.file.Write(trailer[:]); err != nil {
 		w.err = err

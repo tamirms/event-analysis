@@ -93,10 +93,41 @@ func itemsInRecord(totalItems, recordSize, recordIdx int) int {
 //   - Compressed: zstd-decompress (zstd provides integrity)
 //   - Uncompressed: verify trailing CRC32C, strip it
 //   - Raw: use data as-is (no integrity check)
-//   - recordSize>1: decode trailing size table for multi-item records
-//   - recordSize==1: entire payload is one item (no size table)
+//   - recordSize>1: strip and verify the FOR index from the raw record tail first,
+//     then apply format-specific payload processing
+//   - recordSize==1: entire payload is one item (no FOR index)
 func (rd *decoder) Decode(data []byte, recordIdx int) error {
 	n := itemsInRecord(rd.totalItems, rd.recordSize, recordIdx)
+
+	// For multi-item records: the FOR index is always the last bytes of the raw
+	// record, uncompressed, with its own CRC32C. Strip and verify it before any
+	// format-specific processing. Last 9 bytes are always [1B width][4B min][4B CRC].
+	var forIndexBytes []byte
+	if rd.recordSize > 1 {
+		const forFooterSize = 5 // 1B width + 4B min
+		const crcSize = 4
+		const metaSize = forFooterSize + crcSize // fixed tail of every multi-item record
+		if len(data) < metaSize {
+			return fmt.Errorf("packfile: record too short for FOR index: %d bytes", len(data))
+		}
+		width := data[len(data)-metaSize]
+		if width > 32 {
+			return fmt.Errorf("%w: invalid FOR width %d", ErrCorrupt, width)
+		}
+		packSize := (int(width)*n + 7) / 8
+		forStart := len(data) - metaSize - packSize
+		if forStart < 0 {
+			return fmt.Errorf("%w: FOR index size exceeds record size", ErrCorrupt)
+		}
+		forIndexBytes = data[forStart : len(data)-crcSize]
+		storedCRC := binary.LittleEndian.Uint32(data[len(data)-crcSize:])
+		if storedCRC != CRC32C(forIndexBytes) {
+			return fmt.Errorf("packfile: FOR index CRC32C: %w", ErrChecksum)
+		}
+		data = data[:forStart]
+	}
+
+	// Format-specific payload processing on data (with FOR index already stripped).
 	switch rd.format {
 	case Compressed:
 		decoded, err := rd.dec.Decode(rd.decompressed[:0], data)
@@ -106,7 +137,7 @@ func (rd *decoder) Decode(data []byte, recordIdx int) error {
 		rd.decompressed = decoded
 	case Raw:
 		rd.decompressed = append(rd.decompressed[:0], data...)
-	default: // Uncompressed
+	default: // Uncompressed: CRC_items covers payload only
 		if len(data) < 5 {
 			return fmt.Errorf("packfile: too short for CRC32C: %d bytes (min 5)", len(data))
 		}
@@ -120,9 +151,17 @@ func (rd *decoder) Decode(data []byte, recordIdx int) error {
 
 	if rd.recordSize > 1 {
 		var err error
-		rd.sizes, err = intpack.DecodeTrailingGroup(rd.decompressed, n, rd.sizes)
+		rd.sizes, _, err = intpack.DecodeGroup(forIndexBytes, n, rd.sizes)
 		if err != nil {
 			return err
+		}
+		// Validate sum(sizes) == actual payload length (format-aware via rd.decompressed).
+		sum := 0
+		for _, s := range rd.sizes {
+			sum += int(s)
+		}
+		if sum != len(rd.decompressed) {
+			return fmt.Errorf("%w: item size sum %d != payload len %d", ErrCorrupt, sum, len(rd.decompressed))
 		}
 	} else {
 		if cap(rd.sizes) >= 1 {

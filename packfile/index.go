@@ -10,7 +10,6 @@ import (
 )
 
 // decodeIndex decodes a FOR-128 encoded offset index with CRC32C integrity.
-// buf must contain at least indexSize+7 bytes (7 for safe 8-byte overshoot in DecodeGroup).
 // Returns recordCount+1 offsets: offsets[i] = start offset of record i, offsets[recordCount] = indexBase.
 func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([]int64, error) {
 	if indexSize < 4 {
@@ -18,7 +17,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	}
 
 	// Sanity-check recordCount against indexSize to prevent OOM from crafted trailers.
-	// Each FOR group of up to 128 records requires at least 6 bytes (1B W + 4B min + 1B packed).
+	// Each FOR group of up to 128 records requires at least 6 bytes (1B packed + 1B width + 4B min).
 	maxGroups := (indexSize - 4) / 6 // subtract CRC, divide by min group size
 	maxRecords := maxGroups * groupSize
 	if recordCount > maxRecords {
@@ -32,36 +31,37 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 		return nil, ErrChecksum
 	}
 
-	offsets := make([]int64, recordCount+1)
-	idx := 0
-	pos := 0
-	offset := int64(0)
-
+	// Groups are stored forward on disk but decoded backward: each group's metadata
+	// (width, min) is at its tail, so DecodeGroup naturally reads from the end of
+	// its window. Iterating backward lets us shrink the window after each group.
 	groupCount := (recordCount + groupSize - 1) / groupSize
-
-	var values []uint32
-	for g := range groupCount {
+	deltas := make([]uint32, recordCount)
+	pos := payloadLen
+	for g := groupCount - 1; g >= 0; g-- {
+		base := g * groupSize
 		limit := groupSize
 		if g == groupCount-1 && recordCount%groupSize != 0 {
 			limit = recordCount % groupSize
 		}
-
-		if pos >= payloadLen {
-			return nil, fmt.Errorf("%w: index decode overran payload at group %d (pos %d >= %d)", ErrCorrupt, g, pos, payloadLen)
-		}
-
-		var size int
+		var consumed int
 		var err error
-		values, size, err = intpack.DecodeGroup(buf[pos:], limit, values)
+		// deltas[base:base+limit] always has sufficient cap: cap = recordCount-base >= limit.
+		_, consumed, err = intpack.DecodeGroup(buf[:pos], limit, deltas[base:base+limit])
 		if err != nil {
 			return nil, fmt.Errorf("%w: index group %d: %w", ErrCorrupt, g, err)
 		}
-		for _, v := range values {
-			offsets[idx] = offset
-			idx++
-			offset += int64(v)
-		}
-		pos += size
+		pos -= consumed
+	}
+	if pos != 0 {
+		return nil, fmt.Errorf("%w: index has %d unconsumed bytes after decoding all groups", ErrCorrupt, pos)
+	}
+
+	// Forward prefix-sum pass to build absolute offsets.
+	offsets := make([]int64, recordCount+1)
+	offset := int64(0)
+	for i, d := range deltas {
+		offsets[i] = offset
+		offset += int64(d)
 	}
 
 	// Structural sanity check: running sum must arrive at indexBase.

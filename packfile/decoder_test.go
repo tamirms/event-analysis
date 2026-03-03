@@ -9,16 +9,20 @@ import (
 	"github.com/tamir/events-analysis/zstd"
 )
 
-// buildRecord constructs a raw record from entries: [entry0][entry1]...[trailing FOR sizes].
-func buildRecord(entries [][]byte) []byte {
-	sizes := make([]uint32, len(entries))
-	var buf []byte
+// buildPayload assembles entries into a contiguous payload and returns item sizes.
+func buildPayload(entries [][]byte) (payload []byte, sizes []uint32) {
+	sizes = make([]uint32, len(entries))
 	for i, e := range entries {
-		buf = append(buf, e...)
+		payload = append(payload, e...)
 		sizes[i] = uint32(len(e))
 	}
-	buf = append(buf, intpack.EncodeTrailingGroup(sizes)...)
-	return buf
+	return
+}
+
+// buildForIndex encodes sizes as a FOR index: [packed][1B W][4B min][4B CRC32C].
+func buildForIndex(sizes []uint32) []byte {
+	encoded := intpack.EncodeGroup(sizes)
+	return binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 }
 
 // configTestDecoder sets up a decoder to decode a single record containing n items.
@@ -34,18 +38,19 @@ func TestDecoderCompressed(t *testing.T) {
 		[]byte("world"),
 		[]byte("!"),
 	}
-	raw := buildRecord(entries)
-
-	compressed, err := zstd.Encode(raw)
+	payload, sizes := buildPayload(entries)
+	forIndex := buildForIndex(sizes)
+	compressed, err := zstd.Encode(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
+	data := append(compressed, forIndex...)
 
 	rd := newDecoder()
 	defer rd.Close()
 	configTestDecoder(rd, len(entries), Compressed)
 
-	if err := rd.Decode(compressed, 0); err != nil {
+	if err := rd.Decode(data, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
@@ -69,11 +74,11 @@ func TestDecoderUncompressed(t *testing.T) {
 		[]byte("beta"),
 		[]byte("gamma"),
 	}
-	raw := buildRecord(entries)
-
-	// Append CRC32C.
-	crc := CRC32C(raw)
-	raw = binary.LittleEndian.AppendUint32(raw, crc)
+	payload, sizes := buildPayload(entries)
+	forIndex := buildForIndex(sizes)
+	// CRC_items covers payload only; FOR index has its own CRC.
+	raw := binary.LittleEndian.AppendUint32(append([]byte{}, payload...), CRC32C(payload))
+	raw = append(raw, forIndex...)
 
 	rd := newDecoder()
 	defer rd.Close()
@@ -91,10 +96,9 @@ func TestDecoderUncompressed(t *testing.T) {
 }
 
 func TestDecoderCRC32CCorruption(t *testing.T) {
-	entries := [][]byte{[]byte("data")}
-	raw := buildRecord(entries)
-	crc := CRC32C(raw)
-	raw = binary.LittleEndian.AppendUint32(raw, crc)
+	// recordSize=1: no FOR index, just [payload][4B CRC_items].
+	payload := []byte("data")
+	raw := binary.LittleEndian.AppendUint32(append([]byte{}, payload...), CRC32C(payload))
 
 	// Corrupt a byte in the payload.
 	raw[0] ^= 0xFF
@@ -132,15 +136,17 @@ func TestDecoderCRC32CShortRecord(t *testing.T) {
 
 func TestDecoderPool(t *testing.T) {
 	entries := [][]byte{[]byte("pooled"), []byte("data")}
-	raw := buildRecord(entries)
-	compressed, err := zstd.Encode(raw)
+	payload, sizes := buildPayload(entries)
+	forIndex := buildForIndex(sizes)
+	compressed, err := zstd.Encode(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
+	data := append(compressed, forIndex...)
 
 	rd := getDecoder()
 	configTestDecoder(rd, len(entries), Compressed)
-	if err := rd.Decode(compressed, 0); err != nil {
+	if err := rd.Decode(data, 0); err != nil {
 		putDecoder(rd)
 		t.Fatal(err)
 	}
@@ -154,16 +160,18 @@ func TestDecoderPool(t *testing.T) {
 
 func TestEntryBoundsCheck(t *testing.T) {
 	entries := [][]byte{[]byte("a"), []byte("b"), []byte("c")}
-	raw := buildRecord(entries)
-	compressed, err := zstd.Encode(raw)
+	payload, sizes := buildPayload(entries)
+	forIndex := buildForIndex(sizes)
+	compressed, err := zstd.Encode(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
+	data := append(compressed, forIndex...)
 
 	rd := newDecoder()
 	defer rd.Close()
 	configTestDecoder(rd, 3, Compressed)
-	if err := rd.Decode(compressed, 0); err != nil {
+	if err := rd.Decode(data, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,8 +196,8 @@ func assertPanics(t *testing.T, name string, f func()) {
 	f()
 }
 
-func TestDecoderNoTrailingSizes(t *testing.T) {
-	// When recordSize=1, the entire decompressed payload is one item (no size table).
+func TestDecoderNoForIndex(t *testing.T) {
+	// When recordSize=1, the entire decompressed payload is one item (no FOR index).
 	payload := []byte("single-item-payload")
 	compressed, err := zstd.Encode(payload)
 	if err != nil {
@@ -210,9 +218,11 @@ func TestDecoderNoTrailingSizes(t *testing.T) {
 }
 
 func TestDecoderRaw(t *testing.T) {
-	// When format=Raw, the data is used as-is (no decompression, no CRC).
+	// When format=Raw: [payload][FOR index], no CRC on payload.
 	entries := [][]byte{[]byte("raw"), []byte("data")}
-	raw := buildRecord(entries)
+	payload, sizes := buildPayload(entries)
+	forIndex := buildForIndex(sizes)
+	raw := append(append([]byte{}, payload...), forIndex...)
 
 	rd := newDecoder()
 	defer rd.Close()
@@ -264,17 +274,19 @@ func TestDecoderReuse(t *testing.T) {
 	// decoder. Verifies that stale state from the first decode (larger
 	// sizes/offsets slices) doesn't leak into the second.
 	entries1 := [][]byte{[]byte("a"), []byte("bb"), []byte("ccc"), []byte("dd"), []byte("e")}
-	raw1 := buildRecord(entries1)
-	comp1, err := zstd.Encode(raw1)
+	payload1, sizes1 := buildPayload(entries1)
+	forIndex1 := buildForIndex(sizes1)
+	comp1, err := zstd.Encode(payload1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	data1 := append(comp1, forIndex1...)
 
 	rd := newDecoder()
 	defer rd.Close()
 	configTestDecoder(rd, 5, Compressed)
 
-	if err := rd.Decode(comp1, 0); err != nil {
+	if err := rd.Decode(data1, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries1 {
@@ -285,15 +297,17 @@ func TestDecoderReuse(t *testing.T) {
 
 	// Second decode: fewer entries.
 	entries2 := [][]byte{[]byte("xx"), []byte("yy")}
-	raw2 := buildRecord(entries2)
-	comp2, err := zstd.Encode(raw2)
+	payload2, sizes2 := buildPayload(entries2)
+	forIndex2 := buildForIndex(sizes2)
+	comp2, err := zstd.Encode(payload2)
 	if err != nil {
 		t.Fatal(err)
 	}
+	data2 := append(comp2, forIndex2...)
 
 	rd.totalItems = 2
 	rd.recordSize = 2
-	if err := rd.Decode(comp2, 0); err != nil {
+	if err := rd.Decode(data2, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries2 {

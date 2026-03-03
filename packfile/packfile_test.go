@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -675,14 +674,9 @@ func TestContentHashCorruption(t *testing.T) {
 	trailerStart := len(fileData) - trailerSize
 	fileData[trailerStart+26] ^= 0xFF
 
-	// Recompute trailer CRC over (appData || trailer[0:60]).
-	appDataSize := int(binary.LittleEndian.Uint32(fileData[trailerStart+22:]))
-	crc := crc32.New(crc32cTable)
-	if appDataSize > 0 {
-		crc.Write(fileData[trailerStart-appDataSize : trailerStart])
-	}
-	crc.Write(fileData[trailerStart : trailerStart+60])
-	binary.LittleEndian.PutUint32(fileData[trailerStart+60:], crc.Sum32())
+	// Recompute trailer CRC over trailer[0:60] only.
+	binary.LittleEndian.PutUint32(fileData[trailerStart+60:],
+		CRC32C(fileData[trailerStart:trailerStart+60]))
 
 	corruptedPath := filepath.Join(t.TempDir(), "corrupted.pack")
 	if err := os.WriteFile(corruptedPath, fileData, 0644); err != nil {
@@ -944,6 +938,9 @@ func TestAppDataRoundTrip(t *testing.T) {
 }
 
 func TestAppDataCorruption(t *testing.T) {
+	// App data has no packfile-level integrity protection — the trailer CRC covers
+	// only trailer[0:60]. Corruption in app data is undetected by packfile; callers
+	// are responsible for their own app data integrity checks.
 	appData := []byte("important-metadata")
 
 	dir := t.TempDir()
@@ -978,12 +975,16 @@ func TestAppDataCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Packfile opens successfully — app data corruption is not detected.
 	r := Open(corruptedPath)
 	defer r.Close()
 
-	_, err = r.TotalItems()
-	if !errors.Is(err, ErrChecksum) {
-		t.Fatalf("expected ErrChecksum for corrupted app data, got %v", err)
+	got, err := r.AppData()
+	if err != nil {
+		t.Fatalf("unexpected error opening file with corrupted app data: %v", err)
+	}
+	if string(got) == string(appData) {
+		t.Error("expected corrupted app data to differ from original")
 	}
 }
 

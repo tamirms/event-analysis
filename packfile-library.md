@@ -6,7 +6,7 @@ We need to store large collections of variable-length items (events, compressed 
 
 Items are grouped into **records** for compression. Small items like events and bitmaps are batched together (e.g. 128 per record) because a single 200-byte event doesn't compress meaningfully, but 128 of them together do. Large items like ledgers are stored one per record since they're big enough to compress individually. Each record is compressed and written as a contiguous block on disk.
 
-When a record contains multiple items, the reader needs to know where each item starts and ends within the decompressed data. A small size table appended to each multi-item record stores these byte lengths. Single-item records skip the size table entirely — the item is the whole payload.
+When a record contains multiple items, the reader needs to know where each item starts and ends within the decompressed data. A compact FOR (Frame of Reference) index appended to each multi-item record stores these byte lengths. The FOR index is always uncompressed and carries its own CRC32C — it is readable without decompressing the payload. Single-item records skip the FOR index entirely — the item is the whole payload.
 
 The natural approach is a flat file: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
 
@@ -304,44 +304,26 @@ var (
     ErrIndexRange           = errors.New("packfile: record index out of range")
     ErrContentHashMismatch  = errors.New("packfile: content hash mismatch")
 )
-
-// CRC32C computes CRC32C (Castagnoli) of b.
-func CRC32C(b []byte) uint32
 ```
 
 ### intpack (separate package)
 
-Frame of Reference (FOR) integer compression. Two formats: standard `[W][min][packed]` for streaming decode (used by the file-level offset index), and trailing `[min][packed][W]` for appending after variable-length data (used by record-level size tables).
+Frame of Reference (FOR) integer compression. Unified format: `[packed residuals][1B W][4B min LE]`. Width (`W`) and minimum are always the final 5 bytes, so callers can locate metadata from the tail of any buffer. This layout is used for both the file-level offset index and the per-record item size groups — both share identical on-disk structure and the same encode/decode functions.
 
 ```go
 package intpack
 
-// EncodeGroup FOR-encodes values into one group: [1B W][4B min LE][packed residuals].
+// EncodeGroup FOR-encodes values into one group: [packed residuals][1B W][4B min LE].
 // W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
 // Panics if len(values) == 0.
 func EncodeGroup(values []uint32) []byte
 
-// DecodeGroup FOR-decodes one group of n values from data into dst.
-// Returns values (possibly reallocated if dst is too small), bytes consumed,
-// and any error. data must have 7 bytes of overshoot past the encoded
-// payload for safe 8-byte reads.
-func DecodeGroup(data []byte, n int, dst []uint32) (values []uint32, size int, err error)
-
-// EncodeTrailingGroup FOR-encodes values into trailing format:
-// [4B min LE][packed residuals][1B W]
-// W is the last byte, suitable for appending after variable-length data.
-// Panics if len(values) == 0.
-func EncodeTrailingGroup(values []uint32) []byte
-
-// DecodeTrailingGroup decodes a trailing FOR group from the end of data.
-// The trailing format is [4B min LE][packed residuals][1B W] appended after
-// variable-length data entries. n is the number of values.
-// Returns decoded sizes (possibly reallocated). Validates that sum(sizes)
-// equals the data length preceding the trailing group.
-func DecodeTrailingGroup(data []byte, n int, sizes []uint32) ([]uint32, error)
+// DecodeGroup FOR-decodes one group of n values from the tail of buf.
+// buf must end at the last byte of [min] (the byte before any trailing CRC or other data).
+// Returns decoded values (written into dst[0:n], reallocating if cap(dst) < n),
+// bytes consumed from the tail, and any error.
+func DecodeGroup(buf []byte, n int, dst []uint32) (values []uint32, consumed int, err error)
 ```
-
-Note: the group size (128 values) is not fixed by intpack — it's a pure codec. The 128-value group size is a packfile format constant.
 
 ---
 
@@ -371,28 +353,35 @@ Reads throughout this section use `pread` — positioned read at a specific file
 
 ### Records
 
-Each record contains up to `RecordSize` items. When a record contains multiple items (`RecordSize > 1`), the items are concatenated and followed by a trailing size table that stores each item's byte length. This enables extracting individual items without scanning all preceding data. The size table is encoded using the `intpack` trailing format (a compact bit-packed representation — see [intpack](#intpack-separate-package) in the API reference).
+Each record contains up to `RecordSize` items. When a record contains multiple items (`RecordSize > 1`), the items are concatenated into a payload, and a **FOR index** is appended. The FOR index encodes each item's byte length and carries its own CRC32C — it is always uncompressed regardless of the record format, and is stripped from the raw record bytes before any format-specific processing.
 
 ```
-Multi-item record layout (RecordSize > 1):
-  [item_0 bytes][item_1 bytes]...[item_{N-1} bytes][trailing size table]
+Multi-item record on-disk layout:
 
-Trailing size table (intpack trailing format):
-  [4B min LE][packed residuals][1B W]
+  Compressed:   [zstd(payload)][FOR_index]
+  Uncompressed: [payload][4B CRC_items][FOR_index]
+  Raw:          [payload][FOR_index]
+
+FOR_index = [packed residuals][1B W][4B min LE][4B CRC32C]
+  where CRC32C covers [packed][W][min]
 ```
 
-**Single-item records** (`RecordSize=1`): The trailing size table is omitted entirely — the item's length equals the decompressed payload length. This saves 6 bytes per record and avoids a decode step on every read.
+The last 9 bytes of any multi-item record are always `[1B W][4B min][4B CRC]` — fixed offsets from the tail regardless of packed content. The decoder strips and verifies the FOR index from the raw bytes before decompression, enabling early corruption detection without paying decompression cost.
+
+**Single-item records** (`RecordSize=1`): The FOR index is omitted entirely — the item's length equals the decompressed payload length.
 
 ```
 Single-item record layout (RecordSize=1):
-  [item bytes]
+  Compressed:   [zstd(item)]
+  Uncompressed: [item][4B CRC_items]
+  Raw:          [item]
 ```
 
-**Compressed records** (default): The entire record payload is zstd-compressed. Integrity is provided by zstd's built-in content checksum (xxHash64), verified automatically during decompression.
+**Compressed records** (default): The payload is zstd-compressed. Integrity is provided by zstd's built-in content checksum (xxHash64), verified automatically during decompression. The FOR index (appended after compression) has its own CRC32C.
 
-**Uncompressed records** (`Format: Uncompressed`): The record is stored as-is with a trailing 4-byte CRC32C appended after the payload.
+**Uncompressed records** (`Format: Uncompressed`): The payload is stored as-is with a 4-byte CRC32C. The FOR index has its own CRC32C. The item CRC covers only the payload bytes (not the FOR index).
 
-**Raw records** (`Format: Raw`): The record is stored as-is with no integrity wrapper. Use this when items are already compressed or checksummed.
+**Raw records** (`Format: Raw`): The payload is stored as-is with no integrity wrapper. The FOR index still has its own CRC32C.
 
 ### Content Hash
 
@@ -420,7 +409,7 @@ Offset  Size  Type      Field
 22      4     uint32    appDataSize (0 if none)
 26      32    [32]byte  contentHash (zeroed if flagContentHash not set)
 58      2     -         reserved (zero)
-60      4     uint32    CRC32C of (appData || trailer[0:60])
+60      4     uint32    CRC32C of trailer[0:60]
 ```
 
 Flags (uint8):
@@ -441,18 +430,20 @@ Packfile avoids this by storing **record sizes** (deltas between consecutive off
 Deltas are encoded using **Frame of Reference (FOR)** compression in groups of 128. FOR is a simple integer compression technique: subtract a per-group minimum from every value, then bit-pack the residuals at the minimum bit width needed. Each group of 128 consecutive deltas is self-contained:
 
 ```
-FOR Group (5 + ceil(128 × W' / 8) bytes):
+FOR Group (ceil(128 × W' / 8) + 5 bytes):
 
-  [00]     W': uint8
-           Bit width of residuals in this group (bits.Len32 of max residual).
-
-  [01-04]  groupMin: uint32 LE
-           Minimum delta in this group.
-
-  [05-XX]  residuals: 128 packed integers, W' bits each
+  [00-XX]  residuals: 128 packed integers, W' bits each
            residual[j] = delta[j] - groupMin
            where delta[j] = byte size of record (groupIndex × 128 + j)
+
+  [XX]     W': uint8
+           Bit width of residuals in this group (bits.Len32 of max residual).
+
+  [XX+1 .. XX+4]  groupMin: uint32 LE
+           Minimum delta in this group.
 ```
+
+Width and minimum are always the final 5 bytes of the group. The decoder reads from the group tail, so groups are decoded backward when iterating (the last group is decoded first, shrinking the window). This tail-first layout is identical to the per-record FOR index layout — both share the same `EncodeGroup` / `DecodeGroup` functions.
 
 The writer computes `groupMin` and `W'` independently for each group:
 
@@ -478,20 +469,20 @@ On open, all groups are decoded into a flat `[]int64` offset table. Each `ReadIt
 
 ```go
 bitPos  := uint64(j) * uint64(W)
-bytePos := 5 + bitPos/8
+bytePos := bitPos / 8    // offset from start of packed section (no header prefix)
 shift   := bitPos % 8
-raw     := binary.LittleEndian.Uint64(groupBuf[bytePos:])
+raw     := binary.LittleEndian.Uint64(packed[bytePos:])
 residual := int64((raw >> shift) & ((1 << W) - 1))
 delta   := residual + int64(groupMin)
 ```
 
-Reads 8 bytes, shifts, masks, adds back the group minimum. Maximum usable `W'` is 57 (shift ≤ 7, shift + W' ≤ 64).
+`packed` is `groupBuf[:packSize]` where `packSize = ceil(N × W / 8)`. Reads 8 bytes, shifts, masks, adds back the group minimum. Maximum usable `W'` is 57 (shift ≤ 7, shift + W' ≤ 64).
 
 ### Integrity
 
 **Index checksum:** A CRC32C of the raw index bytes (all FOR groups, excluding the CRC itself) is stored at the end of the index section (after the last group, before metadata). On open, the library verifies this checksum before decoding. This catches any on-disk corruption in group headers or packed residuals. As an additional sanity check, after decoding, the library asserts that the running offset sum equals `indexBase` — an independent structural invariant that catches encode/decode logic bugs.
 
-**Trailer checksum:** CRC32C of `appData || trailer[0:60]` protects all structural fields and optional app data.
+**Trailer checksum:** CRC32C of `trailer[0:60]` protects all structural fields. App data has no packfile-level integrity check — callers are responsible for their own app data integrity.
 
 **Trailer validation:** On open, the reader validates flags against `knownFlags`, rejects unknown flags, validates `recordSize > 0`, and cross-validates that `ceil(totalItems / recordSize) == recordCount`.
 
@@ -505,7 +496,7 @@ Reads 8 bytes, shifts, masks, adds back the group minimum. Maximum usable `W'` i
 
 **Last record:** If `TotalItems` is not a multiple of `RecordSize`, the last record contains fewer items. `itemsInRecord()` handles this.
 
-**8-byte read overshoot:** The bit extraction reads 8 bytes at a time. For the last residual in a group (W'=13, j=127): bit position 1651, byte position `5 + 206 = 211`, 8-byte read spans bytes 211-218 — extending past the group's packed section (213 bytes). For middle groups, the overshoot lands in the next group's header, which is safe because the mask extracts only the relevant bits. For the last group, the overshoot may extend past the packed data into the 4-byte CRC that follows. The reader allocates `indexSize + 7` bytes for the read buffer and zeroes the trailing 7, so the overshoot always reads from valid memory.
+**8-byte read overshoot (decode):** The bit extraction reads 8 bytes at a time. For elements near the end of the packed section, an 8-byte read could extend past the packed data. `unpackResiduals` handles this with a `safeLimit = len(packed) - 7` guard: elements past `safeLimit` are decoded byte-by-byte. No extra allocation needed in the decoder — the overshoot concern is write-side only. `EncodeGroup` allocates `+7` bytes beyond the packed section so `packResiduals`'s 8-byte writes are always safe.
 
 **Zero items:** Valid. No records. Index section is just 4 bytes (CRC32C of empty payload). All read operations return errors or empty results.
 
@@ -560,7 +551,7 @@ Optional background writeback via `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Li
 
 ### Index Decode OOM Guard
 
-Before decoding the index, the reader validates that `recordCount` is plausible given `indexSize`. Each index group of up to 128 records requires at least 6 bytes (1B width + 4B min + 1B packed). If `recordCount` exceeds `(indexSize - 4) / 6 * 128`, the file is rejected as corrupt. This prevents crafted trailers from causing huge allocations.
+Before decoding the index, the reader validates that `recordCount` is plausible given `indexSize`. Each index group of up to 128 records requires at least 6 bytes (1B packed + 1B width + 4B min). If `recordCount` exceeds `(indexSize - 4) / 6 * 128`, the file is rejected as corrupt. This prevents crafted trailers from causing huge allocations.
 
 ### Concurrency
 
@@ -572,7 +563,9 @@ A `sync.Pool` of `decoder` instances, each owning a `ZSTD_DCtx` (zstd decompress
 
 ### Validation Summary
 
-**On open:** magic, version, trailer CRC32C (covers `appData || trailer[0:60]`), file size consistency, index OOM guard, index CRC32C (raw bytes), final offset equals `indexBase`, trailer flags against `knownFlags`, `recordSize > 0`, `ceil(totalItems / recordSize) == recordCount`.
+**On open:** magic, version, trailer CRC32C (covers `trailer[0:60]`), file size consistency, index OOM guard, index CRC32C (raw bytes), final offset equals `indexBase`, trailer flags against `knownFlags`, `recordSize > 0`, `ceil(totalItems / recordSize) == recordCount`.
+
+**On Decode (multi-item records):** FOR index CRC32C (over `[packed][W][min]`); `sum(itemSizes) == actual payload length`.
 
 **On ReadItem:** index in `[0, TotalItems)`.
 

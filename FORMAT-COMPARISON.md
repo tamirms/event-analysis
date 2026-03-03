@@ -51,11 +51,9 @@ The performance gap is structural, not tunable:
    RocksDB uses a B-tree block index requiring O(log N) traversal per lookup. For positional
    access by integer ordinal, the offset array is strictly superior.
 
-3. **Per-entry overhead.** Packfile: ~1 byte/entry (FOR-N encoded event sizes). RocksDB:
-   ~15 bytes/entry (4B ordinal key + 8B internal trailer + 3B varint framing). The 8-byte
-   internal trailer is baked into the SSTable format and cannot be configured away.
+3. **Per-entry overhead.** Packfile: ~1 byte/entry (FOR-128 encoded item sizes in the per-record index) + ~4 bytes/record (FOR index CRC32C, amortized over up to 128 items). RocksDB: ~15 bytes/entry (4B ordinal key + 8B internal trailer + 3B varint framing). The 8-byte internal trailer is baked into the SSTable format and cannot be configured away.
 
-4. **Compression input.** Packfile compresses raw event bytes + tiny FOR-N index. RocksDB
+4. **Compression input.** Packfile compresses raw event bytes only (the FOR index is uncompressed). RocksDB
    compresses events + ordinal keys + internal trailers + varint framing. More metadata in the
    input means more bytes to compress and slightly worse ratios (4.6x vs 4.3x).
 
@@ -88,19 +86,19 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/ + intpack/) | ~1,800 | — |
+| Core format (packfile/ + intpack/) | ~1,770 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
 | Eventstore impl (thin facade) | ~170 | 401 |
 | Bitmapindex impl | ~570 | 343 |
-| **Total implementation** | **~2,760** | **900** |
+| **Total implementation** | **~2,720** | **900** |
 
 RocksDB requires **~3x less code** because RocksDB handles block management, compression,
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these:
 
-- Frame-of-Reference encoding/decoding (intpack/: 186 lines)
-- Record decoding with zstd + CRC32C + trailing FOR index (packfile/decoder.go)
+- Frame-of-Reference encoding/decoding (intpack/: 125 lines)
+- Record decoding with zstd + CRC32C + FOR index (packfile/decoder.go)
 - Item accumulation, record building, and streaming compression pipeline (packfile/writer.go)
 - Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
 - Work-stealing parallel I/O with direct callback (packfile/reader.go — ReadItems)
@@ -143,7 +141,7 @@ code paths.
 | eventstore/rocksdb | 17 | 446 |
 | bitmapindex (packfile) | in root tests | — |
 | bitmapindex/rocksdb | 9 | 314 |
-| packfile | 47 | 1,321 |
+| packfile | 47 | 1,336 |
 
 The packfile tests are more comprehensive because the format has more edge cases to cover
 (block boundaries, partial blocks, FOR encoding corner cases, compression failures). RocksDB
