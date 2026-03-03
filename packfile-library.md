@@ -144,7 +144,7 @@ r.ReadItem(slot, func(data []byte) error {
 - **Minimal I/O.** The full index loads in one disk read on open (~112KB for 68K event blocks). After that, one disk read per record, exact size, no over-read.
 - **Compact index.** Index size depends on max record size, not file size. A file with 20KB records uses 15-bit deltas whether the file is 500MB or 50GB.
 - **Immutable after write.** No updates, no deletes. Simple, safe, predictable.
-- **Concurrent reads.** Multiple goroutines can call `ReadItem` on the same `Reader`. No locks in the read path.
+- **Concurrent reads.** All `Reader` methods are safe for concurrent use. No locks in the read path.
 
 ## Non-Goals
 

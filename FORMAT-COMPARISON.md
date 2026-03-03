@@ -88,14 +88,14 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/ + intpack/) | ~1,500 | — |
+| Core format (packfile/ + intpack/) | ~1,800 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
-| Eventstore impl (thin facade) | ~150 | 401 |
-| Bitmapindex impl | ~520 | 344 |
-| **Total implementation** | **~2,390** | **901** |
+| Eventstore impl (thin facade) | ~170 | 401 |
+| Bitmapindex impl | ~570 | 343 |
+| **Total implementation** | **~2,760** | **900** |
 
-RocksDB requires **~2.6x less code** because RocksDB handles block management, compression,
+RocksDB requires **~3x less code** because RocksDB handles block management, compression,
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these:
 
@@ -104,12 +104,12 @@ all of these:
 - Item accumulation, record building, and streaming compression pipeline (packfile/writer.go)
 - Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
 - Work-stealing parallel I/O with direct callback (packfile/reader.go — ReadItems)
-- Metadata encoding, content hashing (packfile/metadata.go)
+- Content hashing (packfile/contenthash.go)
 - MPHF construction and query (bitmapindex/writer.go, reader.go)
 - Atomic write with temp file + rename + directory fsync (packfile/writer.go)
 - CRC32C checksums and trailer parsing (packfile/reader.go, packfile.go)
 
-Note: eventstore is now a thin facade (~150 lines total for reader + writer) that delegates
+Note: eventstore is now a thin facade (~170 lines total for reader + writer) that delegates
 entirely to packfile. The record-level logic (compression, batching, content hashing) that
 was previously in eventstore has been absorbed into packfile.
 
@@ -139,11 +139,11 @@ code paths.
 
 | Package | Tests | Lines |
 |---------|-------|-------|
-| eventstore (packfile) | 26 | 764 |
+| eventstore (packfile) | 34 | 1,005 |
 | eventstore/rocksdb | 17 | 446 |
 | bitmapindex (packfile) | in root tests | — |
 | bitmapindex/rocksdb | 9 | 314 |
-| packfile | 37 | 1,107 |
+| packfile | 47 | 1,321 |
 
 The packfile tests are more comprehensive because the format has more edge cases to cover
 (block boundaries, partial blocks, FOR encoding corner cases, compression failures). RocksDB

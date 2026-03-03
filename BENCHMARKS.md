@@ -63,7 +63,7 @@ Notes:
 | 16 | 2,732 | 2,574 | 6% |
 | 24 | 2,814 | 2,503 | 11% |
 
-At c=1, SHA-256 runs serially after compression and adds 29% overhead. At c=4+, SHA-256 overlaps with zstd compression in parallel goroutines — overhead drops to 6-11%. On EBS at c=8+, the overhead is zero (EBS bandwidth is the bottleneck: both hash and no-hash plateau at ~592 MB/s, throttled by `sync_file_range` writeback).
+At c=1, SHA-256 runs serially after compression and adds 29% overhead. At c=4+, SHA-256 overlaps with zstd compression in parallel goroutines — overhead drops to 19% at c=4 and 6-11% at c=8+. On EBS at c=8+, the overhead is zero (EBS bandwidth is the bottleneck: both hash and no-hash plateau at ~592 MB/s, throttled by `sync_file_range` writeback).
 
 ### Write Peak Memory (RssAnon delta, excluding page cache)
 
