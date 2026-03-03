@@ -12,17 +12,17 @@ Numbers from BENCHMARKS.md (Intel Xeon 32-core). ARM64 ratios are similar (see B
 
 | Operation | Packfile | RocksDB | Winner |
 |-----------|----------|---------|--------|
-| **Sequential read** | 2,561 MB/s | 487 MB/s | Packfile (5.3x) |
-| **Point read** | 11.3 µs | 13.4 µs | Packfile (1.2x) |
-| **Batch 128 events** | 10.7 µs | 63.3 µs | Packfile (5.9x) |
-| **Range scan 128** | 22.8 µs | 72.0 µs | Packfile (3.2x) |
-| **Scattered 50 indices** | 158 µs | 206 µs | Packfile (1.3x) |
-| **Parallel point (32 cores)** | 687 ns | 853 ns | Packfile (1.2x) |
-| **Parallel scattered (32 cores)** | 42 µs | 45 µs | Tie (~1.07x) |
-| **Consecutive 1000 blocks** | 2.5 ms | 2.3 ms | Tie (~1.08x) |
+| **Sequential read** | 2,490 MB/s | 510 MB/s | Packfile (4.9x) |
+| **Point read** | 12.3 µs | 14.3 µs | Packfile (1.17x) |
+| **Batch 128 events** | 10.8 µs | 64.5 µs | Packfile (5.9x) |
+| **Range scan 128** | 23.4 µs | 73.4 µs | Packfile (3.1x) |
+| **Scattered 50 indices** | 155 µs | 212 µs | Packfile (1.37x) |
+| **Parallel point (32 cores)** | 723 ns | 914 ns | Packfile (1.26x) |
+| **Parallel scattered (32 cores)** | 33.5 µs | 48.6 µs | Packfile (1.45x) |
+| **Consecutive 1000 blocks** | 1.84 ms | 2.38 ms | Packfile (1.29x) |
 | **Write (NVMe, 8 goroutines)** | 2,805 MB/s | 926 MB/s | Packfile (3.0x) |
 | **Write (EBS, 8 goroutines)** | 821 MB/s | 756 MB/s | Packfile (1.09x) |
-| **Open latency (warm)** | 320 µs | 1,951 µs | Packfile (6.1x) |
+| **Open latency (warm)** | 317 µs | 2,181 µs | Packfile (6.9x) |
 | **File size** | 413 MB | 437 MB | Packfile (5.7% smaller) |
 | **Write peak memory** | 55 MB | 29 MB | RocksDB (1.9x less) |
 | **Read peak memory** | 3 MB | — | Both minimal |
@@ -31,10 +31,10 @@ Numbers from BENCHMARKS.md (Intel Xeon 32-core). ARM64 ratios are similar (see B
 
 | Operation | MPHF+Packfile | RocksDB | Winner |
 |-----------|--------------|---------|--------|
-| **Single lookup (warm)** | 12.9 µs | 17.1 µs | MPHF (1.3x) |
-| **Parallel 15 (32 cores)** | 1.2 µs | 4.6 µs | MPHF (3.7x) |
-| **Cold 1 lookup (NVMe)** | 666 µs | 1,420 µs | MPHF (2.1x) |
-| **Cold 50 lookups (NVMe)** | 1,543 µs | 2,116 µs | MPHF LookupKeys (1.4x) |
+| **Single lookup (warm)** | 12.0 µs | 17.4 µs | MPHF (1.45x) |
+| **Parallel 15 (32 cores)** | 1.0 µs | 4.3 µs | MPHF (4.3x) |
+| **Cold 1 lookup (NVMe)** | 646 µs | 1,421 µs | MPHF (2.2x) |
+| **Cold 50 lookups (NVMe)** | 1,417 µs | 2,139 µs | MPHF LookupKeys (1.5x) |
 | **Cold 50 lookups (EBS)** | 16.2 ms | 17.3 ms | Tie (IOPS-limited) |
 | **File size** | 53.1 MB | 58.9 MB | MPHF (10% smaller) |
 
@@ -63,14 +63,12 @@ The performance gap is structural, not tunable:
 
 - **EBS cold cache:** At 3,000 IOPS (gp3 baseline), both formats converge because I/O latency
   dominates CPU overhead. 1,000 scattered reads: ~333ms for both.
-- **Parallel scattered reads:** Under 32-core parallel load with 50 indices, RocksDB's
-  `BatchedMultiGetCF` nearly matches packfile's work-stealing (45µs vs 42µs).
-- **Consecutive block reads (warm):** 1,000 consecutive blocks: packfile's ReadItems
-  batch I/O (2.5ms) nearly matches RocksDB's block cache locality (2.3ms). Both are
-  decompression-bound (~1,000 zstd block decompressions each). Packfile splits large
-  consecutive runs across workers for parallel decompression; RocksDB benefits from
-  sequential prefetch in its block cache. On cold EBS, packfile pulls ahead (47ms vs
-  IOPS-limited scattered reads at 98ms) because batch ReadRange is bandwidth-optimal.
+- **Consecutive block reads (warm):** 1,000 consecutive blocks: packfile 1.84ms vs
+  RocksDB 2.38ms (packfile 1.29x faster). Both are decompression-bound (~1,000 zstd
+  block decompressions each). Packfile splits large consecutive runs across workers for
+  parallel decompression; RocksDB benefits from sequential prefetch in its block cache.
+  On cold EBS, packfile pulls ahead (47ms vs IOPS-limited scattered reads at 98ms)
+  because batch ReadRange is bandwidth-optimal.
 - **EBS writes:** Packfile at 8 goroutines (821 MB/s) is now 1.09x faster than RocksDB at 8
   threads (756 MB/s) on EBS, thanks to `sync_file_range(SYNC_FILE_RANGE_WRITE)` which initiates
   background writeback every 1MB during the append phase. Before this optimization, RocksDB was
@@ -288,7 +286,7 @@ Breakdown for 1000 scattered blocks, S3 Standard, c=128:
 
 | Storage | 1000 scattered reads | 15 bitmap lookups |
 |---------|---------------------|-------------------|
-| NVMe i4i (c=64) | 5.2ms | ~0.15ms (warm) |
+| NVMe i4i (c=64) | 5.2ms | ~0.13ms (warm) |
 | EBS gp3 baseline (c=64) | 332ms | ~5ms (cold) |
 | EBS gp3 + 16K IOPS (c=64) | ~62ms | ~2ms (cold) |
 | **S3 Standard (c=128)** | **~800ms** | **~100ms** |
@@ -361,7 +359,7 @@ to S3 Express One Zone ($0.10-0.15/GB storage, similar per-request costs).
 | EBS gp3 baseline | ~$34 | 332ms | ~5ms |
 | EBS gp3 + 16K IOPS | ~$99 | ~62ms | ~2ms |
 | EBS io2 40K IOPS | ~$2,636 | ~25ms | ~1ms |
-| NVMe i4i.xlarge | ~$250 | 5.2ms | ~0.15ms |
+| NVMe i4i.xlarge | ~$250 | 5.2ms | ~0.13ms |
 
 Key observations:
 - **Request costs are trivial** — even at 30M GETs/month, S3/GCS request fees are $12-33.
@@ -585,9 +583,9 @@ chunks (~14 days), far more than needed for a 24h hot window.
 
 | Operation | NVMe (hot) | EBS gp3 (warm) | S3 Standard (cold) | S3 Express (cold) |
 |-----------|-----------|----------------|--------------------|--------------------|
-| 15 bitmap lookups | 0.15 ms | ~5 ms | ~100 ms | ~10 ms |
+| 15 bitmap lookups | 0.13 ms | ~5 ms | ~100 ms | ~10 ms |
 | 1,000 scattered reads | 5.2 ms | 332 ms | ~800 ms | ~80 ms |
-| Point read | 0.011 ms | ~0.3 ms | ~100 ms | ~10 ms |
+| Point read | 0.012 ms | ~0.3 ms | ~100 ms | ~10 ms |
 
 **Why this works well with packfile:**
 
@@ -674,7 +672,7 @@ in size.
 
 The packfile format is the clear winner for this project's specific workload: immutable,
 append-only event storage with positional access patterns on local or remote storage. It
-delivers 2-6x better read throughput, 3.0x better write throughput (NVMe), 1.09x better
+delivers 1.2-5.9x better read throughput, 3.0x better write throughput (NVMe), 1.09x better
 write throughput (EBS), and smaller files, with a simpler deployment story (no RocksDB
 build dependency). RocksDB uses less peak write memory (29 vs 55 MB).
 

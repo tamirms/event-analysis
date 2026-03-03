@@ -51,6 +51,20 @@ Notes:
 - **EBS**: Packfile plateaus at ~821 MB/s (c=4+), faster than RocksDB's ~756 MB/s (t=4-8). Both are crash-safe: packfile fsyncs the data file + directory; RocksDB's `IngestExternalFile` fsyncs the SST file after linking it into the DB directory (via `SyncIngestedFile`). Packfile uses `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1MB during the append phase to initiate background writeback of dirty pages to EBS. **Per-phase timing:** without `sync_file_range`, packfile's parallel compression completes in ~879ms, accumulating 412MB of dirty pages — then `fdatasync()` must flush all 412MB at once (2,311ms, total: 3.19s = 607 MB/s). With `sync_file_range`, writeback overlaps with compression: the append phase is throttled to ~2.3s by EBS bandwidth, but `fdatasync()` finishes in ~55ms (total: 2.30s = 821 MB/s). RocksDB's C-side SST builder naturally matches EBS writeback pace (2.45s append, 108ms finish); adding `bytes_per_sync` to RocksDB had no measurable effect. EBS c=4-32 numbers are measured from isolated phase tests (c=8) and validated by TestWriteThroughput first-concurrent-level (c=4=831 MB/s); same-process sequential runs on EBS show contamination from kernel dirty page throttling across iterations.
 - **NVMe**: Packfile scales to ~3.1 GB/s at c=16-32, up from ~2.5 GB/s before `sync_file_range`. The 156ms fdatasync savings (from ~158ms to ~2ms) is significant when total time is <1s. The serial main goroutine (block building) becomes the bottleneck at c=16+.
 
+### Content Hash Overhead (SHA-256, NVMe)
+
+`ContentHash: true` computes a chunked SHA-256 over the logical item stream. For concurrent writes, per-worker hash goroutines compute chunk digests in parallel with zstd compression.
+
+| Concurrency | No hash (MB/s) | With hash (MB/s) | Overhead |
+|-------------|---------------|------------------|----------|
+| 1 | 466 | 333 | 29% |
+| 4 | 1,943 | 1,573 | 19% |
+| 8 | 2,651 | 2,431 | 8% |
+| 16 | 2,732 | 2,574 | 6% |
+| 24 | 2,814 | 2,503 | 11% |
+
+At c=1, SHA-256 runs serially after compression and adds 29% overhead. At c=4+, SHA-256 overlaps with zstd compression in parallel goroutines — overhead drops to 6-11%. On EBS at c=8+, the overhead is zero (EBS bandwidth is the bottleneck: both hash and no-hash plateau at ~592 MB/s, throttled by `sync_file_range` writeback).
+
 ### Write Peak Memory (RssAnon delta, excluding page cache)
 
 | Benchmark | Peak Delta |
@@ -76,35 +90,35 @@ Read memory is minimal — just pooled `blockBuf` decoders from `sync.Pool`, sca
 
 | Benchmark | Throughput (MB/s) | ns/op | Allocs |
 |-----------|------------------|-------|--------|
-| PackfileSeqRead | 2,561 | 755M | 800KB / 15 |
-| RocksDBSeqRead | 487 | 3,970M | 96B / 6 |
+| PackfileSeqRead | 2,490 | 777M | 800KB / 14 |
+| RocksDBSeqRead | 510 | 3,786M | 120B / 6 |
 
-Packfile is 5.3x faster than RocksDB for sequential reads. The gap comes from two factors: (1) RocksDB's per-item iterator API requires ~26M CGO crossings (Valid + Next + ValueSlice per event) vs packfile's ~68K (one decompress per block, then pure Go iteration), and (2) RocksDB's prefix-compressed KV entry decoding is inherently more work per item than packfile's flat offset-array format. Both formats use the `StoreReader` interface via `ReadEvents`, adding `iter.Seq2` yield overhead per item (~34ns/event, ~8% for RocksDB, ~3% for packfile). The no-compression benchmarks below show the gap widens to 9.1x without zstd, confirming the format overhead is the dominant factor.
+Packfile is 4.9x faster than RocksDB for sequential reads. The gap comes from two factors: (1) RocksDB's per-item iterator API requires ~26M CGO crossings (Valid + Next + ValueSlice per event) vs packfile's ~68K (one decompress per block, then pure Go iteration), and (2) RocksDB's prefix-compressed KV entry decoding is inherently more work per item than packfile's flat offset-array format. Both formats use the `StoreReader` interface via `ReadEvents`, adding `iter.Seq2` yield overhead per item (~34ns/event, ~8% for RocksDB, ~3% for packfile). The no-compression benchmarks below show the gap widens to 7.4x without zstd, confirming the format overhead is the dominant factor.
 
 ## Random Point Read
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileRandomRead | 11,300 | 256B / 2 |
-| RocksDBRandomRead | 13,400 | 289B / 7 |
+| PackfileRandomRead | 12,260 | 262B / 2 |
+| RocksDBRandomRead | 14,310 | 289B / 7 |
 
-Packfile is 1.19x faster. Both formats go through the `StoreReader` interface (`ReadEvent`), which copies the value into an owned slice. RocksDB's allocs are higher (289B/7 vs 256B/2) due to `GetPinned` + copy vs packfile's direct buffer extraction.
+Packfile is 1.17x faster. Both formats go through the `StoreReader` interface (`ReadEvent`), which copies the value into an owned slice. RocksDB's allocs are higher (289B/7 vs 262B/2) due to `GetPinned` + copy vs packfile's direct buffer extraction.
 
 ## Parallel Read (32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelRead | 687 | 230B / 1 |
-| RocksDBParallelRead | 853 | 265B / 6 |
+| PackfileParallelRead | 723 | 229B / 1 |
+| RocksDBParallelRead | 914 | 265B / 6 |
 
-Packfile is 1.24x faster under parallel load. The gap (vs 1.19x for single-threaded random reads) comes from RocksDB's higher per-read allocation overhead through the `StoreReader` interface being amplified across 32 cores.
+Packfile is 1.26x faster under parallel load. The gap (vs 1.17x for single-threaded random reads) comes from RocksDB's higher per-read allocation overhead through the `StoreReader` interface being amplified across 32 cores.
 
 ## Batch Read (128 events from offset 0)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadBatch128 | 10,690 | 91B / 3 |
-| RocksDBReadBatch128 | 63,300 | 96B / 6 |
+| PackfileReadBatch128 | 10,840 | 108B / 3 |
+| RocksDBReadBatch128 | 64,470 | 108B / 6 |
 
 Packfile is 5.9x faster than RocksDB for batch reads from a known offset. Both use `ReadEvents` via the `StoreReader` interface. Packfile decompresses one block (single CGO call) to yield all 128 events in a flat buffer. RocksDB iterates with 384 CGO crossings (3 per event x 128) plus per-entry prefix-compressed key decoding.
 
@@ -112,28 +126,28 @@ Packfile is 5.9x faster than RocksDB for batch reads from a known offset. Both u
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileRangeScan128 | 22,800 | 114B / 3 |
-| RocksDBRangeScan128 | 72,000 | 96B / 6 |
+| PackfileRangeScan128 | 23,360 | 111B / 3 |
+| RocksDBRangeScan128 | 73,350 | 108B / 6 |
 
-Packfile is 3.2x faster than RocksDB. Both use `ReadEvents` via the `StoreReader` interface, creating a new iterator per call. Compared to batch-from-0 (10.7us), the random seek adds ~12us for packfile (locating and decompressing the target block).
+Packfile is 3.1x faster than RocksDB. Both use `ReadEvents` via the `StoreReader` interface, creating a new iterator per call. Compared to batch-from-0 (10.8us), the random seek adds ~12.5us for packfile (locating and decompressing the target block).
 
 ## Scattered Read (50 random indices)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadIndices | 158,000 | 35KB / 81 |
-| RocksDBReadIndices | 206,000 | 20.5KB / 271 |
+| PackfileReadIndices | 154,800 | 38KB / 76 |
+| RocksDBReadIndices | 211,700 | 20.5KB / 271 |
 
-Both use 8 internal goroutines for parallel I/O via the `StoreReader` interface. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, and `SetFillCache(false)`. RocksDB's higher alloc count (271 vs 81) comes from copying each value into an owned `[]byte` slice (packfile returns slices from decompressed block buffers). Packfile is 1.30x faster.
+Both use 8 internal goroutines for parallel I/O via the `StoreReader` interface. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, and `SetFillCache(false)`. RocksDB's higher alloc count (271 vs 76) comes from copying each value into an owned `[]byte` slice (packfile returns slices from decompressed block buffers). Packfile is 1.37x faster.
 
 ## Parallel Scattered Read (50 indices, 32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelReadIndices | 42,000 | 41KB / 81 |
-| RocksDBParallelReadIndices | 45,000 | 20.5KB / 271 |
+| PackfileParallelReadIndices | 33,490 | 27KB / 77 |
+| RocksDBParallelReadIndices | 48,620 | 20.5KB / 272 |
 
-Under parallel scattered load packfile is 1.07x faster — effectively tied.
+Under parallel scattered load packfile is 1.45x faster.
 
 ## Cold Cache Scattered Read (1,000 indices on distinct blocks, includes open)
 
@@ -143,17 +157,17 @@ Both formats use the `StoreReader` interface (`ReadIndices` with `WithConcurrenc
 
 | Benchmark | Goroutines | NVMe (ms) | EBS (ms) |
 |-----------|-----------|-----------|----------|
-| Packfile | 1 | 106 | 772 |
+| Packfile | 1 | 107 | 772 |
 | Packfile | 8 | 15.8 | 269 |
 | Packfile | 32 | 6.6 | 344 |
 | Packfile | 64 | 5.2 | 332 |
-| RocksDB | 1 | 111 | 790 |
-| RocksDB | 8 | 19.1 | 257 |
-| RocksDB | 32 | 10.0 | 333 |
-| RocksDB | 64 | 9.9 | 334 |
+| RocksDB | 1 | 114 | 790 |
+| RocksDB | 8 | 20.1 | 257 |
+| RocksDB | 32 | 10.7 | 333 |
+| RocksDB | 64 | 10.4 | 334 |
 
 Notes:
-- **NVMe scales with concurrency** for both formats. Packfile at c=64 (5.2ms) is 1.9x faster than RocksDB at c=64 (9.9ms).
+- **NVMe scales with concurrency** for both formats. Packfile at c=64 (5.2ms) is 2.0x faster than RocksDB at c=64 (10.4ms).
 - **EBS is IOPS-limited at ~3,000 IOPS.** At c=8, both formats are similar (packfile 269ms, RocksDB 257ms). At c=32+, both converge to ~333ms (the 3,000 IOPS floor).
 
 ### Improving EBS Cold Cache Latency
@@ -178,7 +192,7 @@ Compression disabled for both formats to isolate format overhead, block-building
 
 | Benchmark | NVMe (MB/s) | EBS (MB/s) |
 |-----------|------------|-----------|
-| Packfile (no zstd) | 1,225 | 129 |
+| Packfile (no zstd) | 1,225 | 130 |
 | RocksDB (no zstd) | 656 | 124 |
 
 Packfile raw I/O is 1.9x faster than RocksDB on NVMe. Without compression, both formats are **I/O-bound** — writing uncompressed data (1.9GB) dominates. RocksDB's gap on NVMe is SST block construction + key encoding + ingest overhead. On EBS both are equal (both hit EBS bandwidth limit). Packfile's improvement over the pre-`sync_file_range` number (1,002 → 1,225 MB/s on NVMe) comes from eliminating the fdatasync penalty for the 1.9GB uncompressed output.
@@ -189,25 +203,25 @@ Without compression, both formats are **slower** than with-compression at high c
 
 | Benchmark | Packfile (no zstd) | RocksDB (no zstd) | Packfile (zstd) | RocksDB (zstd) |
 |-----------|-------------------|-------------------|----------------|----------------|
-| Sequential | 5,232 MB/s | 567 MB/s | 2,561 MB/s | 487 MB/s |
-| Point read | 6.0 us | 8.8 us | 11.3 us | 13.4 us |
-| Scattered 50 | 129 us | 185 us | 158 us | 206 us |
-| Range scan 128 | 11 us | 62 us | 22.8 us | 72.0 us |
+| Sequential | 4,162 MB/s | 559 MB/s | 2,490 MB/s | 510 MB/s |
+| Point read | 7.1 us | 8.6 us | 12.3 us | 14.3 us |
+| Scattered 50 | 131 us | 172 us | 155 us | 212 us |
+| Range scan 128 | 13 us | 63 us | 23.4 us | 73.4 us |
 
 Notes:
-- **Sequential reads**: Packfile 9.2x faster than RocksDB without compression (vs 5.3x with). Without compression, the gap reveals the raw format + API overhead: packfile iterates a flat buffer in pure Go (~68K blocks), while RocksDB decodes prefix-compressed entries via ~26M CGO crossings. With compression, both spend ~350ms decompressing (packfile via CGO, RocksDB internally in C++), which narrows the ratio.
-- **Point reads**: Packfile is 1.5x faster without compression (6.0 vs 8.8 us). With compression, 1.19x (11.3 vs 13.4 us). Decompression cost equalizes the two — packfile's Go-side decompress + extract costs slightly more than RocksDB's single C++ Get().
-- **Scattered**: With compression, packfile is 1.30x faster (158 vs 206 us). Without compression, packfile is 1.4x faster (129 vs 185 us). RocksDB's `BatchedMultiGetCF` with sorted input is efficient for no-compression point lookups where block-index traversal cost per key is lower (no decompression step).
-- **Range scan**: Packfile stays 5.6x faster without compression (11 vs 62 us). With compression, 3.2x faster (22.8 vs 72.0 us).
+- **Sequential reads**: Packfile 7.4x faster than RocksDB without compression (vs 4.9x with). Without compression, the gap reveals the raw format + API overhead: packfile iterates a flat buffer in pure Go (~68K blocks), while RocksDB decodes prefix-compressed entries via ~26M CGO crossings. With compression, both spend ~350ms decompressing (packfile via CGO, RocksDB internally in C++), which narrows the ratio.
+- **Point reads**: Packfile is 1.2x faster without compression (7.1 vs 8.6 us). With compression, 1.17x (12.3 vs 14.3 us). Decompression cost equalizes the two — packfile's Go-side decompress + extract costs slightly more than RocksDB's single C++ Get().
+- **Scattered**: With compression, packfile is 1.37x faster (155 vs 212 us). Without compression, packfile is 1.3x faster (131 vs 172 us). RocksDB's `BatchedMultiGetCF` with sorted input is efficient for no-compression point lookups where block-index traversal cost per key is lower (no decompression step).
+- **Range scan**: Packfile stays 4.8x faster without compression (13 vs 63 us). With compression, 3.1x faster (23.4 vs 73.4 us).
 
 ## Open Latency (warm page cache)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileOpen | 320,000 | 927KB / 14 |
-| RocksDBOpen | 1,951,000 | 537B / 7 |
+| PackfileOpen | 317,200 | 927KB / 14 |
+| RocksDBOpen | 2,181,000 | 429B / 7 |
 
-Packfile opens in 320us (reads index into memory). RocksDB opens in 2.0ms (with skip-stats optimizations). These are warm-cache numbers; cold-cache open is included in the cold cache benchmarks above.
+Packfile opens in 317us (reads index into memory). RocksDB opens in 2.2ms (with skip-stats optimizations). RocksDB is 6.9x slower. These are warm-cache numbers; cold-cache open is included in the cold cache benchmarks above.
 
 ## File Sizes
 
@@ -241,27 +255,27 @@ MPHF+packfile is 10% smaller. Build time: MPHF 6.1s vs RocksDB 7.5s.
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| BitmapMPHFLookup | 12,876 | 6,953B / 147 |
-| BitmapRocksDBLookup | 17,091 | 6,453B / 149 |
+| BitmapMPHFLookup | 11,991 | 7,198B / 145 |
+| BitmapRocksDBLookup | 17,436 | 6,488B / 149 |
 
-MPHF is **1.3x faster** for single-key lookups. Both allocations are dominated by roaring bitmap deserialization. The gap is narrower than ARM64 (1.7x) because x86's faster single-core performance benefits both implementations, compressing the ratio.
+MPHF is **1.45x faster** for single-key lookups. Both allocations are dominated by roaring bitmap deserialization.
 
 ### Warm Cache — Parallel Lookup (32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| BitmapMPHFParallel15 | 1,234 | 6,446B / 145 |
-| BitmapRocksDBParallel15 | 4,578 | 6,346B / 148 |
+| BitmapMPHFParallel15 | 991 | 6,385B / 144 |
+| BitmapRocksDBParallel15 | 4,258 | 6,198B / 148 |
 
-MPHF is **3.7x faster** under parallel load. The hash-to-offset lookup scales linearly with cores; RocksDB's block index traversal and CGO crossings create contention.
+MPHF is **4.3x faster** under parallel load. The hash-to-offset lookup scales linearly with cores; RocksDB's block index traversal and CGO crossings create contention.
 
 ### Warm Cache — Batch Lookup (15 keys)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| BitmapMPHFLookupKeys15 | 140,336 | 137,193B / 2,199 |
+| BitmapMPHFLookupKeys15 | 133,600 | 220KB / 2,158 |
 
-`LookupKeys` resolves 15 keys in a single call (~9.4µs/key). RocksDB's `LookupKeys` uses `BatchedMultiGetCF` with sorted input and concurrent goroutines — see cold cache benchmarks below for comparison.
+`LookupKeys` resolves 15 keys in a single call (~8.9µs/key). RocksDB's `LookupKeys` uses `BatchedMultiGetCF` with sorted input and concurrent goroutines — see cold cache benchmarks below for comparison.
 
 ### Cold Cache — NVMe (drop page cache, open + lookup + close per iteration)
 
@@ -269,15 +283,15 @@ Each iteration drops file cache via `posix_fadvise FADV_DONTNEED` (MPHF/packfile
 
 | Lookups | MPHF serial (µs) | MPHF LookupKeys (µs) | RocksDB serial (µs) | RocksDB parallel (µs) |
 |---------|------------------|-----------------------|---------------------|-----------------------|
-| 1 | 666 | 730 | 1,420 | 1,267 |
-| 5 | 1,037 | 745 | 1,838 | 1,545 |
-| 15 | 2,186 | 909 | 2,952 | 1,795 |
-| 50 | 6,111 | 1,543 | 6,462 | 2,116 |
+| 1 | 731 | 646 | 1,412 | 1,421 |
+| 5 | 1,058 | 745 | 1,847 | 1,556 |
+| 15 | 2,032 | 869 | 2,928 | 1,752 |
+| 50 | 6,134 | 1,417 | 6,635 | 2,139 |
 
 Notes:
-- **MPHF serial is 1.1-2.1x faster than RocksDB serial** across all lookup counts. At 1 lookup, the gap is dominated by open latency: MPHF opens in ~0.6ms (mmap hash + packfile) vs RocksDB ~1.4ms.
-- **MPHF LookupKeys is the fastest option at all counts.** At 50 lookups, LookupKeys (1.5ms) is 4.0x faster than MPHF serial (6.1ms) — the batch API sorts by file offset and coalesces nearby reads, converting 50 random I/Os into fewer sequential ones.
-- **RocksDB parallel converges with MPHF LookupKeys at high counts** (50 lookups: 2.1ms vs 1.5ms). Both amortize open cost and parallelize I/O, but LookupKeys has lower overhead (no goroutine spawn, sorted access pattern).
+- **MPHF serial is 1.1-1.9x faster than RocksDB serial** across all lookup counts. At 1 lookup, the gap is dominated by open latency: MPHF opens in ~0.7ms (mmap hash + packfile) vs RocksDB ~1.4ms.
+- **MPHF LookupKeys is the fastest option at all counts.** At 50 lookups, LookupKeys (1.4ms) is 4.3x faster than MPHF serial (6.1ms) — the batch API sorts by file offset and coalesces nearby reads, converting 50 random I/Os into fewer sequential ones.
+- **RocksDB parallel converges with MPHF LookupKeys at high counts** (50 lookups: 2.1ms vs 1.4ms). Both amortize open cost and parallelize I/O, but LookupKeys has lower overhead (no goroutine spawn, sorted access pattern).
 - All latencies are ~1.5-1.6x faster than ARM64 (NVMe I/O is similar; x86 CPU handles hash computation, mmap setup, and bitmap deserialization faster).
 
 ### Cold Cache — EBS (gp3, 3,000 IOPS baseline)
