@@ -37,6 +37,19 @@ const (
 	Raw
 )
 
+func (f RecordFormat) String() string {
+	switch f {
+	case Compressed:
+		return "Compressed"
+	case Uncompressed:
+		return "Uncompressed"
+	case Raw:
+		return "Raw"
+	default:
+		return fmt.Sprintf("RecordFormat(%d)", int(f))
+	}
+}
+
 // On-disk flag bits (uint8 at trailer offset 5).
 const (
 	flagNoCompression uint8 = 1 << 0

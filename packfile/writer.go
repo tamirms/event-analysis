@@ -29,8 +29,9 @@ type WriterOptions struct {
 	// Raw: raw records with no integrity wrapper.
 	Format RecordFormat
 
-	// Concurrency sets the number of compression goroutines.
-	// 0 or 1 means serial. Ignored when Format is not Compressed.
+	// Concurrency sets the number of block-processing goroutines.
+	// 0 or 1 means serial. Ignored when Format is not Compressed
+	// and ContentHash is false (nothing to parallelize).
 	Concurrency int
 
 	// ContentHash enables SHA-256 content hashing over the logical item stream.
@@ -46,7 +47,7 @@ type WriterOptions struct {
 
 type blockResult struct {
 	blockID   uint32
-	data      []byte   // payload → compressed payload
+	data      []byte   // payload → format-processed payload
 	forIndex  []byte   // FOR index: [packed][1B W][4B min][4B CRC32C]; nil when recordSize==1
 	hashSizes []uint32 // entry sizes for hash goroutine
 	digest    [sha256.Size]byte
@@ -61,7 +62,7 @@ type hashWork struct {
 
 // Writer creates a new packfile with item-level semantics.
 // Items are accumulated into records of recordSize items each,
-// compressed (optionally), and written with an offset index.
+// format-processed (compressed/CRC/raw), and written with an offset index.
 type Writer struct {
 	// File I/O
 	file         *os.File
@@ -118,8 +119,8 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 		return nil, errors.New("packfile: RecordSize must be > 0")
 	}
 	conc := opts.Concurrency
-	if opts.Format != Compressed {
-		conc = 0 // no pipeline when compression is disabled
+	if opts.Format != Compressed && !opts.ContentHash {
+		conc = 0 // no pipeline when nothing to parallelize
 	}
 
 	tmpPath := path + ".tmp." + strconv.FormatInt(rand.Int63(), 10)
@@ -148,12 +149,12 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 		w.resultCh = make(chan blockResult, w.concurrency)
 		w.writerDone = make(chan error, 1)
 
-		var compressWg sync.WaitGroup
+		var blockWg sync.WaitGroup
 		for range w.concurrency {
-			compressWg.Go(w.compressWorker)
+			blockWg.Go(w.blockWorker)
 		}
 		go func() {
-			compressWg.Wait()
+			blockWg.Wait()
 			close(w.resultCh)
 		}()
 		go w.runWriter()
@@ -162,11 +163,15 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	return w, nil
 }
 
-// compressWorker reads uncompressed blocks from workCh and sends compressed
-// results to resultCh, preserving the blockID for reordering.
-func (w *Writer) compressWorker() {
-	c := zstd.NewCompressor()
-	defer c.Close()
+// blockWorker reads blocks from workCh, performs format-specific processing
+// (compression/CRC) and optional content hashing, then sends results to
+// resultCh preserving blockID for reordering.
+func (w *Writer) blockWorker() {
+	var c *zstd.Compressor
+	if w.format == Compressed {
+		c = zstd.NewCompressor()
+		defer c.Close()
+	}
 
 	var hashIn chan hashWork
 	var hashOut chan [sha256.Size]byte
@@ -193,33 +198,53 @@ func (w *Writer) compressWorker() {
 	}
 
 	for work := range w.workCh {
+		// Phase 1: queue hash work (hash goroutine reads work.data concurrently).
 		if work.hashSizes != nil {
 			hashIn <- hashWork{data: work.data, hashSizes: work.hashSizes}
 		}
 
-		// Compress payload only; the FOR index is never compressed.
-		compressed, err := c.Encode(work.data)
-		if err != nil {
-			if work.hashSizes != nil {
+		// Phase 2: format processing (read-only on work.data, concurrent with hash).
+		var compressed []byte
+		var crc uint32
+		var fmtErr error
+		switch w.format {
+		case Compressed:
+			compressed, fmtErr = c.Encode(work.data)
+		case Uncompressed:
+			crc = CRC32C(work.data)
+		}
+
+		// Phase 3: collect hash (hash goroutine done reading work.data).
+		if work.hashSizes != nil {
+			if fmtErr != nil {
 				<-hashOut
+			} else {
+				work.digest = <-hashOut
+				work.hasHash = true
 			}
-			w.resultCh <- blockResult{blockID: work.blockID, err: fmt.Errorf("packfile: compress block %d: %w", work.blockID, err)}
+			work.hashSizes = nil
+		}
+		if fmtErr != nil {
+			w.resultCh <- blockResult{blockID: work.blockID, err: fmt.Errorf("packfile: block %d: %w", work.blockID, fmtErr)}
 			return
 		}
 
-		if work.hashSizes != nil {
-			work.digest = <-hashOut
-			work.hasHash = true
-			work.hashSizes = nil
+		// Assemble: format-specific payload + uncompressed FOR index.
+		switch w.format {
+		case Compressed:
+			work.data = append(append(work.data[:0], compressed...), work.forIndex...)
+		case Uncompressed:
+			work.data = binary.LittleEndian.AppendUint32(work.data, crc)
+			work.data = append(work.data, work.forIndex...)
+		default: // Raw
+			work.data = append(work.data, work.forIndex...)
 		}
-		// Assemble: compressed payload + uncompressed FOR index.
-		work.data = append(append(work.data[:0], compressed...), work.forIndex...)
 		work.forIndex = nil
 		w.resultCh <- work
 	}
 }
 
-// runWriter receives compressed blocks and writes them in blockID order.
+// runWriter receives processed blocks and writes them in blockID order.
 func (w *Writer) runWriter() {
 	defer close(w.writerDone)
 
@@ -288,7 +313,7 @@ func (w *Writer) Append(parts ...[]byte) error {
 	return nil
 }
 
-// writeBlock appends a compressed (or uncompressed) record to the file,
+// writeBlock appends a format-processed record to the file,
 // updates offsets/pos, and initiates background writeback if configured.
 func (w *Writer) writeBlock(data []byte) error {
 	w.offsets = append(w.offsets, w.pos)
@@ -315,21 +340,22 @@ func (w *Writer) closeCompressor() {
 
 // buildBlock extracts the current payload buffer and (for recordSize>1) encodes
 // the FOR index. Returns them separately: the FOR index is never compressed and
-// always carries its own CRC32C.
+// always carries its own CRC32C. Payload is allocated with spare capacity for
+// CRC (4B) + forIndex so callers can append without reallocation.
 func (w *Writer) buildBlock() (payload []byte, forIndex []byte) {
-	payload = make([]byte, len(w.buf))
-	copy(payload, w.buf)
-	w.buf = w.buf[:0]
 	if w.recordSize > 1 {
 		encoded := intpack.EncodeGroup(w.sizes)
 		forIndex = binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 	}
+	payload = make([]byte, len(w.buf), len(w.buf)+4+len(forIndex))
+	copy(payload, w.buf)
+	w.buf = w.buf[:0]
 	w.sizes = w.sizes[:0]
 	return
 }
 
 func (w *Writer) flush() error {
-	// Serial path: compress inline. Content hash is handled by serialHasher in Append.
+	// Serial path: format-process inline. Content hash is handled by serialHasher in Append.
 	if w.concurrency <= 1 {
 		payload, forIndex := w.buildBlock()
 		var block []byte
@@ -342,7 +368,7 @@ func (w *Writer) flush() error {
 			if err != nil {
 				return err
 			}
-			block = append(compressed, forIndex...)
+			block = append(append(payload[:0], compressed...), forIndex...)
 		case Uncompressed:
 			// CRC_items covers payload only; FOR index has its own CRC.
 			payload = binary.LittleEndian.AppendUint32(payload, CRC32C(payload))
@@ -353,7 +379,7 @@ func (w *Writer) flush() error {
 		return w.writeBlock(block)
 	}
 
-	// Concurrent path (Compressed-only: Create sets conc=0 for other formats).
+	// Concurrent path: blockWorker handles all formats.
 	var hashSizes []uint32
 	if w.contentHash {
 		hashSizes = w.getSizes()[:len(w.sizes)]
@@ -390,7 +416,7 @@ func (w *Writer) Finish(appData []byte) error {
 		}
 	}
 
-	// Drain the streaming compression pipeline.
+	// Drain the block-processing pipeline.
 	if w.workCh != nil {
 		close(w.workCh)
 		err := <-w.writerDone

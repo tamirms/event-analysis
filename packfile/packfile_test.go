@@ -1003,3 +1003,118 @@ func TestAppDataEmpty(t *testing.T) {
 		t.Fatalf("expected nil app data, got %d bytes", len(got))
 	}
 }
+
+// TestWriterMatrix exercises all 24 Format × Concurrency × Hash × RecordSize combinations.
+func TestWriterMatrix(t *testing.T) {
+	items := makeItems(300, 200)
+	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
+		for _, conc := range []int{0, 4} {
+			for _, hash := range []bool{false, true} {
+				for _, rs := range []int{1, 128} {
+					t.Run(fmt.Sprintf("%s/c%d/hash=%v/rs=%d", format, conc, hash, rs), func(t *testing.T) {
+						opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: hash, RecordSize: rs}
+						path := writeTestPackfile(t, items, opts)
+
+						r := Open(path)
+						defer r.Close()
+
+						tc, err := r.TotalItems()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if tc != len(items) {
+							t.Fatalf("TotalItems = %d, want %d", tc, len(items))
+						}
+
+						for i, want := range items {
+							if got := readItemCopy(t, r, i); !bytes.Equal(got, want) {
+								t.Fatalf("ReadItem(%d): data mismatch", i)
+							}
+						}
+
+						storedHash, ok, err := r.ContentHash()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if hash {
+							if !ok {
+								t.Fatal("expected content hash to be present")
+							}
+							if storedHash == ([32]byte{}) {
+								t.Fatal("expected non-zero hash")
+							}
+							if err := r.Verify(context.Background()); err != nil {
+								t.Fatalf("Verify: %v", err)
+							}
+						} else {
+							if ok {
+								t.Fatal("expected no content hash when disabled")
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestContentHashCrossFormat verifies that the same items produce identical hashes
+// across all formats and concurrency modes (hash is over the logical item stream).
+func TestContentHashCrossFormat(t *testing.T) {
+	items := makeItems(300, 200)
+	var hashes [][32]byte
+	var labels []string
+
+	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
+		for _, conc := range []int{0, 4} {
+			opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: true, RecordSize: 128}
+			path := writeTestPackfile(t, items, opts)
+			r := Open(path)
+			h, ok, err := r.ContentHash()
+			r.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("expected content hash")
+			}
+			hashes = append(hashes, h)
+			labels = append(labels, fmt.Sprintf("%s/c%d", format, conc))
+		}
+	}
+
+	for i := 1; i < len(hashes); i++ {
+		if hashes[i] != hashes[0] {
+			t.Fatalf("hash mismatch: %s (%x) != %s (%x)", labels[i], hashes[i], labels[0], hashes[0])
+		}
+	}
+}
+
+// TestBlockWorkerRaceStress exercises the concurrent blockWorker path with small
+// record sizes to maximise goroutine interleaving. Run with -race -count=10.
+func TestBlockWorkerRaceStress(t *testing.T) {
+	items := makeItems(200, 100)
+	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
+		for _, rs := range []int{1, 2, 3} {
+			t.Run(fmt.Sprintf("%s/rs=%d", format, rs), func(t *testing.T) {
+				opts := WriterOptions{Format: format, Concurrency: 8, ContentHash: true, RecordSize: rs}
+				path := writeTestPackfile(t, items, opts)
+
+				r := Open(path)
+				defer r.Close()
+
+				tc, err := r.TotalItems()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc != len(items) {
+					t.Fatalf("TotalItems = %d, want %d", tc, len(items))
+				}
+
+				if err := r.Verify(context.Background()); err != nil {
+					t.Fatalf("Verify: %v", err)
+				}
+			})
+		}
+	}
+}

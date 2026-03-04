@@ -10,7 +10,7 @@ When a record contains multiple items, the reader needs to know where each item 
 
 The natural approach is a flat file: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
 
-Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel compression, SHA-256 content hashing, atomic writes, CRC32C integrity checks, and safe concurrent reads.
+Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, atomic writes, CRC32C integrity checks, and safe concurrent reads.
 
 ## What Packfile Does
 
@@ -30,7 +30,7 @@ Error handling omitted for clarity. All functions return errors.
 ```go
 w, _ := packfile.Create("events-00042.pack", packfile.WriterOptions{
     RecordSize:  128,         // items per record (default 128)
-    Concurrency: 4,           // parallel compression goroutines
+    Concurrency: 4,           // parallel block-processing goroutines
     ContentHash: true,        // compute SHA-256 content hash
 })
 
@@ -171,8 +171,9 @@ type WriterOptions struct {
     // Raw: raw records with no integrity wrapper.
     Format RecordFormat
 
-    // Concurrency sets the number of compression goroutines.
-    // 0 or 1 means serial. Ignored when Format is not Compressed.
+    // Concurrency sets the number of block-processing goroutines.
+    // 0 or 1 means serial. Ignored when Format is not Compressed
+    // and ContentHash is false (nothing to parallelize).
     Concurrency int
 
     // ContentHash enables SHA-256 content hashing over the logical item stream.
@@ -393,7 +394,7 @@ finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
 K = RecordSize
 ```
 
-The hash depends on record size (chunk boundaries), item order, and item content. Same items with the same record size in the same order produce the same hash. The hash is independent of compression and format version. For concurrent writes, per-worker hash goroutines compute chunk digests in parallel with zstd compression.
+The hash depends on record size (chunk boundaries), item order, and item content. Same items with the same record size in the same order produce the same hash. The hash is independent of compression and format version. For concurrent writes, per-worker hash goroutines compute chunk digests in parallel with format processing (compression, CRC, or no-op).
 
 ### Trailer (64 bytes at EOF)
 
@@ -536,14 +537,14 @@ Single-pass setup then parallel execution:
 
 No channels, no reorder goroutine — workers call `fn` directly. The caller handles ordering via the `pos` argument (position in the original indices slice). On error or context cancellation, an atomic flag stops remaining workers. A `sync.Once` captures the first error.
 
-### Parallel Compression Pipeline
+### Parallel Block-Processing Pipeline
 
-When `Concurrency > 1`, the writer runs a streaming pipeline:
+When `Concurrency > 1` (enabled for Compressed format, or any format with `ContentHash: true`), the writer runs a streaming pipeline:
 
 1. **Append** accumulates items into a buffer until `RecordSize` items.
-2. **Flush** builds the uncompressed record and sends it to `workCh`.
-3. **N compress workers** receive records from `workCh`, compress via zstd, optionally compute SHA-256 chunk digest in a parallel goroutine (overlapping with CGo zstd), and send results to `resultCh`.
-4. **Writer goroutine** receives compressed records from `resultCh`, reorders by block ID, and writes sequentially. Chunk digests are appended to the digest buffer in order.
+2. **Flush** builds the raw record payload and sends it to `workCh`.
+3. **N block workers** receive records from `workCh`, perform format-specific processing (zstd compression / CRC32C / no-op for Raw), optionally compute SHA-256 chunk digest in a parallel goroutine (overlapping with format processing), and send results to `resultCh`.
+4. **Writer goroutine** receives processed records from `resultCh`, reorders by block ID, and writes sequentially. Chunk digests are appended to the digest buffer in order.
 
 ### BytesPerSync
 

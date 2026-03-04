@@ -99,7 +99,7 @@ all of these:
 
 - Frame-of-Reference encoding/decoding (intpack/: 125 lines)
 - Record decoding with zstd + CRC32C + FOR index (packfile/decoder.go)
-- Item accumulation, record building, and streaming compression pipeline (packfile/writer.go)
+- Item accumulation, record building, and block-processing pipeline (packfile/writer.go)
 - Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
 - Work-stealing parallel I/O with direct callback (packfile/reader.go — ReadItems)
 - Content hashing (packfile/contenthash.go)
@@ -115,7 +115,7 @@ was previously in eventstore has been absorbed into packfile.
 
 | Aspect | Packfile | RocksDB |
 |--------|----------|---------|
-| **Compression pipeline** | Bounded channel + N workers + reorder buffer (packfile.Writer) | `SetCompressionOptionsParallelThreads(N)` |
+| **Block-processing pipeline** | Bounded channel + N workers + reorder buffer (packfile.Writer) | `SetCompressionOptionsParallelThreads(N)` |
 | **Parallel read** | ReadItems: record grouping + work-stealing parallel I/O + direct callback | `BatchedMultiGetCF` with sorted input |
 | **Block buffer management** | sync.Pool for Decoder (owns ZSTD_DCtx) + read buffers | Handled internally by RocksDB |
 | **Index format** | FOR-128 encoding, speculative read at open | B-tree block index (automatic) |
@@ -123,7 +123,7 @@ was previously in eventstore has been absorbed into packfile.
 | **Checksums** | Manual CRC32C of index + trailer | Automatic per-block (configurable) |
 
 The packfile's complexity is concentrated in two areas that are difficult to get right:
-(1) the concurrent compression pipeline with in-order reordering (packfile/writer.go), and
+(1) the concurrent block-processing pipeline with in-order reordering (packfile/writer.go), and
 (2) ReadItems parallel I/O (work-stealing workers calling a callback directly with borrowed
 entries in packfile/reader.go). Both are well-tested and shared by all callers (eventstore
 and bitmapindex are thin facades). This consolidation reduces maintenance surface compared
@@ -507,7 +507,7 @@ K = RecordSize (BatchSize for bitmapindex)
 The hash depends on record size (chunk boundaries), entry order, and entry content.
 Same events with the same record size in the same order = same hash. The hash is
 independent of compression and format version. For concurrent writes, per-worker
-hash goroutines compute chunk digests in parallel with zstd compression.
+hash goroutines compute chunk digests in parallel with format processing (compression, CRC, or no-op).
 
 For bitmap index: entries are hashed in rank order (0, 1, ..., N-1). Each entry
 is `[fingerprint || bitmap]`, hashed as one length-prefixed unit.
