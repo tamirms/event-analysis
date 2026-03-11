@@ -44,15 +44,11 @@ type openResult struct {
 // Public methods block (via waitOpen) until the goroutine completes.
 // Close must always be called to release resources.
 type Reader struct {
-	ch        <-chan openResult
-	once      sync.Once
-	closeOnce sync.Once
-
 	openResult  // embedded: file, trailer, offsets, metadata fields
 	concurrency int
-
-	openErr  error
-	closeErr error
+	waitOpen    func() error // blocks until background open completes
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // ReaderOption configures Reader behavior.
@@ -62,20 +58,6 @@ type ReaderOption func(*Reader)
 // Values less than 1 are clamped to 1. Default 8.
 func WithConcurrency(n int) ReaderOption {
 	return func(r *Reader) { r.concurrency = n }
-}
-
-// drain receives the goroutine result and populates all Reader fields.
-func (r *Reader) drain() {
-	res := <-r.ch
-	r.openErr = res.err
-	res.err = nil
-	r.openResult = res
-}
-
-// waitOpen blocks until the background Open goroutine has finished.
-func (r *Reader) waitOpen() error {
-	r.once.Do(r.drain)
-	return r.openErr
 }
 
 // ItemReader is the common interface satisfied by both *Reader and *LiveWriter.
@@ -96,7 +78,7 @@ type ItemReader interface {
 func newReaderFromState(res openResult) *Reader {
 	r := &Reader{concurrency: defaultConcurrency}
 	r.openResult = res
-	r.once.Do(func() {}) // mark as opened — waitOpen() becomes a no-op
+	r.waitOpen = func() error { return nil }
 	return r
 }
 
@@ -114,7 +96,6 @@ func Open(path string, opts ...ReaderOption) *Reader {
 	}
 
 	ch := make(chan openResult, 1)
-	r.ch = ch
 	go func() {
 		defer func() {
 			if rv := recover(); rv != nil {
@@ -123,6 +104,13 @@ func Open(path string, opts ...ReaderOption) *Reader {
 		}()
 		ch <- doOpen(path)
 	}()
+	r.waitOpen = sync.OnceValue(func() error {
+		res := <-ch
+		err := res.err
+		res.err = nil
+		r.openResult = res
+		return err
+	})
 	return r
 }
 
@@ -628,7 +616,7 @@ func (r *Reader) Trailer() (Trailer, error) {
 // Must always be called, even if no query methods were called.
 func (r *Reader) Close() error {
 	r.closeOnce.Do(func() {
-		r.once.Do(r.drain) // drain goroutine, populate all fields
+		r.waitOpen() // drain goroutine, populate all fields
 		if r.file != nil {
 			r.closeErr = r.file.Close()
 		}
