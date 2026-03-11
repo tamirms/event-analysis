@@ -1,15 +1,82 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"fmt"
 	"iter"
 
 	"github.com/tamir/events-analysis/packfile"
 )
 
-var ErrIndexRange = fmt.Errorf("eventstore: %w", packfile.ErrIndexRange)
+// ErrIndexRange is returned when an index is out of bounds.
+var ErrIndexRange = packfile.ErrIndexRange
+
+// eventReader provides the common read methods shared by Reader and LiveWriter.
+// It wraps a packfile.ItemReader.
+type eventReader struct {
+	ir packfile.ItemReader
+}
+
+// ReadEvent reads a single event by global index.
+// The caller owns the returned slice.
+func (r *eventReader) ReadEvent(index int) ([]byte, error) {
+	var data []byte
+	if err := r.ir.ReadItem(index, func(entry []byte) error {
+		data = bytes.Clone(entry)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// ReadEvents returns an iterator over count contiguous events starting at start.
+// Each yielded []byte is valid only until the next iteration.
+func (r *eventReader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
+	return r.ir.ReadRange(start, count)
+}
+
+// ReadIndices reads events at scattered indices with parallel I/O.
+// indices must be sorted ascending with no duplicates.
+// Each yielded []byte is owned by the caller.
+func (r *eventReader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
+	return func(yield func([]byte, error) bool) {
+		if len(indices) == 0 {
+			return
+		}
+		results := make([][]byte, len(indices))
+		if err := r.ir.ReadItems(ctx, indices, func(pos int, entry []byte) error {
+			results[pos] = bytes.Clone(entry)
+			return nil
+		}); err != nil {
+			yield(nil, err)
+			return
+		}
+		for _, item := range results {
+			if !yield(item, nil) {
+				return
+			}
+		}
+	}
+}
+
+// EventCount returns the total number of events.
+func (r *eventReader) EventCount() (int, error) {
+	return r.ir.TotalItems()
+}
+
+// ContentHash returns the SHA-256 content hash, if present.
+func (r *eventReader) ContentHash() ([32]byte, bool, error) {
+	return r.ir.ContentHash()
+}
+
+// Verify recomputes the SHA-256 content hash and compares to stored hash.
+func (r *eventReader) Verify(ctx context.Context) error {
+	return r.ir.Verify(ctx)
+}
+
+// Close releases all resources.
+func (r *eventReader) Close() error { return r.ir.Close() }
 
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*readerConfig)
@@ -26,7 +93,7 @@ func WithConcurrency(n int) ReaderOption {
 
 // Reader reads events from an eventstore packfile.
 type Reader struct {
-	pr *packfile.Reader
+	eventReader
 }
 
 // Open opens an eventstore for reading. Returns immediately; all I/O
@@ -41,74 +108,8 @@ func Open(path string, opts ...ReaderOption) *Reader {
 	if cfg.concurrency != 0 {
 		prOpts = append(prOpts, packfile.WithConcurrency(cfg.concurrency))
 	}
+	pr := packfile.Open(path, prOpts...)
 	return &Reader{
-		pr: packfile.Open(path, prOpts...),
+		eventReader: eventReader{ir: pr},
 	}
 }
-
-// EventCount returns the total number of events.
-func (r *Reader) EventCount() (int, error) {
-	return r.pr.TotalItems()
-}
-
-// ReadEvent reads a single event by global index.
-// The caller owns the returned slice.
-func (r *Reader) ReadEvent(index int) ([]byte, error) {
-	var data []byte
-	if err := r.pr.ReadItem(index, func(entry []byte) error {
-		data = append([]byte(nil), entry...)
-		return nil
-	}); err != nil {
-		if errors.Is(err, packfile.ErrIndexRange) {
-			return nil, ErrIndexRange
-		}
-		return nil, err
-	}
-	return data, nil
-}
-
-// ReadEvents returns an iterator over count contiguous events starting at start.
-// Each yielded []byte is valid only until the next iteration.
-func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
-	return r.pr.ReadRange(start, count)
-}
-
-// ReadIndices reads events at scattered indices with parallel I/O.
-// indices must be sorted ascending with no duplicates.
-// Each yielded []byte is owned by the caller.
-func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
-	return func(yield func([]byte, error) bool) {
-		if len(indices) == 0 {
-			return
-		}
-		results := make([][]byte, len(indices))
-		if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
-			results[pos] = append([]byte(nil), entry...)
-			return nil
-		}); err != nil {
-			yield(nil, err)
-			return
-		}
-		for _, item := range results {
-			if !yield(item, nil) {
-				return
-			}
-		}
-	}
-}
-
-// ContentHash returns the SHA-256 content hash stored in the trailer, if present.
-func (r *Reader) ContentHash() ([32]byte, bool, error) {
-	return r.pr.ContentHash()
-}
-
-// Verify recomputes the SHA-256 content hash and compares to stored hash.
-func (r *Reader) Verify(ctx context.Context) error {
-	if err := r.pr.Verify(ctx); err != nil {
-		return fmt.Errorf("eventstore: %w", err)
-	}
-	return nil
-}
-
-// Close closes the underlying packfile.
-func (r *Reader) Close() error { return r.pr.Close() }

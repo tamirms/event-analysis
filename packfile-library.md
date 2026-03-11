@@ -10,7 +10,7 @@ When a record contains multiple items, the reader needs to know where each item 
 
 The natural approach is a flat file: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
 
-Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, atomic writes, CRC32C integrity checks, and safe concurrent reads.
+Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, CRC32C integrity checks, and safe concurrent reads.
 
 ## What Packfile Does
 
@@ -38,10 +38,11 @@ for _, event := range events {
     w.Append(event)
 }
 
-w.Finish(nil) // flushes partial record, writes index + trailer, fsyncs, atomic rename
+defer w.Close() // removes file if Finish was not called
+w.Finish(nil)   // flushes partial record, writes index + trailer, fsyncs
 ```
 
-Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer (containing total items, record size, flags, content hash), fsyncs, and atomically renames the temp file to the final path. If the process crashes before `Finish`, no partial file is left behind.
+Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer (containing total items, record size, flags, content hash), and fsyncs. `Close` after `Finish` is a no-op; `Close` without `Finish` removes the incomplete file.
 
 Multi-part items (e.g., fingerprint + bitmap data) can be appended as a single logical item:
 
@@ -138,6 +139,59 @@ r.ReadItem(slot, func(data []byte) error {
 })
 ```
 
+### Writing (Live/Incremental)
+
+`LiveWriter` builds packfiles incrementally — appending events, serving concurrent reads on flushed and pending data, and freezing into a standard packfile when complete.
+
+```go
+lw, _ := packfile.CreateLive("events-current.pack", packfile.WriterOptions{
+    RecordSize:  128,
+    ContentHash: true,
+})
+
+for _, event := range batch {
+    lw.Append(event)
+}
+
+// Read directly from the LiveWriter (RLock-based, no snapshot needed).
+lw.ReadItem(42, func(data []byte) error { ... })
+n, _ := lw.TotalItems()
+for item, err := range lw.ReadRange(0, n) { ... }
+
+// Sync: fsync and get checkpoint for crash recovery.
+cp, _ := lw.Sync()
+persistCheckpoint(cp) // caller stores in RocksDB with replay cursor
+
+// Freeze: finalize into a standard packfile.
+lw.Freeze(appData) // flush partial, write index + trailer, fsync
+```
+
+### Crash Recovery
+
+On crash, the caller replays from the right ledger, skipping events already in the packfile. `OpenLive` truncates any torn writes and restores the Writer state:
+
+```go
+cp := loadCheckpoint() // from RocksDB
+lw, _ := packfile.OpenLive("events-current.pack", cp, packfile.WriterOptions{
+    RecordSize:  128,
+    ContentHash: true,
+})
+// Resume appending from cp.TotalItems() onward.
+```
+
+### Reading from a LiveWriter
+
+Reads dispatch by index: flushed items go to disk (via a cached Reader with a shared fd), pending items are read directly from the writer's buffer. All standard read methods work:
+
+```go
+n, _ := lw.TotalItems()                   // flushed + pending
+lw.ReadItem(idx, fn)                       // disk or memory
+lw.ReadRange(start, count)                 // chains disk + memory
+lw.ReadItems(ctx, indices, fn)             // parallel I/O for flushed
+```
+
+Reads hold a shared lock (RLock), allowing concurrent reads but blocking writes for their duration.
+
 ## Goals
 
 - **O(1) random access by ordinal index.** Every `ReadItem` call maps index to record via arithmetic, then reads and decodes a single record.
@@ -149,7 +203,7 @@ r.ReadItem(slot, func(data []byte) error {
 ## Non-Goals
 
 - **Key-based lookup.** Packfile is indexed by ordinal position, not by key. Key-based access is built on top by the caller (see key-based access usage example).
-- **Mutability.** No append-after-finalize, no updates, no deletes.
+- **Mutability.** No updates, no deletes. `LiveWriter` supports incremental append before finalization, but once frozen the file is immutable.
 - **Chunk management.** Directory layout, chunk-to-sequence mapping, rotation are caller concerns.
 - **Caching.** No built-in LRU. Callers manage their own pool of open `Reader` instances.
 
@@ -185,13 +239,17 @@ type WriterOptions struct {
     // This spreads I/O across the write phase so the final fdatasync in Finish()
     // has less data to flush. 0 disables (default).
     BytesPerSync int
+
+    // Overwrite allows Create/CreateLive to replace an existing file.
+    // When false (default), fails if the file already exists.
+    Overwrite bool
 }
 
 // Writer creates a new packfile. Items must be appended in order.
 type Writer struct{ /* unexported */ }
 
-// Create starts writing a new packfile at path.
-// The file is not visible at path until Finish is called.
+// Create starts writing a new packfile at path. Fails if the file already
+// exists unless Overwrite is set.
 func Create(path string, opts WriterOptions) (*Writer, error)
 
 // Append adds a single logical item. Parts are concatenated as one entry.
@@ -199,15 +257,72 @@ func Create(path string, opts WriterOptions) (*Writer, error)
 func (w *Writer) Append(parts ...[]byte) error
 
 // Finish flushes any partial record, writes index + optional app data + trailer,
-// fsyncs, and atomically renames to the final path. appData is optional
-// caller-injected data stored between the index and trailer; pass nil for
-// no app data. On failure, the caller should call Abort to clean up the temp file.
+// fsyncs, and closes the file. appData is optional caller-injected data stored
+// between the index and trailer; pass nil for no app data.
 func (w *Writer) Finish(appData []byte) error
 
-// Abort discards the in-progress packfile and removes the temp file.
-// Safe to call after a failed Finish to clean up.
-// No-op only after a successful Finish or a previous Abort.
-func (w *Writer) Abort() error
+// Close releases resources. If Finish was not called, the incomplete file
+// is removed. If Finish was called, Close is a no-op. Safe to call multiple
+// times. Idiomatic usage: defer w.Close() with Finish as the last action.
+func (w *Writer) Close() error
+```
+
+### LiveWriter
+
+```go
+// Checkpoint captures the durable state of a LiveWriter after Sync.
+type Checkpoint struct {
+    Offsets    []int64      // one per flushed record
+    EndOfData  int64        // byte offset of end of last flushed record
+    Digests    []byte       // content hash state (serialHasher.digests)
+    RecordSize int          // validated on recovery
+    Format     RecordFormat // validated on recovery
+}
+
+func (cp Checkpoint) TotalItems() int // len(Offsets) * RecordSize
+
+// LiveWriter supports incremental packfile construction with concurrent
+// reads on flushed data and crash recovery via Checkpoint.
+type LiveWriter struct{ /* unexported */ }
+
+// CreateLive starts a new live packfile at path. Concurrency is forced to 0.
+func CreateLive(path string, opts WriterOptions) (*LiveWriter, error)
+
+// OpenLive recovers a LiveWriter from a Checkpoint. Truncates torn writes.
+func OpenLive(path string, cp Checkpoint, opts WriterOptions) (*LiveWriter, error)
+
+func (lw *LiveWriter) Append(parts ...[]byte) error
+func (lw *LiveWriter) Sync() (Checkpoint, error)    // fsync + checkpoint state
+func (lw *LiveWriter) Freeze(appData []byte) error   // finalize as standard packfile
+
+// Close releases resources. If Freeze was called, the file remains as a
+// valid packfile. If Freeze was not called, the file is removed. Safe to
+// call multiple times.
+func (lw *LiveWriter) Close() error
+
+// Reads (concurrent via RLock):
+func (lw *LiveWriter) TotalItems() (int, error)
+func (lw *LiveWriter) ReadItem(index int, fn func([]byte) error) error
+func (lw *LiveWriter) ReadRange(start, count int) iter.Seq2[[]byte, error]
+func (lw *LiveWriter) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+func (lw *LiveWriter) ContentHash() ([32]byte, bool, error)
+func (lw *LiveWriter) Verify(ctx context.Context) error
+```
+
+### ItemReader
+
+```go
+// ItemReader is the common read interface satisfied by both *Reader and
+// *LiveWriter. Consumers that only need reads can accept this interface.
+type ItemReader interface {
+    TotalItems() (int, error)
+    ReadItem(index int, fn func([]byte) error) error
+    ReadRange(start, count int) iter.Seq2[[]byte, error]
+    ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+    ContentHash() ([32]byte, bool, error)
+    Verify(ctx context.Context) error
+    Close() error
+}
 ```
 
 ### Reader
@@ -418,7 +533,7 @@ Flags (uint8):
 - Bit 1 (`flagContentHash`): trailer contains a 32-byte SHA-256 content hash
 - Bit 2 (`flagNoCRC`): per-record CRC32C is omitted (only with flagNoCompression)
 
-The `Checksum` at offset 60 covers `appData || trailer[0:60]` — when no app data is present, just `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits. The on-disk flags byte is decoded into a `RecordFormat` value and `HasContentHash` boolean in the `Trailer` struct — callers never touch raw flag bits.
+The `Checksum` at offset 60 covers `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits. The on-disk flags byte is decoded into a `RecordFormat` value and `HasContentHash` boolean in the `Trailer` struct — callers never touch raw flag bits.
 
 The group size (128) is a library constant; if it changes, the version is bumped.
 
@@ -515,9 +630,9 @@ delta   := residual + int64(groupMin)
 
 On open, the reader issues a single pread of the last `min(256KB, fileSize)` bytes. This usually captures the trailer, app data, and index in one IOP. The trailer is parsed from the tail, and if the full index + app data fit within the speculative buffer, no additional reads are needed. If the tail exceeds 256KB, a single fallback read fetches the remaining data.
 
-### Atomic Writes
+### Writes
 
-`Create` writes to `{path}.tmp.{random}` (random int64 suffix prevents collisions). `Finish` writes remaining items, the offset index, CRC32C, optional app data, and 64-byte trailer, fsyncs, then renames. The parent directory is fsynced to ensure the rename is durable. Crash before rename: no file at final path. Crash after: complete valid packfile.
+`Create` opens the file directly at `path` (fails if the file exists unless `Overwrite` is set). `Finish` writes remaining items, the offset index, CRC32C, optional app data, and 64-byte trailer, then fsyncs. If `Close` is called without `Finish`, the incomplete file is removed.
 
 ### ReadItem
 
@@ -553,6 +668,18 @@ Optional background writeback via `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Li
 ### Index Decode OOM Guard
 
 Before decoding the index, the reader validates that `recordCount` is plausible given `indexSize`. Each index group of up to 128 records requires at least 6 bytes (1B packed + 1B width + 4B min). If `recordCount` exceeds `(indexSize - 4) / 6 * 128`, the file is rejected as corrupt. This prevents crafted trailers from causing huge allocations.
+
+### LiveWriter Composition
+
+`LiveWriter` wraps `*Writer` (serial, concurrency=0) with a `sync.RWMutex`. Writes (`Append`, `Sync`, `Freeze`, `Close`) hold the exclusive lock. Reads (`TotalItems`, `ReadItem`, `ReadRange`, `ReadItems`, `ContentHash`, `Verify`) hold a shared lock (RLock), dispatching flushed items to a cached `*Reader` and pending items directly from the writer's buffer.
+
+### Read Dispatch
+
+Reads compute a boundary from `len(offsets) * recordSize`. Items below this boundary are flushed to disk and served via a cached `*Reader` (rebuilt via `newReaderFromState` after each flush). Items at or above are pending in the writer's buffer (`w.buf`/`w.sizes`) and read directly. `ReadRange` chains the two sources seamlessly. `ReadItems` partitions indices and delegates flushed ones to `Reader.ReadItems` for parallel pread + coalescing.
+
+### Crash Recovery
+
+`OpenLive` truncates the file to `Checkpoint.EndOfData`, fsyncs, and reconstructs the Writer's `offsets`, `pos`, `total`, and `serialHasher.digests`. Only full records are checkpointed — partial records are discarded. The caller replays `cp.TotalItems()` onward from its external replay cursor.
 
 ### Concurrency
 

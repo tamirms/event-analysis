@@ -233,7 +233,7 @@ func TestNoCompression(t *testing.T) {
 	}
 }
 
-func TestAbort(t *testing.T) {
+func TestCloseWithoutFinish(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 	w, err := Create(dbPath, WriterOptions{})
@@ -243,11 +243,11 @@ func TestAbort(t *testing.T) {
 	if err := w.Append([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Abort(); err != nil {
+	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Double abort is safe.
-	if err := w.Abort(); err != nil {
+	// Double Close is safe.
+	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -264,10 +264,7 @@ func (r *Reader) ContentHash() ([32]byte, bool, error) {
 
 // Verify recomputes the SHA-256 content hash and compares to stored hash.
 func (r *Reader) Verify(ctx context.Context) error {
-	if err := r.pr.Verify(ctx); err != nil {
-		return fmt.Errorf("bitmapindex: %w", err)
-	}
-	return nil
+	return r.pr.Verify(ctx)
 }
 
 // Close releases all resources. Safe to call multiple times.

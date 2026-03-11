@@ -19,21 +19,25 @@ type Writer struct {
 
 // Create starts writing a new eventstore at path.
 func Create(path string, opts WriterOptions) (*Writer, error) {
+	pw, err := packfile.Create(path, packfileOpts(opts))
+	if err != nil {
+		return nil, err
+	}
+	return &Writer{pw: pw}, nil
+}
+
+func packfileOpts(opts WriterOptions) packfile.WriterOptions {
 	recordSize := opts.RecordSize
 	if recordSize == 0 {
 		recordSize = DefaultRecordSize
 	}
-	pw, err := packfile.Create(path, packfile.WriterOptions{
+	return packfile.WriterOptions{
 		RecordSize:   recordSize,
 		Concurrency:  opts.Concurrency,
 		Format:       opts.Format,
 		ContentHash:  opts.ContentHash,
 		BytesPerSync: 1 << 20,
-	})
-	if err != nil {
-		return nil, err
 	}
-	return &Writer{pw: pw}, nil
 }
 
 // Append adds a single event.
@@ -46,7 +50,8 @@ func (w *Writer) Finish() error {
 	return w.pw.Finish(nil)
 }
 
-// Abort discards the in-progress eventstore.
-func (w *Writer) Abort() error {
-	return w.pw.Abort()
+// Close releases resources. If Finish was not called, the incomplete file
+// is removed. If Finish was called, Close is a no-op.
+func (w *Writer) Close() error {
+	return w.pw.Close()
 }

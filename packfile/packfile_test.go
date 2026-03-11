@@ -48,7 +48,7 @@ func readItemCopy(t *testing.T, r *Reader, index int) []byte {
 	t.Helper()
 	var got []byte
 	if err := r.ReadItem(index, func(entry []byte) error {
-		got = append([]byte(nil), entry...)
+		got = bytes.Clone(entry)
 		return nil
 	}); err != nil {
 		t.Fatalf("ReadItem(%d): %v", index, err)
@@ -301,7 +301,7 @@ func TestReadItems(t *testing.T) {
 	indices := []int{0, 1, 127, 128, 200, 299}
 	got := make([][]byte, len(indices))
 	err := r.ReadItems(context.Background(), indices, func(pos int, entry []byte) error {
-		got[pos] = append([]byte(nil), entry...)
+		got[pos] = bytes.Clone(entry)
 		return nil
 	})
 	if err != nil {
@@ -438,7 +438,7 @@ func TestConcurrentReads(t *testing.T) {
 			defer wg.Done()
 			var got []byte
 			if err := r.ReadItem(idx, func(entry []byte) error {
-				got = append([]byte(nil), entry...)
+				got = bytes.Clone(entry)
 				return nil
 			}); err != nil {
 				errs <- err
@@ -458,20 +458,14 @@ func TestConcurrentReads(t *testing.T) {
 	}
 }
 
-func TestAtomicWrite(t *testing.T) {
+func TestCreateExclusive(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "atomic.pack")
+	path := filepath.Join(dir, "excl.pack")
 
 	w, err := Create(path, WriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// File should not exist at final path yet.
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("file exists at final path before Finish")
-	}
-
 	if err := w.Append([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
@@ -479,13 +473,26 @@ func TestAtomicWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Now file should exist.
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("file not at final path after Finish: %v", err)
+	// Second Create at same path should fail.
+	_, err = Create(path, WriterOptions{})
+	if err == nil {
+		t.Fatal("expected error creating at existing path")
+	}
+
+	// With Overwrite, it should succeed.
+	w2, err := Create(path, WriterOptions{Overwrite: true})
+	if err != nil {
+		t.Fatalf("Create with Overwrite: %v", err)
+	}
+	if err := w2.Append([]byte("world")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Finish(nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestAbortCleansUp(t *testing.T) {
+func TestCloseWithoutFinish(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "abort.pack")
 
@@ -494,28 +501,16 @@ func TestAbortCleansUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tmpPath := w.tmpPath
 	if err := w.Append([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
 
-	// Tmp file should exist.
-	if _, err := os.Stat(tmpPath); err != nil {
-		t.Fatalf("tmp file not found: %v", err)
-	}
-
-	if err := w.Abort(); err != nil {
+	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Tmp file should be gone.
-	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Fatal("tmp file still exists after Abort")
-	}
-
-	// Final path should not exist.
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("file exists at final path after Abort")
+		t.Fatal("file still exists after Close without Finish")
 	}
 }
 
