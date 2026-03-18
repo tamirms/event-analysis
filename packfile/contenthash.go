@@ -1,6 +1,7 @@
 package packfile
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -56,6 +57,19 @@ func (h *contentHasher) Add(parts ...[]byte) {
 	}
 }
 
+// Snapshot returns the content hash as if Sum were called now, without
+// mutating the hasher state. Safe for concurrent readers.
+func (h *contentHasher) Snapshot() [32]byte {
+	if h.count == 0 {
+		return sha256.Sum256(h.digests)
+	}
+	partial := sha256.Sum256(h.buf)
+	tmp := make([]byte, 0, len(h.digests)+sha256.Size)
+	tmp = append(tmp, h.digests...)
+	tmp = append(tmp, partial[:]...)
+	return sha256.Sum256(tmp)
+}
+
 // Sum flushes any partial chunk and returns the final hash.
 // After calling Sum, the hasher must not be reused (no further Add calls).
 func (h *contentHasher) Sum() [32]byte {
@@ -66,5 +80,34 @@ func (h *contentHasher) Sum() [32]byte {
 		h.count = 0
 	}
 	return sha256.Sum256(h.digests)
+}
+
+// verifyContentHash re-reads all items from ir, recomputes the chunked
+// SHA-256 content hash, and compares it to expected.
+func verifyContentHash(ctx context.Context, ir ItemReader, recordSize int, expected [32]byte) error {
+	total, err := ir.TotalItems()
+	if err != nil {
+		return err
+	}
+	hasher := newContentHasher(recordSize)
+	i := 0
+	for item, err := range ir.ReadRange(0, total) {
+		if err != nil {
+			return err
+		}
+		hasher.Add(item)
+		i++
+		if i%recordSize == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+	}
+	computed := hasher.Sum()
+	if computed != expected {
+		return fmt.Errorf("packfile: %w: expected %x, got %x",
+			ErrContentHashMismatch, expected, computed)
+	}
+	return nil
 }
 
