@@ -139,6 +139,59 @@ r.ReadItem(slot, func(data []byte) error {
 })
 ```
 
+### Writing (Live/Incremental)
+
+`LiveWriter` builds packfiles incrementally — appending events, serving concurrent reads on flushed and pending data, and freezing into a standard packfile when complete.
+
+```go
+lw, _ := packfile.CreateLive("events-current.pack", packfile.WriterOptions{
+    RecordSize:  128,
+    ContentHash: true,
+})
+
+for _, event := range batch {
+    lw.Append(event)
+}
+
+// Read directly from the LiveWriter (RLock-based, no snapshot needed).
+lw.ReadItem(42, func(data []byte) error { ... })
+n, _ := lw.TotalItems()
+for item, err := range lw.ReadRange(0, n) { ... }
+
+// Sync: fsync and get checkpoint for crash recovery.
+cp, _ := lw.Sync()
+persistCheckpoint(cp) // caller stores in RocksDB with replay cursor
+
+// Freeze: finalize into a standard packfile.
+lw.Freeze(appData) // flush partial, write index + trailer, fsync
+```
+
+### Crash Recovery
+
+On crash, the caller replays from the right ledger, skipping events already in the packfile. `OpenLive` truncates any torn writes and restores the Writer state:
+
+```go
+cp := loadCheckpoint() // from RocksDB
+lw, _ := packfile.OpenLive("events-current.pack", cp, packfile.WriterOptions{
+    RecordSize:  128,
+    ContentHash: true,
+})
+// Resume appending from cp.TotalItems() onward.
+```
+
+### Reading from a LiveWriter
+
+Reads dispatch by index: flushed items go to disk (via a cached Reader with a shared fd), pending items are read directly from the writer's buffer. All standard read methods work:
+
+```go
+n, _ := lw.TotalItems()                   // flushed + pending
+lw.ReadItem(idx, fn)                       // disk or memory
+lw.ReadRange(start, count)                 // chains disk + memory
+lw.ReadItems(ctx, indices, fn)             // parallel I/O for flushed
+```
+
+Reads hold a shared lock (RLock), allowing concurrent reads but blocking writes for their duration.
+
 ## Goals
 
 - **O(1) random access by ordinal index.** Every `ReadItem` call maps index to record via arithmetic, then reads and decodes a single record.
@@ -150,7 +203,7 @@ r.ReadItem(slot, func(data []byte) error {
 ## Non-Goals
 
 - **Key-based lookup.** Packfile is indexed by ordinal position, not by key. Key-based access is built on top by the caller (see key-based access usage example).
-- **Mutability.** No append-after-finalize, no updates, no deletes.
+- **Mutability.** No updates, no deletes. `LiveWriter` supports incremental append before finalization, but once frozen the file is immutable.
 - **Chunk management.** Directory layout, chunk-to-sequence mapping, rotation are caller concerns.
 - **Caching.** No built-in LRU. Callers manage their own pool of open `Reader` instances.
 
@@ -187,7 +240,7 @@ type WriterOptions struct {
     // has less data to flush. 0 disables (default).
     BytesPerSync int
 
-    // Overwrite allows Create to replace an existing file.
+    // Overwrite allows Create/CreateLive to replace an existing file.
     // When false (default), fails if the file already exists.
     Overwrite bool
 }
@@ -212,6 +265,64 @@ func (w *Writer) Finish(appData []byte) error
 // is removed. If Finish was called, Close is a no-op. Safe to call multiple
 // times. Idiomatic usage: defer w.Close() with Finish as the last action.
 func (w *Writer) Close() error
+```
+
+### LiveWriter
+
+```go
+// Checkpoint captures the durable state of a LiveWriter after Sync.
+type Checkpoint struct {
+    Offsets    []int64      // one per flushed record
+    EndOfData  int64        // byte offset of end of last flushed record
+    Digests    []byte       // content hash state (serialHasher.digests)
+    RecordSize int          // validated on recovery
+    Format     RecordFormat // validated on recovery
+}
+
+func (cp Checkpoint) TotalItems() int // len(Offsets) * RecordSize
+
+// LiveWriter supports incremental packfile construction with concurrent
+// reads on flushed data and crash recovery via Checkpoint.
+type LiveWriter struct{ /* unexported */ }
+
+// CreateLive starts a new live packfile at path. Concurrency is forced to 0.
+func CreateLive(path string, opts WriterOptions) (*LiveWriter, error)
+
+// OpenLive recovers a LiveWriter from a Checkpoint. Truncates torn writes.
+func OpenLive(path string, cp Checkpoint, opts WriterOptions) (*LiveWriter, error)
+
+func (lw *LiveWriter) Append(parts ...[]byte) error
+func (lw *LiveWriter) Sync() (Checkpoint, error)    // fsync + checkpoint state
+func (lw *LiveWriter) Freeze(appData []byte) error   // finalize as standard packfile
+
+// Close releases resources. If Freeze was called, the file remains as a
+// valid packfile. If Freeze was not called, the file is removed. Safe to
+// call multiple times.
+func (lw *LiveWriter) Close() error
+
+// Reads (concurrent via RLock):
+func (lw *LiveWriter) TotalItems() (int, error)
+func (lw *LiveWriter) ReadItem(index int, fn func([]byte) error) error
+func (lw *LiveWriter) ReadRange(start, count int) iter.Seq2[[]byte, error]
+func (lw *LiveWriter) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+func (lw *LiveWriter) ContentHash() ([32]byte, bool, error)
+func (lw *LiveWriter) Verify(ctx context.Context) error
+```
+
+### ItemReader
+
+```go
+// ItemReader is the common read interface satisfied by both *Reader and
+// *LiveWriter. Consumers that only need reads can accept this interface.
+type ItemReader interface {
+    TotalItems() (int, error)
+    ReadItem(index int, fn func([]byte) error) error
+    ReadRange(start, count int) iter.Seq2[[]byte, error]
+    ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+    ContentHash() ([32]byte, bool, error)
+    Verify(ctx context.Context) error
+    Close() error
+}
 ```
 
 ### Reader
@@ -557,6 +668,18 @@ Optional background writeback via `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Li
 ### Index Decode OOM Guard
 
 Before decoding the index, the reader validates that `recordCount` is plausible given `indexSize`. Each index group of up to 128 records requires at least 6 bytes (1B packed + 1B width + 4B min). If `recordCount` exceeds `(indexSize - 4) / 6 * 128`, the file is rejected as corrupt. This prevents crafted trailers from causing huge allocations.
+
+### LiveWriter Composition
+
+`LiveWriter` wraps `*Writer` (serial, concurrency=0) with a `sync.RWMutex`. Writes (`Append`, `Sync`, `Freeze`, `Close`) hold the exclusive lock. Reads (`TotalItems`, `ReadItem`, `ReadRange`, `ReadItems`, `ContentHash`, `Verify`) hold a shared lock (RLock), dispatching flushed items to a cached `*Reader` and pending items directly from the writer's buffer.
+
+### Read Dispatch
+
+Reads compute a boundary from `len(offsets) * recordSize`. Items below this boundary are flushed to disk and served via a cached `*Reader` (rebuilt via `newReaderFromState` after each flush). Items at or above are pending in the writer's buffer (`w.buf`/`w.sizes`) and read directly. `ReadRange` chains the two sources seamlessly. `ReadItems` partitions indices and delegates flushed ones to `Reader.ReadItems` for parallel pread + coalescing.
+
+### Crash Recovery
+
+`OpenLive` truncates the file to `Checkpoint.EndOfData`, fsyncs, and reconstructs the Writer's `offsets`, `pos`, `total`, and `serialHasher.digests`. Only full records are checkpointed — partial records are discarded. The caller replays `cp.TotalItems()` onward from its external replay cursor.
 
 ### Concurrency
 

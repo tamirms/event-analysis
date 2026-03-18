@@ -87,6 +87,8 @@ type Writer struct {
 	serialHasher *contentHasher // serial path: streams entries through contentHasher
 	digests      []byte         // concurrent path: accumulated 32-byte chunk digests
 	sizesPool    sync.Pool      // concurrent path: pooled []uint32 for hash goroutines
+	finalHash    [32]byte       // set by Finish; available via LiveWriter.ContentHash
+	hasFinalHash bool           // true after Finish if contentHash was enabled
 
 	// Pipeline (concurrency > 1)
 	concurrency int
@@ -108,6 +110,26 @@ func (w *Writer) getSizes() []uint32 {
 }
 
 func (w *Writer) putSizes(s []uint32) { w.sizesPool.Put(s) }
+
+// newSerialWriter creates a Writer configured for serial (non-pipelined) use.
+// Used by CreateLive and OpenLive where Concurrency is always 0.
+func newSerialWriter(f *os.File, path string, recordSize int, opts WriterOptions) *Writer {
+	w := &Writer{
+		file:         f,
+		path:         path,
+		recordSize:   recordSize,
+		format:       opts.Format,
+		contentHash:  opts.ContentHash,
+		bytesPerSync: int64(opts.BytesPerSync),
+	}
+	if opts.Format == Compressed {
+		w.compressor = zstd.NewCompressor()
+	}
+	if opts.ContentHash {
+		w.serialHasher = newContentHasher(recordSize)
+	}
+	return w
+}
 
 // resolveRecordSize returns the effective record size from opts, defaulting
 // to 128 if zero. Returns an error if negative.
@@ -455,6 +477,8 @@ func (w *Writer) Finish(appData []byte) error {
 		} else {
 			hash = sha256.Sum256(w.digests)
 		}
+		w.finalHash = hash
+		w.hasFinalHash = true
 	}
 
 	// Encode index using FOR-128.

@@ -60,6 +60,28 @@ func WithConcurrency(n int) ReaderOption {
 	return func(r *Reader) { r.concurrency = n }
 }
 
+// ItemReader is the common interface satisfied by both *Reader and *LiveWriter.
+// It covers random-access reads, metadata, verification, and lifecycle.
+type ItemReader interface {
+	TotalItems() (int, error)
+	ReadItem(index int, fn func([]byte) error) error
+	ReadRange(start, count int) iter.Seq2[[]byte, error]
+	ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+	ContentHash() ([32]byte, bool, error)
+	Verify(ctx context.Context) error
+	Close() error
+}
+
+// newReaderFromState creates a Reader from pre-computed state, bypassing
+// the async-open path. Used by LiveWriter for flushed-record reads.
+// Co-located here so it's updated alongside Reader internals.
+func newReaderFromState(res openResult) *Reader {
+	r := &Reader{concurrency: defaultConcurrency}
+	r.openResult = res
+	r.waitOpen = func() error { return nil }
+	return r
+}
+
 // Open returns a Reader immediately. All file I/O (open, stat, speculative
 // read, trailer parse, index decode, app data read) runs in a background
 // goroutine. Open never fails; errors are deferred to the first method that
@@ -579,27 +601,7 @@ func (r *Reader) Verify(ctx context.Context) error {
 	if !r.trailer.HasContentHash {
 		return nil
 	}
-
-	hasher := newContentHasher(r.recordSize)
-	i := 0
-	for item, err := range r.ReadRange(0, r.totalItems) {
-		if err != nil {
-			return err
-		}
-		hasher.Add(item)
-		i++
-		if i%r.recordSize == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-	}
-	computed := hasher.Sum()
-	if computed != r.trailer.ContentHash {
-		return fmt.Errorf("packfile: %w: expected %x, got %x",
-			ErrContentHashMismatch, r.trailer.ContentHash, computed)
-	}
-	return nil
+	return verifyContentHash(ctx, r, r.recordSize, r.trailer.ContentHash)
 }
 
 // Trailer returns the parsed trailer.
