@@ -99,7 +99,7 @@ func (w *Writer) Finish() error {
 	return rocksdbutil.IngestSST(w.dbPath, w.sstPath, w.cfg)
 }
 
-func (w *Writer) Abort() error {
+func (w *Writer) Close() error {
 	if w.closed {
 		return nil
 	}

@@ -1,15 +1,15 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"fmt"
 	"iter"
 
 	"github.com/tamir/events-analysis/packfile"
 )
 
-var ErrIndexRange = fmt.Errorf("eventstore: %w", packfile.ErrIndexRange)
+// ErrIndexRange is returned when an index is out of bounds.
+var ErrIndexRange = packfile.ErrIndexRange
 
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*readerConfig)
@@ -56,12 +56,9 @@ func (r *Reader) EventCount() (int, error) {
 func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	var data []byte
 	if err := r.pr.ReadItem(index, func(entry []byte) error {
-		data = append([]byte(nil), entry...)
+		data = bytes.Clone(entry)
 		return nil
 	}); err != nil {
-		if errors.Is(err, packfile.ErrIndexRange) {
-			return nil, ErrIndexRange
-		}
 		return nil, err
 	}
 	return data, nil
@@ -83,7 +80,7 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 		}
 		results := make([][]byte, len(indices))
 		if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
-			results[pos] = append([]byte(nil), entry...)
+			results[pos] = bytes.Clone(entry)
 			return nil
 		}); err != nil {
 			yield(nil, err)
@@ -104,10 +101,7 @@ func (r *Reader) ContentHash() ([32]byte, bool, error) {
 
 // Verify recomputes the SHA-256 content hash and compares to stored hash.
 func (r *Reader) Verify(ctx context.Context) error {
-	if err := r.pr.Verify(ctx); err != nil {
-		return fmt.Errorf("eventstore: %w", err)
-	}
-	return nil
+	return r.pr.Verify(ctx)
 }
 
 // Close closes the underlying packfile.
