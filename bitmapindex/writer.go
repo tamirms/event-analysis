@@ -186,7 +186,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		if err := pw.Append(prepared[i].fingerprint[:], prepared[i].data); err != nil {
 			return errors.Join(
 				fmt.Errorf("bitmapindex: append item %d: %w", i, err),
-				pw.Abort(),
+				pw.Close(),
 			)
 		}
 		prepared[i].data = nil // free as we go
@@ -195,7 +195,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	if err := pw.Finish(nil); err != nil {
 		return errors.Join(
 			fmt.Errorf("bitmapindex: finish packfile: %w", err),
-			pw.Abort(),
+			pw.Close(),
 		)
 	}
 

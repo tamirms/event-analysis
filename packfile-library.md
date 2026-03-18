@@ -10,7 +10,7 @@ When a record contains multiple items, the reader needs to know where each item 
 
 The natural approach is a flat file: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
 
-Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, atomic writes, CRC32C integrity checks, and safe concurrent reads.
+Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, CRC32C integrity checks, and safe concurrent reads.
 
 ## What Packfile Does
 
@@ -38,10 +38,11 @@ for _, event := range events {
     w.Append(event)
 }
 
-w.Finish(nil) // flushes partial record, writes index + trailer, fsyncs, atomic rename
+defer w.Close() // removes file if Finish was not called
+w.Finish(nil)   // flushes partial record, writes index + trailer, fsyncs
 ```
 
-Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer (containing total items, record size, flags, content hash), fsyncs, and atomically renames the temp file to the final path. If the process crashes before `Finish`, no partial file is left behind.
+Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer (containing total items, record size, flags, content hash), and fsyncs. `Close` after `Finish` is a no-op; `Close` without `Finish` removes the incomplete file.
 
 Multi-part items (e.g., fingerprint + bitmap data) can be appended as a single logical item:
 
@@ -185,13 +186,17 @@ type WriterOptions struct {
     // This spreads I/O across the write phase so the final fdatasync in Finish()
     // has less data to flush. 0 disables (default).
     BytesPerSync int
+
+    // Overwrite allows Create to replace an existing file.
+    // When false (default), fails if the file already exists.
+    Overwrite bool
 }
 
 // Writer creates a new packfile. Items must be appended in order.
 type Writer struct{ /* unexported */ }
 
-// Create starts writing a new packfile at path.
-// The file is not visible at path until Finish is called.
+// Create starts writing a new packfile at path. Fails if the file already
+// exists unless Overwrite is set.
 func Create(path string, opts WriterOptions) (*Writer, error)
 
 // Append adds a single logical item. Parts are concatenated as one entry.
@@ -199,15 +204,14 @@ func Create(path string, opts WriterOptions) (*Writer, error)
 func (w *Writer) Append(parts ...[]byte) error
 
 // Finish flushes any partial record, writes index + optional app data + trailer,
-// fsyncs, and atomically renames to the final path. appData is optional
-// caller-injected data stored between the index and trailer; pass nil for
-// no app data. On failure, the caller should call Abort to clean up the temp file.
+// fsyncs, and closes the file. appData is optional caller-injected data stored
+// between the index and trailer; pass nil for no app data.
 func (w *Writer) Finish(appData []byte) error
 
-// Abort discards the in-progress packfile and removes the temp file.
-// Safe to call after a failed Finish to clean up.
-// No-op only after a successful Finish or a previous Abort.
-func (w *Writer) Abort() error
+// Close releases resources. If Finish was not called, the incomplete file
+// is removed. If Finish was called, Close is a no-op. Safe to call multiple
+// times. Idiomatic usage: defer w.Close() with Finish as the last action.
+func (w *Writer) Close() error
 ```
 
 ### Reader
@@ -418,7 +422,7 @@ Flags (uint8):
 - Bit 1 (`flagContentHash`): trailer contains a 32-byte SHA-256 content hash
 - Bit 2 (`flagNoCRC`): per-record CRC32C is omitted (only with flagNoCompression)
 
-The `Checksum` at offset 60 covers `appData || trailer[0:60]` — when no app data is present, just `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits. The on-disk flags byte is decoded into a `RecordFormat` value and `HasContentHash` boolean in the `Trailer` struct — callers never touch raw flag bits.
+The `Checksum` at offset 60 covers `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits. The on-disk flags byte is decoded into a `RecordFormat` value and `HasContentHash` boolean in the `Trailer` struct — callers never touch raw flag bits.
 
 The group size (128) is a library constant; if it changes, the version is bumped.
 
@@ -515,9 +519,9 @@ delta   := residual + int64(groupMin)
 
 On open, the reader issues a single pread of the last `min(256KB, fileSize)` bytes. This usually captures the trailer, app data, and index in one IOP. The trailer is parsed from the tail, and if the full index + app data fit within the speculative buffer, no additional reads are needed. If the tail exceeds 256KB, a single fallback read fetches the remaining data.
 
-### Atomic Writes
+### Writes
 
-`Create` writes to `{path}.tmp.{random}` (random int64 suffix prevents collisions). `Finish` writes remaining items, the offset index, CRC32C, optional app data, and 64-byte trailer, fsyncs, then renames. The parent directory is fsynced to ensure the rename is durable. Crash before rename: no file at final path. Crash after: complete valid packfile.
+`Create` opens the file directly at `path` (fails if the file exists unless `Overwrite` is set). `Finish` writes remaining items, the offset index, CRC32C, optional app data, and 64-byte trailer, then fsyncs. If `Close` is called without `Finish`, the incomplete file is removed.
 
 ### ReadItem
 

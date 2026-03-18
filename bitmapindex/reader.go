@@ -38,34 +38,15 @@ func WithConcurrency(n int) ReaderOption {
 	return func(cfg *readerConfig) { cfg.concurrency = n }
 }
 
-type mphfResult struct {
-	idx *streamhash.Index
-	err error
-}
-
 // Reader provides point lookups from an MPHF+packfile bitmap index.
 // Thread-safe for concurrent Lookup and LookupKeys calls after Open.
 type Reader struct {
-	pr *packfile.Reader
-
-	// MPHF — loaded async:
-	mphfCh    <-chan mphfResult
-	mphfOnce  sync.Once
-	mphfIndex *streamhash.Index
-	mphfErr   error
+	pr       *packfile.Reader
+	waitMPHF func() (*streamhash.Index, error) // blocks until MPHF load completes
 
 	// Idempotent close:
 	closeOnce sync.Once
 	closeErr  error
-}
-
-func (r *Reader) waitMPHF() (*streamhash.Index, error) {
-	r.mphfOnce.Do(func() {
-		res := <-r.mphfCh
-		r.mphfIndex = res.idx
-		r.mphfErr = res.err
-	})
-	return r.mphfIndex, r.mphfErr
 }
 
 // Open opens a two-file bitmap index for querying.
@@ -82,60 +63,66 @@ func Open(mphfPath, dataPath string, opts ...ReaderOption) *Reader {
 		prOpts = append(prOpts, packfile.WithConcurrency(cfg.concurrency))
 	}
 
-	mphfCh := make(chan mphfResult, 1)
+	type loadResult struct {
+		idx *streamhash.Index
+		err error
+	}
+	ch := make(chan loadResult, 1)
 	go func() {
-		var result mphfResult
+		var res loadResult
 		defer func() {
 			if rv := recover(); rv != nil {
-				if result.idx != nil {
-					result.idx.Close()
+				if res.idx != nil {
+					res.idx.Close()
 				}
-				result = mphfResult{err: fmt.Errorf("bitmapindex: panic in MPHF load: %v", rv)}
+				res = loadResult{err: fmt.Errorf("bitmapindex: panic in MPHF load: %v", rv)}
 			}
-			mphfCh <- result
+			ch <- res
 		}()
-		result = loadMPHF(mphfPath, cfg.expectedLookups)
+		res.idx, res.err = loadMPHF(mphfPath, cfg.expectedLookups)
 	}()
 
 	return &Reader{
-		pr:     packfile.Open(dataPath, prOpts...),
-		mphfCh: mphfCh,
+		pr: packfile.Open(dataPath, prOpts...),
+		waitMPHF: sync.OnceValues(func() (*streamhash.Index, error) {
+			res := <-ch
+			return res.idx, res.err
+		}),
 	}
 }
 
 // loadMPHF performs all synchronous I/O for loading the MPHF index.
-func loadMPHF(path string, expectedLookups int) mphfResult {
+func loadMPHF(path string, expectedLookups int) (*streamhash.Index, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return mphfResult{err: fmt.Errorf("bitmapindex: open MPHF: %w", err)}
+		return nil, fmt.Errorf("bitmapindex: open MPHF: %w", err)
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		return mphfResult{err: fmt.Errorf("bitmapindex: stat MPHF: %w", err)}
+		return nil, fmt.Errorf("bitmapindex: stat MPHF: %w", err)
 	}
 	const ebsIOPSize = 256 * 1024
 	iopsToReadAll := (stat.Size() + ebsIOPSize - 1) / ebsIOPSize
 	prefetch := int64(expectedLookups)+1 > iopsToReadAll
 
-	var idx *streamhash.Index
 	if prefetch {
 		data, err := io.ReadAll(f)
 		if err != nil {
-			return mphfResult{err: fmt.Errorf("bitmapindex: read MPHF: %w", err)}
+			return nil, fmt.Errorf("bitmapindex: read MPHF: %w", err)
 		}
-		idx, err = streamhash.OpenBytes(data)
+		idx, err := streamhash.OpenBytes(data)
 		if err != nil {
-			return mphfResult{err: fmt.Errorf("bitmapindex: parse MPHF: %w", err)}
+			return nil, fmt.Errorf("bitmapindex: parse MPHF: %w", err)
 		}
-	} else {
-		idx, err = streamhash.OpenFile(f)
-		if err != nil {
-			return mphfResult{err: fmt.Errorf("bitmapindex: mmap MPHF: %w", err)}
-		}
+		return idx, nil
 	}
-	return mphfResult{idx: idx}
+	idx, err := streamhash.OpenFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("bitmapindex: mmap MPHF: %w", err)
+	}
+	return idx, nil
 }
 
 // Lookup returns the roaring bitmap for the given field/key, or ErrKeyNotFound.
@@ -264,22 +251,15 @@ func (r *Reader) ContentHash() ([32]byte, bool, error) {
 
 // Verify recomputes the SHA-256 content hash and compares to stored hash.
 func (r *Reader) Verify(ctx context.Context) error {
-	if err := r.pr.Verify(ctx); err != nil {
-		return fmt.Errorf("bitmapindex: %w", err)
-	}
-	return nil
+	return r.pr.Verify(ctx)
 }
 
 // Close releases all resources. Safe to call multiple times.
 func (r *Reader) Close() error {
 	r.closeOnce.Do(func() {
-		r.mphfOnce.Do(func() {
-			res := <-r.mphfCh
-			r.mphfIndex = res.idx
-			r.mphfErr = res.err
-		})
-		if r.mphfIndex != nil {
-			r.closeErr = r.mphfIndex.Close()
+		idx, _ := r.waitMPHF()
+		if idx != nil {
+			r.closeErr = idx.Close()
 		}
 		r.closeErr = errors.Join(r.closeErr, r.pr.Close())
 	})

@@ -9,7 +9,7 @@ import (
 type StoreWriter interface {
 	Append(event []byte) error
 	Finish() error
-	Abort() error
+	Close() error
 }
 
 // StoreReader reads events from a store.

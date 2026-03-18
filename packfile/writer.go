@@ -6,10 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
-	"path/filepath"
-	"strconv"
 	"sync"
 
 	"github.com/tamir/events-analysis/intpack"
@@ -43,6 +40,11 @@ type WriterOptions struct {
 	// This spreads I/O across the write phase so the final fdatasync in Finish()
 	// has less data to flush. 0 disables (default).
 	BytesPerSync int
+
+	// Overwrite allows Create to replace an existing file at the path.
+	// When false (default), Create fails if the file already exists.
+	// When true, any existing file is removed before creation.
+	Overwrite bool
 }
 
 type blockResult struct {
@@ -65,10 +67,9 @@ type hashWork struct {
 // format-processed (compressed/CRC/raw), and written with an offset index.
 type Writer struct {
 	// File I/O
-	file         *os.File
-	path         string // final path
-	tmpPath      string // {path}.tmp.{random}
-	pos          int64
+	file *os.File
+	path string
+	pos  int64
 	offsets      []int64
 	bytesPerSync int64
 	lastSyncPos  int64
@@ -108,23 +109,36 @@ func (w *Writer) getSizes() []uint32 {
 
 func (w *Writer) putSizes(s []uint32) { w.sizesPool.Put(s) }
 
-// Create starts writing a new packfile at path.
-// The file is not visible at path until Finish is called.
-func Create(path string, opts WriterOptions) (*Writer, error) {
-	recordSize := opts.RecordSize
-	if recordSize == 0 {
-		recordSize = defaultRecordSize
+// resolveRecordSize returns the effective record size from opts, defaulting
+// to 128 if zero. Returns an error if negative.
+func resolveRecordSize(opts WriterOptions) (int, error) {
+	rs := opts.RecordSize
+	if rs == 0 {
+		return defaultRecordSize, nil
 	}
-	if recordSize < 0 {
-		return nil, errors.New("packfile: RecordSize must be > 0")
+	if rs < 0 {
+		return 0, errors.New("packfile: RecordSize must be > 0")
+	}
+	return rs, nil
+}
+
+// Create starts writing a new packfile at path. By default, fails if the
+// file already exists. Set Overwrite to replace an existing file.
+func Create(path string, opts WriterOptions) (*Writer, error) {
+	recordSize, err := resolveRecordSize(opts)
+	if err != nil {
+		return nil, err
 	}
 	conc := opts.Concurrency
 	if opts.Format != Compressed && !opts.ContentHash {
 		conc = 0 // no pipeline when nothing to parallelize
 	}
 
-	tmpPath := path + ".tmp." + strconv.FormatInt(rand.Int63(), 10)
-	f, err := os.Create(tmpPath)
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if opts.Overwrite {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(path, flags, 0666)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +146,6 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	w := &Writer{
 		file:         f,
 		path:         path,
-		tmpPath:      tmpPath,
 		recordSize:   recordSize,
 		concurrency:  conc,
 		format:       opts.Format,
@@ -499,7 +512,6 @@ func (w *Writer) Finish(appData []byte) error {
 		return err
 	}
 
-	// Fsync and atomic rename.
 	if err := w.file.Sync(); err != nil {
 		w.err = err
 		return err
@@ -509,20 +521,6 @@ func (w *Writer) Finish(appData []byte) error {
 		return err
 	}
 	w.fileClosed = true
-	if err := os.Rename(w.tmpPath, w.path); err != nil {
-		w.err = err
-		return err
-	}
-
-	// Fsync parent directory to ensure the rename is durable.
-	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		syncErr := dir.Sync()
-		closeErr := dir.Close()
-		if err := errors.Join(syncErr, closeErr); err != nil {
-			w.err = err
-			return err
-		}
-	}
 
 	w.closeCompressor()
 
@@ -530,9 +528,15 @@ func (w *Writer) Finish(appData []byte) error {
 	return nil
 }
 
-// Abort discards the in-progress packfile and removes the temp file.
-// Safe to call after a failed Finish to clean up.
-func (w *Writer) Abort() error {
+// Close releases resources. If Finish was not called, the incomplete file
+// is removed. If Finish was called, Close is a no-op (the file remains as
+// a valid packfile). Safe to call multiple times. Idiomatic usage:
+//
+//	w, _ := Create(path, opts)
+//	defer w.Close()
+//	// ... Append ...
+//	return w.Finish(nil)
+func (w *Writer) Close() error {
 	if w.closed {
 		return nil
 	}
@@ -546,6 +550,7 @@ func (w *Writer) Abort() error {
 	if !w.fileClosed {
 		closeErr = w.file.Close()
 	}
-	removeErr := os.Remove(w.tmpPath)
+	// Finish was never called — remove the incomplete file.
+	removeErr := os.Remove(w.path)
 	return errors.Join(closeErr, removeErr)
 }
