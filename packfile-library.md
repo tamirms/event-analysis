@@ -4,22 +4,14 @@
 
 We need to store large collections of variable-length items (events, compressed bitmaps, ledgers) in immutable files and read individual items by ordinal index with minimal I/O. The files are written once and read many times over their lifetime.
 
-Items are grouped into **records** for compression. Small items like events and bitmaps are batched together (e.g. 128 per record) because a single 200-byte event doesn't compress meaningfully, but 128 of them together do. Large items like ledgers are stored one per record since they're big enough to compress individually. Each record is compressed and written as a contiguous block on disk.
+A flat file is the natural fit: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
 
-When a record contains multiple items, the reader needs to know where each item starts and ends within the decompressed data. A compact FOR (Frame of Reference) index appended to each multi-item record stores these byte lengths. The FOR index is always uncompressed and carries its own CRC32C — it is readable without decompressing the payload. Single-item records skip the FOR index entirely — the item is the whole payload.
-
-The natural approach is a flat file: write items sequentially, keep an offset table at the end, look up any item by index. This is simple, fast, and well-suited to immutable data. General-purpose storage engines like RocksDB or SQLite add key management, transactions, and mutable write paths that we don't need — overhead without benefit for immutable, ordinal-indexed data.
-
-Packfile is a production implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: compact index encoding, parallel block processing, SHA-256 content hashing, CRC32C integrity checks, and safe concurrent reads.
-
-## What Packfile Does
+Packfile is an implementation of this approach. It handles the details that a naive implementation gets wrong or leaves to the caller: record grouping for compression, compact index encoding, parallel block processing, SHA-256 content hashing, CRC32C integrity checks, and safe concurrent reads.
 
 Two packages:
 
-- **`packfile`** — item-level random access to immutable files. Handles record grouping, zstd compression, CRC32C integrity, content hashing, and parallel I/O. Uses CGo via `zstd/` for compression.
+- **`packfile`** — item-level random access to immutable files. Handles record grouping, zstd compression, CRC32C integrity, content hashing, and parallel I/O. Uses a thin CGo wrapper (`zstd/`) for compression — the pure-Go zstd implementation is 4x slower on our workloads.
 - **`intpack`** — integer compression using Frame of Reference (FOR) encoding. Pure Go, no external dependencies. General-purpose codec — not packfile-specific.
-
-Items are grouped into fixed-size records (default 128 items per record), compressed, and written sequentially. An offset table at the end of the file enables O(1) record lookup (encoded compactly using FOR — see [Index Encoding](#index-encoding) below). The `Writer` accumulates items and builds records automatically; the `Reader` maps item indices to records and extracts individual items.
 
 ## Usage
 
@@ -33,16 +25,16 @@ w, _ := packfile.Create("events-00042.pack", packfile.WriterOptions{
     Concurrency: 4,           // parallel block-processing goroutines
     ContentHash: true,        // compute SHA-256 content hash
 })
+defer w.Close() // removes file if Finish was not called
 
 for _, event := range events {
     w.Append(event)
 }
 
-defer w.Close() // removes file if Finish was not called
-w.Finish(nil)   // flushes partial record, writes index + trailer, fsyncs
+w.Finish(nil) // flushes partial record, writes index + trailer, fsyncs
 ```
 
-Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer (containing total items, record size, flags, content hash), and fsyncs. `Close` after `Finish` is a no-op; `Close` without `Finish` removes the incomplete file.
+Items are appended in order. `Finish` flushes any partial record, writes the offset index, optional app data, and a 64-byte trailer, then fsyncs. `Close` after `Finish` is a no-op; `Close` without `Finish` removes the incomplete file.
 
 Multi-part items (e.g., fingerprint + bitmap data) can be appended as a single logical item:
 
@@ -66,8 +58,6 @@ r.ReadItem(42, func(event []byte) error {
 
 ### Reading: Sequential Scan
 
-`ReadRange` reads a contiguous range of items in batches using a pooled 1MB buffer:
-
 ```go
 r := packfile.Open("events-00042.pack")
 defer r.Close()
@@ -84,7 +74,7 @@ Safe to break early. No cleanup required. Each yielded `[]byte` is valid only un
 
 ### Reading: Scattered Access
 
-A bitmap query produces a set of item indices scattered across the file. `ReadItems` reads them with parallel I/O and decode, calling a callback for each item:
+A bitmap query produces a set of item indices scattered across the file. `ReadItems` reads them with parallel I/O, calling a callback for each item:
 
 ```go
 r := packfile.Open("events-00042.pack", packfile.WithConcurrency(8))
@@ -95,12 +85,12 @@ indices := bitmapResult.ToSortedSlice()
 
 results := make([][]byte, len(indices))
 r.ReadItems(ctx, indices, func(pos int, entry []byte) error {
-    results[pos] = append([]byte(nil), entry...) // copy — entry is borrowed
+    results[pos] = bytes.Clone(entry) // copy — entry is borrowed
     return nil
 })
 ```
 
-`ReadItems` groups indices by record, then partitions consecutive records into I/O batches (≤ 1MB each) upfront. Workers claim batches via a simple atomic counter. The callback is called concurrently from multiple goroutines in arbitrary order; `pos` identifies which index the entry corresponds to.
+`ReadItems` groups indices by record, then partitions consecutive records into I/O batches (≤ 1MB each). Workers claim batches via an atomic counter. The callback is called concurrently from multiple goroutines in arbitrary order; `pos` identifies which index the entry corresponds to.
 
 ### Content Hash Verification
 
@@ -114,7 +104,7 @@ if ok {
 }
 ```
 
-### Reading: Key-Based Access
+### Key-Based Access
 
 Packfile indexes by ordinal position, not by key. For keyed data, the caller provides its own key → ordinal mapping. Any mapping works: a hash table, a sorted array with binary search, or a perfect hash function. Packfile doesn't know or care how the ordinal was determined.
 
@@ -142,193 +132,25 @@ r.ReadItem(slot, func(data []byte) error {
 ## Goals
 
 - **O(1) random access by ordinal index.** Every `ReadItem` call maps index to record via arithmetic, then reads and decodes a single record.
-- **Minimal I/O.** The full index loads in one disk read on open (~112KB for 68K event blocks). After that, one disk read per record, exact size, no over-read.
+- **Minimal I/O.** The full index loads in one disk read on open (~112KB for 68K records). After that, one disk read per record, exact size, no over-read.
 - **Compact index.** Index size depends on max record size, not file size. A file with 20KB records uses 15-bit deltas whether the file is 500MB or 50GB.
 - **Immutable after write.** No updates, no deletes. Simple, safe, predictable.
 - **Concurrent reads.** All `Reader` methods are safe for concurrent use. No locks in the read path.
 
 ## Non-Goals
 
-- **Key-based lookup.** Packfile is indexed by ordinal position, not by key. Key-based access is built on top by the caller (see key-based access usage example).
+- **Key-based lookup.** Packfile is indexed by ordinal position, not by key. Key-based access is built on top by the caller (see usage example above).
 - **Mutability.** No append-after-finalize, no updates, no deletes.
 - **Chunk management.** Directory layout, chunk-to-sequence mapping, rotation are caller concerns.
 - **Caching.** No built-in LRU. Callers manage their own pool of open `Reader` instances.
 
-## API Reference
+## How It Works
 
-### Writer
+Items are grouped into fixed-size **records** (default 128 items per record). Small items like events don't compress well individually, but 128 of them together do. Large items like ledgers are stored one per record since they compress well on their own. Each record is compressed and written as a contiguous block on disk.
 
-```go
-package packfile
+An **offset index** at the end of the file maps record numbers to byte offsets. On open, the entire index is decoded into a flat `[]int64` array. Looking up item `i` is arithmetic: `offsets[i / RecordSize]` gives the record's byte offset, then a single disk read + decode extracts the item.
 
-// WriterOptions configures how the packfile is written.
-type WriterOptions struct {
-    // RecordSize is the number of items per record. 0 defaults to 128.
-    RecordSize int
-
-    // Format controls record encoding. Default (zero value) is Compressed.
-    // Compressed: zstd with built-in integrity.
-    // Uncompressed: raw records with CRC32C integrity.
-    // Raw: raw records with no integrity wrapper.
-    Format RecordFormat
-
-    // Concurrency sets the number of block-processing goroutines.
-    // 0 or 1 means serial. Ignored when Format is not Compressed
-    // and ContentHash is false (nothing to parallelize).
-    Concurrency int
-
-    // ContentHash enables SHA-256 content hashing over the logical item stream.
-    ContentHash bool
-
-    // BytesPerSync initiates background writeback of dirty pages every N bytes
-    // written. On Linux this uses sync_file_range(SYNC_FILE_RANGE_WRITE) which
-    // is non-blocking — it tells the kernel to start flushing without waiting.
-    // This spreads I/O across the write phase so the final fdatasync in Finish()
-    // has less data to flush. 0 disables (default).
-    BytesPerSync int
-
-    // Overwrite allows Create to replace an existing file.
-    // When false (default), fails if the file already exists.
-    Overwrite bool
-}
-
-// Writer creates a new packfile. Items must be appended in order.
-type Writer struct{ /* unexported */ }
-
-// Create starts writing a new packfile at path. Fails if the file already
-// exists unless Overwrite is set.
-func Create(path string, opts WriterOptions) (*Writer, error)
-
-// Append adds a single logical item. Parts are concatenated as one entry.
-// Flushes a record when RecordSize items accumulate.
-func (w *Writer) Append(parts ...[]byte) error
-
-// Finish flushes any partial record, writes index + optional app data + trailer,
-// fsyncs, and closes the file. appData is optional caller-injected data stored
-// between the index and trailer; pass nil for no app data.
-func (w *Writer) Finish(appData []byte) error
-
-// Close releases resources. If Finish was not called, the incomplete file
-// is removed. If Finish was called, Close is a no-op. Safe to call multiple
-// times. Idiomatic usage: defer w.Close() with Finish as the last action.
-func (w *Writer) Close() error
-```
-
-### Reader
-
-```go
-// ReadAtCloser is the minimal interface needed by Reader to access packfile data.
-// *os.File satisfies this interface.
-type ReadAtCloser interface {
-    io.ReaderAt
-    io.Closer
-}
-
-// ReaderOption configures Reader behavior.
-type ReaderOption func(*Reader)
-
-// WithConcurrency sets the max parallel goroutines for ReadItems.
-// Values less than 1 are clamped to 1. Default 8.
-func WithConcurrency(n int) ReaderOption
-
-// Trailer holds the parsed trailer fields.
-type Trailer struct {
-    Version        uint8
-    RecordCount    uint32
-    TotalItems     uint32
-    RecordSize     uint32
-    IndexSize      uint32
-    AppDataSize    uint32
-    ContentHash    [32]byte
-    Format         RecordFormat // decoded from on-disk flags (Compressed, Uncompressed, or Raw)
-    HasContentHash bool         // decoded from on-disk flags bit 1
-    Checksum       uint32
-}
-
-// Reader provides random access to items in a packfile.
-// Safe for concurrent use by multiple goroutines.
-type Reader struct{ /* unexported */ }
-
-// Open returns a Reader immediately. All file I/O (open, stat, speculative
-// read, trailer parse, index decode, app data read) runs in a background
-// goroutine. Open never fails; errors are deferred to the first method that
-// needs the result. Close must always be called.
-func Open(path string, opts ...ReaderOption) *Reader
-
-// TotalItems returns the total number of logical items in the packfile.
-func (r *Reader) TotalItems() (int, error)
-
-// ReadItem reads a single item by global index and passes it to fn.
-// The []byte passed to fn is borrowed and must not be retained after fn
-// returns — copy if needed. Returns ErrIndexRange if index is out of
-// [0, TotalItems).
-func (r *Reader) ReadItem(index int, fn func([]byte) error) error
-
-// ReadRange returns an iterator over count contiguous items starting at start.
-// Each yielded []byte is valid only until the next iteration — copy if you
-// need to retain it. Safe to break early. Thread-safe.
-func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error]
-
-// ReadItems reads items at scattered indices with parallel I/O and calls
-// fn for each item. fn receives the position in the original indices slice
-// and a borrowed entry slice valid only for the duration of the call — copy
-// if needed.
-//
-// fn is called concurrently from multiple goroutines, in arbitrary order.
-// The pos argument identifies which index the entry corresponds to.
-//
-// indices must be sorted ascending with no duplicates.
-// Panics if any index is out of range or indices are not sorted/unique.
-func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
-
-// ContentHash returns the SHA-256 content hash stored in the trailer, if present.
-func (r *Reader) ContentHash() ([32]byte, bool, error)
-
-// AppData returns the app data section, or nil if appDataSize == 0.
-func (r *Reader) AppData() ([]byte, error)
-
-// Verify recomputes the SHA-256 content hash by streaming all items and
-// compares it to the hash stored in the trailer. Returns nil if no hash is
-// stored or if the hash matches.
-func (r *Reader) Verify(ctx context.Context) error
-
-func (r *Reader) Trailer() (Trailer, error)
-
-func (r *Reader) Close() error
-```
-
-### Errors
-
-```go
-var (
-    ErrCorrupt              = errors.New("packfile: corrupt file")
-    ErrMagic                = fmt.Errorf("%w: invalid magic number", ErrCorrupt)
-    ErrVersion              = fmt.Errorf("%w: unsupported version", ErrCorrupt)
-    ErrChecksum             = fmt.Errorf("%w: checksum mismatch", ErrCorrupt)
-    ErrSize                 = fmt.Errorf("%w: file size inconsistent with trailer", ErrCorrupt)
-    ErrIndexRange           = errors.New("packfile: record index out of range")
-    ErrContentHashMismatch  = errors.New("packfile: content hash mismatch")
-)
-```
-
-### intpack (separate package)
-
-Frame of Reference (FOR) integer compression. Unified format: `[packed residuals][1B W][4B min LE]`. Width (`W`) and minimum are always the final 5 bytes, so callers can locate metadata from the tail of any buffer. This layout is used for both the file-level offset index and the per-record item size groups — both share identical on-disk structure and the same encode/decode functions.
-
-```go
-package intpack
-
-// EncodeGroup FOR-encodes values into one group: [packed residuals][1B W][4B min LE].
-// W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
-// Panics if len(values) == 0.
-func EncodeGroup(values []uint32) []byte
-
-// DecodeGroup FOR-decodes one group of n values from the tail of buf.
-// buf must end at the last byte of [min] (the byte before any trailing CRC or other data).
-// Returns decoded values (written into dst[0:n], reallocating if cap(dst) < n),
-// bytes consumed from the tail, and any error.
-func DecodeGroup(buf []byte, n int, dst []uint32) (values []uint32, consumed int, err error)
-```
+When a record contains multiple items, the reader needs to know where each item starts within the decompressed data. A compact **FOR index** appended to each multi-item record stores these byte lengths. The FOR index is always uncompressed and carries its own CRC32C — it can be verified without decompressing the payload. Single-item records skip the FOR index entirely.
 
 ---
 
@@ -398,7 +220,7 @@ finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
 K = RecordSize
 ```
 
-The hash depends on record size (chunk boundaries), item order, and item content. Same items with the same record size in the same order produce the same hash. The hash is independent of compression and format version. For concurrent writes, per-worker hash goroutines compute chunk digests in parallel with format processing (compression, CRC, or no-op).
+The hash is independent of compression and format — same items in the same order with the same RecordSize always produce the same hash. Note that changing RecordSize changes the chunk boundaries and therefore the hash.
 
 ### Trailer (64 bytes at EOF)
 
@@ -422,161 +244,239 @@ Flags (uint8):
 - Bit 1 (`flagContentHash`): trailer contains a 32-byte SHA-256 content hash
 - Bit 2 (`flagNoCRC`): per-record CRC32C is omitted (only with flagNoCompression)
 
-The `Checksum` at offset 60 covers `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits. The on-disk flags byte is decoded into a `RecordFormat` value and `HasContentHash` boolean in the `Trailer` struct — callers never touch raw flag bits.
-
-The group size (128) is a library constant; if it changes, the version is bumped.
+The `Checksum` at offset 60 covers `trailer[0:60]`. The reader validates flags against `knownFlags` and rejects files with unknown flag bits.
 
 ### Index Encoding
 
-A naive offset table stores one absolute byte offset per record. As the file grows, each offset needs more bits — a 50GB file requires 36-bit offsets even though individual records might only be 6KB. The offset table size becomes a function of the total file size rather than the record sizes.
+The offset index maps record numbers to byte positions. A naive approach stores absolute byte offsets, but offset size grows with file size — a 50GB file needs 36-bit offsets even if records are only 6KB.
 
-Packfile avoids this by storing **record sizes** (deltas between consecutive offsets) instead of absolute positions. Deltas depend on the maximum record size, not the total file size. A file with 20KB records uses 15-bit deltas whether the file is 500MB or 50GB.
+Packfile stores **record sizes** (deltas between consecutive offsets) instead. Deltas depend on the maximum record size, not total file size. A file with 20KB records uses 15-bit deltas whether the file is 500MB or 50GB.
 
-Deltas are encoded using **Frame of Reference (FOR)** compression in groups of 128. FOR is a simple integer compression technique: subtract a per-group minimum from every value, then bit-pack the residuals at the minimum bit width needed. Each group of 128 consecutive deltas is self-contained:
+Deltas are encoded using **Frame of Reference (FOR)** compression in groups of 128. FOR subtracts a per-group minimum from every value, then bit-packs the residuals at the minimum bit width needed. Each group is self-contained:
 
 ```
-FOR Group (ceil(128 × W' / 8) + 5 bytes):
+FOR Group (ceil(128 × W / 8) + 5 bytes):
 
-  [00-XX]  residuals: 128 packed integers, W' bits each
+  [00-XX]  residuals: 128 packed integers, W bits each
            residual[j] = delta[j] - groupMin
-           where delta[j] = byte size of record (groupIndex × 128 + j)
 
-  [XX]     W': uint8
-           Bit width of residuals in this group (bits.Len32 of max residual).
+  [XX]     W: uint8, bit width of residuals (bits.Len32 of max residual)
 
-  [XX+1 .. XX+4]  groupMin: uint32 LE
-           Minimum delta in this group.
+  [XX+1 .. XX+4]  groupMin: uint32 LE, minimum delta in this group
 ```
 
-Width and minimum are always the final 5 bytes of the group. The decoder reads from the group tail, so groups are decoded backward when iterating (the last group is decoded first, shrinking the window). This tail-first layout is identical to the per-record FOR index layout — both share the same `EncodeGroup` / `DecodeGroup` functions.
+Width and minimum are always the final 5 bytes. A group where all records are between 5,000 and 5,200 bytes needs only 8 bits for residuals (range of 200), regardless of the absolute delta magnitude.
 
-The writer computes `groupMin` and `W'` independently for each group:
-
-```
-groupMin  = min(delta[0], delta[1], ..., delta[127])
-maxResid  = max(delta[j] - groupMin for j in group)
-W'        = bits.Len32(maxResid)
-```
-
-The per-group minimum subtraction reduces the effective bit width. A group where all records are between 5,000 and 5,200 bytes needs only 8 bits for residuals (range of 200), regardless of the absolute delta magnitude.
-
-**Resolving item `i`:**
+On open, all groups are decoded into a flat `[]int64` offset table. Resolving item `i`:
 
 ```
 recordIdx = i / RecordSize
 localIdx  = i % RecordSize
-offset    = offsets[recordIdx]   // from decoded offset table
+offset    = offsets[recordIdx]
 ```
 
-On open, all groups are decoded into a flat `[]int64` offset table. Each `ReadItem` is an array lookup + single disk read + decode.
+Each `ReadItem` is an array lookup + single disk read + decode.
 
-**Bit extraction (same for encode and decode):**
-
-```go
-bitPos  := uint64(j) * uint64(W)
-bytePos := bitPos / 8    // offset from start of packed section (no header prefix)
-shift   := bitPos % 8
-raw     := binary.LittleEndian.Uint64(packed[bytePos:])
-residual := int64((raw >> shift) & ((1 << W) - 1))
-delta   := residual + int64(groupMin)
-```
-
-`packed` is `groupBuf[:packSize]` where `packSize = ceil(N × W / 8)`. Reads 8 bytes, shifts, masks, adds back the group minimum. Maximum usable `W'` is 57 (shift ≤ 7, shift + W' ≤ 64).
+The group size (128) is a library constant, independent of RecordSize. If it changes, the format version is bumped.
 
 ### Integrity
 
-**Index checksum:** A CRC32C of the raw index bytes (all FOR groups, excluding the CRC itself) is stored at the end of the index section (after the last group, before metadata). On open, the library verifies this checksum before decoding. This catches any on-disk corruption in group headers or packed residuals. As an additional sanity check, after decoding, the library asserts that the running offset sum equals `indexBase` — an independent structural invariant that catches encode/decode logic bugs.
+**Index checksum:** CRC32C of the raw index bytes (all FOR groups). Verified on open before decoding. After decoding, the reader also asserts that the running offset sum equals `indexBase` — an independent structural invariant that catches encode/decode logic bugs.
 
 **Trailer checksum:** CRC32C of `trailer[0:60]` protects all structural fields. App data has no packfile-level integrity check — callers are responsible for their own app data integrity.
 
-**Trailer validation:** On open, the reader validates flags against `knownFlags`, rejects unknown flags, validates `recordSize > 0`, and cross-validates that `ceil(totalItems / recordSize) == recordCount`.
+**Trailer validation:** On open: flags against `knownFlags`, `recordSize > 0`, `ceil(totalItems / recordSize) == recordCount`.
 
-**Record checksums:** Compressed records use zstd's built-in content checksum (xxHash64), verified automatically during decompression. Uncompressed records use a trailing CRC32C. Raw records (`Format: Raw`) have no per-record integrity — use this only when items are already checksummed.
+**Record checksums:** Compressed records use zstd's built-in content checksum (xxHash64), verified during decompression. Uncompressed records use a trailing CRC32C. Raw records have no per-record integrity — use only when items are already checksummed.
 
-**Content hash verification:** `Verify(ctx)` recomputes the SHA-256 content hash by streaming all items via `ReadRange` and compares to the stored hash. Returns `ErrContentHashMismatch` on mismatch.
+**Content hash verification:** `Verify(ctx)` recomputes the SHA-256 content hash by streaming all items and compares to the stored hash.
 
 ### Edge Cases
 
-**Last group:** If `RecordCount` is not a multiple of 128, remaining residual slots are zero-padded. The reader respects `RecordCount` and never accesses padding. The group's `W'` and `groupMin` are computed from actual deltas only.
+**Last group:** If `RecordCount` is not a multiple of 128, remaining residual slots are zero-padded. The reader respects `RecordCount` and never accesses padding.
 
-**Last record:** If `TotalItems` is not a multiple of `RecordSize`, the last record contains fewer items. `itemsInRecord()` handles this.
+**Last record:** If `TotalItems` is not a multiple of `RecordSize`, the last record contains fewer items.
 
-**8-byte read overshoot (decode):** The bit extraction reads 8 bytes at a time. For elements near the end of the packed section, an 8-byte read could extend past the packed data. `unpackResiduals` handles this with a `safeLimit = len(packed) - 7` guard: elements past `safeLimit` are decoded byte-by-byte. No extra allocation needed in the decoder — the overshoot concern is write-side only. `EncodeGroup` allocates `+7` bytes beyond the packed section so `packResiduals`'s 8-byte writes are always safe.
+**Zero items:** Valid. No records. Index section is just 4 bytes (CRC32C of empty payload).
 
-**Zero items:** Valid. No records. Index section is just 4 bytes (CRC32C of empty payload). All read operations return errors or empty results.
-
-**Single item:** One record, one group, one delta. The record's end offset is `indexBase` (start of the index section).
+**Single item:** One record, one group, one delta.
 
 ---
 
-## Implementation
+## Implementation Notes
 
-### Non-blocking Open
+### Read Path
 
-`Open` returns a `*Reader` immediately. A background goroutine performs all I/O: open file, stat, speculative read, trailer parse, CRC verification, index decode, app data read. A `sync.Once` drains the goroutine result on the first query method call (`ReadItem`, `TotalItems`, etc.). Errors are deferred to query time — `Open` itself never fails. This enables overlapped initialization: the caller can start loading an MPHF or opening other packfiles while the goroutine runs.
+**Non-blocking Open.** `Open` returns a `*Reader` immediately. A background goroutine performs all I/O: open, stat, speculative read, trailer parse, CRC verification, index decode, app data read. A `sync.OnceValue` drains the result on the first query call. Errors are deferred to query time — `Open` itself never fails. This enables overlapped initialization: start loading an MPHF or opening other files while the goroutine runs.
 
-### Speculative Read
+**Speculative Read.** On open, one pread of the last `min(256KB, fileSize)` bytes. This usually captures the trailer, app data, and index in one IOP. If the tail exceeds 256KB, a single fallback read fetches the rest.
 
-On open, the reader issues a single pread of the last `min(256KB, fileSize)` bytes. This usually captures the trailer, app data, and index in one IOP. The trailer is parsed from the tail, and if the full index + app data fit within the speculative buffer, no additional reads are needed. If the tail exceeds 256KB, a single fallback read fetches the remaining data.
+**ReadItem.** Maps item index to record index (`i / RecordSize`), gets a pooled decoder, reads the record via `ReadAt`, decodes (decompresses + extracts item sizes), and passes the item to the callback as a borrowed slice. Returns the decoder to the pool after the callback.
 
-### Writes
+**ReadRange.** Coalesces consecutive records that fit in a pooled 1MB buffer into single `ReadAt` calls. Oversized records (> 1MB) get one-off allocations.
 
-`Create` opens the file directly at `path` (fails if the file exists unless `Overwrite` is set). `Finish` writes remaining items, the offset index, CRC32C, optional app data, and 64-byte trailer, then fsyncs. If `Close` is called without `Finish`, the incomplete file is removed.
+**ReadItems.** Single-pass partition of sorted indices into I/O batches (consecutive records ≤ 1MB). Workers (up to `concurrency` goroutines) claim batches via an atomic counter, read with a single `ReadAt`, decode, and call `fn(pos, entry)` directly. No channels, no reorder goroutine. On error or cancellation, an atomic flag stops remaining workers.
 
-### ReadItem
+**Decoder Pool.** `sync.Pool` of decoder instances, each owning a `ZSTD_DCtx` allocated via CGo. Decoders are stateless between calls.
 
-Maps item index to record index (`i / RecordSize`), gets a pooled `decoder`, reads the record via `ReadAt`, decodes (decompresses + extracts item sizes from the trailing size table), and passes the item at `i % RecordSize` to the caller's callback as a borrowed slice. The decoder stays alive during the callback, so the entry is valid for its duration. Returns the decoder to the pool after the callback returns.
+**Concurrency.** Safe for concurrent use after `Open`. The offset table and metadata are immutable. All read methods use stateless `ReadAt` (pread) with pooled resources.
 
-### ReadRange
+### Write Path
 
-Sequential iteration with batch I/O. Computes the first and last record for the requested range. Gets a pooled decoder and a pooled 1MB read buffer. Coalesces consecutive records that fit in the buffer into a single `ReadAt` call. Decodes each record and yields items in range. Oversized records (> 1MB) get one-off allocations.
+**Create.** Opens the file directly at `path` with `O_EXCL` (fails if exists, unless `Overwrite` is set). `Finish` writes remaining items, the offset index, app data, trailer, then fsyncs. `Close` without `Finish` removes the incomplete file.
 
-### ReadItems
+**Parallel Pipeline.** When `Concurrency > 1`, the writer runs a streaming pipeline: `Append` accumulates items → `Flush` sends records to `workCh` → N block workers compress/CRC/hash in parallel → writer goroutine reorders by block ID and writes sequentially.
 
-Single-pass setup then parallel execution:
+**BytesPerSync.** Optional background writeback via `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux (no-op elsewhere). Spreads I/O so the final fsync has less to flush.
 
-**Setup**: Linear scan over sorted indices to partition into I/O batches. Consecutive records whose total bytes ≤ 1MB share a batch (single ReadAt). Non-consecutive records or buffer overflow start a new batch.
+**Index Decode OOM Guard.** Before decoding, validates that `recordCount` is plausible given `indexSize`. Each FOR group of up to 128 records requires at least 6 bytes. This prevents crafted trailers from causing huge allocations.
 
-**Execution**: Workers (up to `concurrency` goroutines) claim batches via an atomic counter. Each worker reads the coalesced byte range with a single ReadAt into a pooled 1MB buffer, decodes each record in the batch, and calls `fn(pos, entry)` directly with the borrowed entry. Oversized single records get one-off allocations.
+## API Reference
 
-No channels, no reorder goroutine — workers call `fn` directly. The caller handles ordering via the `pos` argument (position in the original indices slice). On error or context cancellation, an atomic flag stops remaining workers. A `sync.Once` captures the first error.
+### Writer
 
-### Parallel Block-Processing Pipeline
+```go
+package packfile
 
-When `Concurrency > 1` (enabled for Compressed format, or any format with `ContentHash: true`), the writer runs a streaming pipeline:
+// WriterOptions configures how the packfile is written.
+type WriterOptions struct {
+    // RecordSize is the number of items per record. 0 defaults to 128.
+    RecordSize int
 
-1. **Append** accumulates items into a buffer until `RecordSize` items.
-2. **Flush** builds the raw record payload and sends it to `workCh`.
-3. **N block workers** receive records from `workCh`, perform format-specific processing (zstd compression / CRC32C / no-op for Raw), optionally compute SHA-256 chunk digest in a parallel goroutine (overlapping with format processing), and send results to `resultCh`.
-4. **Writer goroutine** receives processed records from `resultCh`, reorders by block ID, and writes sequentially. Chunk digests are appended to the digest buffer in order.
+    // Format controls record encoding. Default (zero value) is Compressed.
+    // Compressed: zstd with built-in integrity.
+    // Uncompressed: raw records with CRC32C integrity.
+    // Raw: raw records with no integrity wrapper.
+    Format RecordFormat
 
-### BytesPerSync
+    // Concurrency sets the number of block-processing goroutines.
+    // 0 or 1 means serial. Ignored when Format is not Compressed
+    // and ContentHash is false (nothing to parallelize).
+    Concurrency int
 
-Optional background writeback via `sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux (no-op on other platforms). Every `BytesPerSync` bytes written, the writer tells the kernel to start flushing dirty pages in the preceding range — non-blocking, returns immediately. This spreads I/O across the write phase so the final fsync in `Finish` has less data to flush.
+    // ContentHash enables SHA-256 content hashing over the logical item stream.
+    ContentHash bool
 
-### Index Decode OOM Guard
+    // BytesPerSync initiates background writeback of dirty pages every N bytes
+    // written. On Linux this uses sync_file_range(SYNC_FILE_RANGE_WRITE) which
+    // is non-blocking — it tells the kernel to start flushing without waiting.
+    // This spreads I/O across the write phase so the final fdatasync in Finish()
+    // has less data to flush. 0 disables (default).
+    BytesPerSync int
 
-Before decoding the index, the reader validates that `recordCount` is plausible given `indexSize`. Each index group of up to 128 records requires at least 6 bytes (1B packed + 1B width + 4B min). If `recordCount` exceeds `(indexSize - 4) / 6 * 128`, the file is rejected as corrupt. This prevents crafted trailers from causing huge allocations.
+    // Overwrite allows Create to replace an existing file.
+    // When false (default), fails if the file already exists.
+    Overwrite bool
+}
 
-### Concurrency
+// Writer creates a new packfile. Items must be appended in order.
+type Writer struct{ /* unexported */ }
 
-Safe for concurrent use after `Open`. The decoded `[]int64` offset table and metadata are immutable. `ReadItem` issues a stateless `ReadAt` (pread) with a pooled decoder, calls the callback, and returns the decoder to the pool. `ReadRange` borrows a pooled buffer and decoder. `ReadItems` coordinates parallel workers internally — each worker has its own pooled decoder and buffer.
+// Create starts writing a new packfile at path. Fails if the file already
+// exists unless Overwrite is set.
+func Create(path string, opts WriterOptions) (*Writer, error)
 
-### Decoder Pool
+// Append adds a single logical item. Parts are concatenated as one entry.
+// Flushes a record when RecordSize items accumulate.
+func (w *Writer) Append(parts ...[]byte) error
 
-A `sync.Pool` of `decoder` instances, each owning a `ZSTD_DCtx` (zstd decompression context) allocated via CGo. The pool avoids repeated CGo allocation/deallocation. Decoders are stateless between calls — `Decode` fully resets internal buffers.
+// Finish flushes any partial record, writes index + optional app data + trailer,
+// fsyncs, and closes the file. appData is optional caller-injected data stored
+// between the index and trailer; pass nil for no app data.
+func (w *Writer) Finish(appData []byte) error
 
-### Validation Summary
+// Close releases resources. If Finish was not called, the incomplete file
+// is removed. If Finish was called, Close is a no-op. Safe to call multiple
+// times. Idiomatic usage: defer w.Close() with Finish as the last action.
+func (w *Writer) Close() error
+```
 
-**On open:** magic, version, trailer CRC32C (covers `trailer[0:60]`), file size consistency, index OOM guard, index CRC32C (raw bytes), final offset equals `indexBase`, trailer flags against `knownFlags`, `recordSize > 0`, `ceil(totalItems / recordSize) == recordCount`.
+### Reader
 
-**On Decode (multi-item records):** FOR index CRC32C (over `[packed][W][min]`); `sum(itemSizes) == actual payload length`.
+```go
+// Reader provides random access to items in a packfile.
+// Safe for concurrent use by multiple goroutines.
+type Reader struct{ /* unexported */ }
 
-**On ReadItem:** index in `[0, TotalItems)`.
+// Open returns a Reader immediately. All file I/O (open, stat, speculative
+// read, trailer parse, index decode, app data read) runs in a background
+// goroutine. Open never fails; errors are deferred to the first method that
+// needs the result. Close must always be called.
+func Open(path string, opts ...ReaderOption) *Reader
 
-**On ReadRange:** entire range validated upfront (panics on out-of-range).
+// WithConcurrency sets the max parallel goroutines for ReadItems.
+// Values less than 1 are clamped to 1. Default 8.
+func WithConcurrency(n int) ReaderOption
 
-**On ReadItems:** sorted-unique invariant (panics on violation), bounds checked against `TotalItems`.
+// TotalItems returns the total number of logical items in the packfile.
+func (r *Reader) TotalItems() (int, error)
 
-**On Verify:** recomputes SHA-256 content hash over all items, compares to stored hash.
+// ReadItem reads a single item by global index and passes it to fn.
+// The []byte passed to fn is borrowed and must not be retained after fn
+// returns — copy if needed. Returns ErrIndexRange if index is out of
+// [0, TotalItems).
+func (r *Reader) ReadItem(index int, fn func([]byte) error) error
 
+// ReadRange returns an iterator over count contiguous items starting at start.
+// Each yielded []byte is valid only until the next iteration — copy if you
+// need to retain it. Safe to break early. Thread-safe.
+func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error]
+
+// ReadItems reads items at scattered indices with parallel I/O and calls
+// fn for each item. fn receives the position in the original indices slice
+// and a borrowed entry slice valid only for the duration of the call — copy
+// if needed.
+//
+// fn is called concurrently from multiple goroutines, in arbitrary order.
+// The pos argument identifies which index the entry corresponds to.
+//
+// indices must be sorted ascending with no duplicates.
+// Panics if any index is out of range or indices are not sorted/unique.
+func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error
+
+// ContentHash returns the SHA-256 content hash stored in the trailer, if present.
+func (r *Reader) ContentHash() ([32]byte, bool, error)
+
+// Verify recomputes the SHA-256 content hash by streaming all items and
+// compares it to the hash stored in the trailer. Returns nil if no hash is
+// stored or if the hash matches.
+func (r *Reader) Verify(ctx context.Context) error
+
+// AppData returns the app data section, or nil if appDataSize == 0.
+func (r *Reader) AppData() ([]byte, error)
+
+func (r *Reader) Trailer() (Trailer, error)
+
+func (r *Reader) Close() error
+```
+
+### Errors
+
+```go
+var (
+    ErrCorrupt             = errors.New("packfile: corrupt file")
+    ErrMagic               = fmt.Errorf("%w: invalid magic number", ErrCorrupt)
+    ErrVersion             = fmt.Errorf("%w: unsupported version", ErrCorrupt)
+    ErrChecksum            = fmt.Errorf("%w: checksum mismatch", ErrCorrupt)
+    ErrSize                = fmt.Errorf("%w: file size inconsistent with trailer", ErrCorrupt)
+    ErrIndexRange          = errors.New("packfile: record index out of range")
+    ErrContentHashMismatch = errors.New("packfile: content hash mismatch")
+)
+```
+
+### intpack
+
+```go
+package intpack
+
+// EncodeGroup FOR-encodes values into one group: [packed residuals][1B W][4B min LE].
+// W = bits.Len32(max - min), clamped to min 1. Pure codec — no CRC, no trailer.
+// Panics if len(values) == 0.
+func EncodeGroup(values []uint32) []byte
+
+// DecodeGroup FOR-decodes one group of n values from the tail of buf.
+// buf must end at the last byte of [min] (the byte before any trailing CRC or other data).
+// Returns decoded values (written into dst[0:n], reallocating if cap(dst) < n),
+// bytes consumed from the tail, and any error.
+func DecodeGroup(buf []byte, n int, dst []uint32) (values []uint32, consumed int, err error)
+```
