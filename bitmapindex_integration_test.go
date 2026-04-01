@@ -34,7 +34,7 @@ func TestBitmapIndexIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, ev := range allEvents {
-			if err := ew.Append(ev); err != nil {
+			if err := ew.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}

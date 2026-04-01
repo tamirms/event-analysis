@@ -32,7 +32,7 @@ type openResult struct {
 
 	// Decoded from trailer for internal use (int casts of uint32 trailer fields).
 	totalItems int
-	recordSize int
+	itemsPerRecord int
 
 	err error
 }
@@ -60,10 +60,10 @@ func WithConcurrency(n int) ReaderOption {
 	return func(r *Reader) { r.concurrency = n }
 }
 
-// Open returns a Reader immediately. All file I/O (open, stat, speculative
-// read, trailer parse, index decode, app data read) runs in a background
-// goroutine. Open never fails; errors are deferred to the first method that
-// needs the result. Close must always be called.
+// Open returns a Reader immediately. File I/O runs in a background goroutine;
+// the first read call blocks until the file is ready. Open never fails;
+// errors are deferred to the first method that needs the result.
+// Close must always be called.
 func Open(path string, opts ...ReaderOption) *Reader {
 	r := &Reader{concurrency: defaultConcurrency}
 	for _, opt := range opts {
@@ -138,12 +138,18 @@ func doOpen(path string) openResult {
 	flags := tb[5]
 	recordCount := int(binary.LittleEndian.Uint32(tb[6:]))
 	totalItems := int(binary.LittleEndian.Uint32(tb[10:]))
-	recordSize := int(binary.LittleEndian.Uint32(tb[14:]))
+	itemsPerRecord := int(binary.LittleEndian.Uint32(tb[14:]))
 	indexSize := int(binary.LittleEndian.Uint32(tb[18:]))
 	appDataSize := int(binary.LittleEndian.Uint32(tb[22:]))
 	var contentHash [32]byte
 	copy(contentHash[:], tb[26:58])
+	indexGroupSize := int(binary.LittleEndian.Uint16(tb[58:]))
 	storedCRC := binary.LittleEndian.Uint32(tb[60:])
+
+	// Validate index group size.
+	if indexGroupSize != groupSize {
+		return openResult{err: fmt.Errorf("packfile: unsupported index group size %d (expected %d)", indexGroupSize, groupSize)}
+	}
 
 	// Validate flags.
 	if flags&^knownFlags != 0 {
@@ -214,20 +220,20 @@ func doOpen(path string) openResult {
 		return openResult{err: err}
 	}
 
-	// Validate recordSize.
-	if recordSize <= 0 && recordCount > 0 {
-		return openResult{err: fmt.Errorf("packfile: invalid recordSize %d in trailer", recordSize)}
+	// Validate itemsPerRecord.
+	if itemsPerRecord <= 0 && recordCount > 0 {
+		return openResult{err: fmt.Errorf("packfile: invalid itemsPerRecord %d in trailer", itemsPerRecord)}
 	}
 
 	// Cross-validate: number of records implied by totalItems must match recordCount.
-	if recordSize > 0 {
-		expectedRecords := (totalItems + recordSize - 1) / recordSize
+	if itemsPerRecord > 0 {
+		expectedRecords := (totalItems + itemsPerRecord - 1) / itemsPerRecord
 		if totalItems == 0 {
 			expectedRecords = 0
 		}
 		if expectedRecords != recordCount {
-			return openResult{err: fmt.Errorf("packfile: trailer says %d items / %d recordSize = %d records, but packfile has %d records",
-				totalItems, recordSize, expectedRecords, recordCount)}
+			return openResult{err: fmt.Errorf("packfile: trailer says %d items / %d itemsPerRecord = %d records, but packfile has %d records",
+				totalItems, itemsPerRecord, expectedRecords, recordCount)}
 		}
 	}
 
@@ -237,10 +243,11 @@ func doOpen(path string) openResult {
 			Version:        v,
 			RecordCount:    uint32(recordCount),
 			TotalItems:     uint32(totalItems),
-			RecordSize:     uint32(recordSize),
+			ItemsPerRecord:     uint32(itemsPerRecord),
 			IndexSize:      uint32(indexSize),
 			AppDataSize:    uint32(appDataSize),
 			ContentHash:    contentHash,
+			IndexForGroupSize: uint16(indexGroupSize),
 			Format:         format,
 			HasContentHash: hasContentHash,
 			Checksum:       storedCRC,
@@ -248,15 +255,15 @@ func doOpen(path string) openResult {
 		offsets:    offsets,
 		appData:    appData,
 		totalItems: totalItems,
-		recordSize: recordSize,
+		itemsPerRecord: itemsPerRecord,
 	}
 
-	// Default recordSize for empty files (writer stores the configured value,
+	// Default itemsPerRecord for empty files (writer stores the configured value,
 	// e.g. 128, but a hand-crafted file could have 0). Patch both the internal
 	// field and the Trailer to keep them consistent.
-	if res.recordSize == 0 {
-		res.recordSize = 1
-		res.trailer.RecordSize = 1
+	if res.itemsPerRecord == 0 {
+		res.itemsPerRecord = 1
+		res.trailer.ItemsPerRecord = 1
 	}
 
 	cleanup = false
@@ -276,24 +283,24 @@ func (r *Reader) getDecoder() *decoder {
 	rd := getDecoder()
 	rd.format = r.trailer.Format
 	rd.totalItems = r.totalItems
-	rd.recordSize = r.recordSize
+	rd.itemsPerRecord = r.itemsPerRecord
 	return rd
 }
 
-// ReadItem reads a single item by global index and passes it to fn.
+// ReadItem reads a single item by position and passes it to fn.
 // The []byte passed to fn is borrowed and must not be retained after fn
-// returns — copy if needed. Returns ErrIndexRange if index is out of
-// [0, TotalItems).
-func (r *Reader) ReadItem(index int, fn func([]byte) error) error {
+// returns — copy if needed. Returns ErrPositionOutOfRange if position is
+// out of [0, TotalItems).
+func (r *Reader) ReadItem(position int, fn func([]byte) error) error {
 	if err := r.waitOpen(); err != nil {
 		return err
 	}
-	if index < 0 || index >= r.totalItems {
-		return ErrIndexRange
+	if position < 0 || position >= r.totalItems {
+		return ErrPositionOutOfRange
 	}
 
-	recordIdx := index / r.recordSize
-	localIdx := index % r.recordSize
+	recordIdx := position / r.itemsPerRecord
+	localIdx := position % r.itemsPerRecord
 
 	rd := r.getDecoder()
 	defer putDecoder(rd)
@@ -311,7 +318,7 @@ func (r *Reader) ReadItem(index int, fn func([]byte) error) error {
 	if err := rd.Decode(rd.scratch, recordIdx); err != nil {
 		return err
 	}
-	return fn(rd.Entry(localIdx))
+	return fn(rd.Item(localIdx))
 }
 
 // ReadRange returns an iterator over count contiguous items starting at start.
@@ -335,8 +342,8 @@ func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error] {
 				start, count, r.totalItems))
 		}
 
-		firstRecord := start / r.recordSize
-		lastRecord := (start + count - 1) / r.recordSize
+		firstRecord := start / r.itemsPerRecord
+		lastRecord := (start + count - 1) / r.itemsPerRecord
 		end := start + count // one past last item
 
 		rd := r.getDecoder()
@@ -355,11 +362,11 @@ func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error] {
 				yield(nil, err)
 				return false
 			}
-			recStart := recIdx * r.recordSize
+			recStart := recIdx * r.itemsPerRecord
 			lo := globalIdx - recStart
 			hi := min(len(rd.sizes), end-recStart)
 			for i := lo; i < hi; i++ {
-				if !yield(rd.Entry(i), nil) {
+				if !yield(rd.Item(i), nil) {
 					return false
 				}
 				globalIdx++
@@ -411,18 +418,18 @@ func (r *Reader) ReadRange(start, count int) iter.Seq2[[]byte, error] {
 	}
 }
 
-// ReadItems reads items at scattered indices with parallel I/O and calls
-// fn for each item. fn receives the position in the original indices slice and
-// a borrowed entry slice valid only for the duration of the call — copy if
+// ReadItems reads items at scattered positions with parallel I/O and calls
+// fn for each item. fn receives the index in the original positions slice and
+// a borrowed data slice valid only for the duration of the call — copy if
 // needed.
 //
 // fn is called concurrently from multiple goroutines, in arbitrary order.
-// The pos argument identifies which index the entry corresponds to.
+// The idx argument identifies which element in positions the data corresponds to.
 //
-// indices must be sorted ascending with no duplicates.
-// Panics if any index is out of [0, TotalItems) or if indices are not sorted/unique.
-func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, entry []byte) error) error {
-	if len(indices) == 0 {
+// positions must be sorted ascending with no duplicates.
+// Panics if any position is out of [0, TotalItems) or if positions are not sorted/unique.
+func (r *Reader) ReadItems(ctx context.Context, positions []int, fn func(idx int, data []byte) error) error {
+	if len(positions) == 0 {
 		return nil
 	}
 
@@ -431,14 +438,14 @@ func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, 
 	}
 
 	// Validate bounds and sorted+unique invariant.
-	for i, idx := range indices {
-		if idx < 0 || idx >= r.totalItems {
-			panic(fmt.Sprintf("packfile: ReadItems index %d out of range [0, %d)",
-				idx, r.totalItems))
+	for i, pos := range positions {
+		if pos < 0 || pos >= r.totalItems {
+			panic(fmt.Sprintf("packfile: ReadItems position %d out of range [0, %d)",
+				pos, r.totalItems))
 		}
-		if i > 0 && indices[i] <= indices[i-1] {
-			panic(fmt.Sprintf("packfile: ReadItems indices not sorted/unique at position %d: %d <= %d",
-				i, indices[i], indices[i-1]))
+		if i > 0 && positions[i] <= positions[i-1] {
+			panic(fmt.Sprintf("packfile: ReadItems positions not sorted/unique at %d: %d <= %d",
+				i, positions[i], positions[i-1]))
 		}
 	}
 
@@ -449,15 +456,15 @@ func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, 
 		firstRecord int
 		lastRecord  int
 	}
-	maxPerBatch := max(1, (len(indices)+r.concurrency-1)/r.concurrency)
+	maxPerBatch := max(1, (len(positions)+r.concurrency-1)/r.concurrency)
 	batches := make([]ioBatch, 0, r.concurrency)
 	batchIdxStart := 0
-	firstRec := indices[0] / r.recordSize
+	firstRec := positions[0] / r.itemsPerRecord
 	lastRec := firstRec
 	batchBytes := r.offsets[firstRec+1] - r.offsets[firstRec]
 
-	for i := 1; i < len(indices); i++ {
-		rec := indices[i] / r.recordSize
+	for i := 1; i < len(positions); i++ {
+		rec := positions[i] / r.itemsPerRecord
 		if rec == lastRec {
 			continue
 		}
@@ -475,7 +482,7 @@ func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, 
 			batchBytes = recBytes
 		}
 	}
-	batches = append(batches, ioBatch{batchIdxStart, len(indices), firstRec, lastRec})
+	batches = append(batches, ioBatch{batchIdxStart, len(positions), firstRec, lastRec})
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -529,7 +536,7 @@ func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, 
 
 				prevRec := -1
 				for k := batch.idxStart; k < batch.idxEnd; k++ {
-					rec, localIdx := indices[k]/r.recordSize, indices[k]%r.recordSize
+					rec, localIdx := positions[k]/r.itemsPerRecord, positions[k]%r.itemsPerRecord
 					if rec != prevRec {
 						recOff := r.offsets[rec] - readStart
 						recEnd := r.offsets[rec+1] - readStart
@@ -540,7 +547,7 @@ func (r *Reader) ReadItems(ctx context.Context, indices []int, fn func(pos int, 
 						}
 						prevRec = rec
 					}
-					if err := fn(k, rd.Entry(localIdx)); err != nil {
+					if err := fn(k, rd.Item(localIdx)); err != nil {
 						errOnce.Do(func() { firstErr = err })
 						cancelled.Store(true)
 						return
@@ -580,7 +587,7 @@ func (r *Reader) Verify(ctx context.Context) error {
 		return nil
 	}
 
-	hasher := newContentHasher(r.recordSize)
+	hasher := newContentHasher(r.itemsPerRecord)
 	i := 0
 	for item, err := range r.ReadRange(0, r.totalItems) {
 		if err != nil {
@@ -588,7 +595,7 @@ func (r *Reader) Verify(ctx context.Context) error {
 		}
 		hasher.Add(item)
 		i++
-		if i%r.recordSize == 0 {
+		if i%r.itemsPerRecord == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}

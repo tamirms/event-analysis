@@ -5,14 +5,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
-// buildPayload assembles entries into a contiguous payload and returns item sizes.
-func buildPayload(entries [][]byte) (payload []byte, sizes []uint32) {
-	sizes = make([]uint32, len(entries))
-	for i, e := range entries {
+// buildPayload assembles items into a contiguous payload and returns item sizes.
+func buildPayload(items [][]byte) (payload []byte, sizes []uint32) {
+	sizes = make([]uint32, len(items))
+	for i, e := range items {
 		payload = append(payload, e...)
 		sizes[i] = uint32(len(e))
 	}
@@ -21,7 +20,7 @@ func buildPayload(entries [][]byte) (payload []byte, sizes []uint32) {
 
 // buildForIndex encodes sizes as a FOR index: [packed][1B W][4B min][4B CRC32C].
 func buildForIndex(sizes []uint32) []byte {
-	encoded := intpack.EncodeGroup(sizes)
+	encoded := encodeGroup(sizes)
 	return binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 }
 
@@ -29,7 +28,7 @@ func buildForIndex(sizes []uint32) []byte {
 func configTestDecoder(rd *decoder, n int, format RecordFormat) {
 	rd.format = format
 	rd.totalItems = n
-	rd.recordSize = n
+	rd.itemsPerRecord = n
 }
 
 func TestDecoderCompressed(t *testing.T) {
@@ -54,17 +53,17 @@ func TestDecoderCompressed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
-		got := rd.Entry(i)
+		got := rd.Item(i)
 		if string(got) != string(want) {
-			t.Errorf("Entry(%d) = %q, want %q", i, got, want)
+			t.Errorf("Item(%d) = %q, want %q", i, got, want)
 		}
 	}
 
-	// Verify EntryCopy returns an independent copy.
-	cp := rd.EntryCopy(0)
+	// Verify ItemCopy returns an independent copy.
+	cp := rd.ItemCopy(0)
 	cp[0] = 'X'
-	if rd.Entry(0)[0] == 'X' {
-		t.Error("EntryCopy should return an independent copy")
+	if rd.Item(0)[0] == 'X' {
+		t.Error("ItemCopy should return an independent copy")
 	}
 }
 
@@ -88,15 +87,15 @@ func TestDecoderUncompressed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
-		got := rd.Entry(i)
+		got := rd.Item(i)
 		if string(got) != string(want) {
-			t.Errorf("Entry(%d) = %q, want %q", i, got, want)
+			t.Errorf("Item(%d) = %q, want %q", i, got, want)
 		}
 	}
 }
 
 func TestDecoderCRC32CCorruption(t *testing.T) {
-	// recordSize=1: no FOR index, just [payload][4B CRC_items].
+	// itemsPerRecord=1: no FOR index, just [payload][4B CRC_items].
 	payload := []byte("data")
 	raw := binary.LittleEndian.AppendUint32(append([]byte{}, payload...), CRC32C(payload))
 
@@ -150,7 +149,7 @@ func TestDecoderPool(t *testing.T) {
 		putDecoder(rd)
 		t.Fatal(err)
 	}
-	got := rd.EntryCopy(0)
+	got := rd.ItemCopy(0)
 	putDecoder(rd)
 
 	if string(got) != "pooled" {
@@ -158,7 +157,7 @@ func TestDecoderPool(t *testing.T) {
 	}
 }
 
-func TestEntryBoundsCheck(t *testing.T) {
+func TestItemBoundsCheck(t *testing.T) {
 	entries := [][]byte{[]byte("a"), []byte("b"), []byte("c")}
 	payload, sizes := buildPayload(entries)
 	forIndex := buildForIndex(sizes)
@@ -176,14 +175,14 @@ func TestEntryBoundsCheck(t *testing.T) {
 	}
 
 	// Negative index.
-	assertPanics(t, "Entry(-1)", func() { rd.Entry(-1) })
+	assertPanics(t, "Item(-1)", func() { rd.Item(-1) })
 
 	// Index == n (one past end).
-	assertPanics(t, "Entry(3)", func() { rd.Entry(3) })
+	assertPanics(t, "Item(3)", func() { rd.Item(3) })
 
-	// EntryCopy delegates to Entry, so same bounds check.
-	assertPanics(t, "EntryCopy(-1)", func() { rd.EntryCopy(-1) })
-	assertPanics(t, "EntryCopy(3)", func() { rd.EntryCopy(3) })
+	// ItemCopy delegates to Item, so same bounds check.
+	assertPanics(t, "ItemCopy(-1)", func() { rd.ItemCopy(-1) })
+	assertPanics(t, "ItemCopy(3)", func() { rd.ItemCopy(3) })
 }
 
 func assertPanics(t *testing.T, name string, f func()) {
@@ -197,7 +196,7 @@ func assertPanics(t *testing.T, name string, f func()) {
 }
 
 func TestDecoderNoForIndex(t *testing.T) {
-	// When recordSize=1, the entire decompressed payload is one item (no FOR index).
+	// When itemsPerRecord=1, the entire decompressed payload is one item (no FOR index).
 	payload := []byte("single-item-payload")
 	compressed, err := zstd.Encode(payload)
 	if err != nil {
@@ -211,9 +210,9 @@ func TestDecoderNoForIndex(t *testing.T) {
 	if err := rd.Decode(compressed, 0); err != nil {
 		t.Fatal(err)
 	}
-	got := rd.Entry(0)
+	got := rd.Item(0)
 	if string(got) != string(payload) {
-		t.Errorf("Entry(0) = %q, want %q", got, payload)
+		t.Errorf("Item(0) = %q, want %q", got, payload)
 	}
 }
 
@@ -232,9 +231,9 @@ func TestDecoderRaw(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range entries {
-		got := rd.Entry(i)
+		got := rd.Item(i)
 		if string(got) != string(want) {
-			t.Errorf("Entry(%d) = %q, want %q", i, got, want)
+			t.Errorf("Item(%d) = %q, want %q", i, got, want)
 		}
 	}
 }
@@ -245,7 +244,7 @@ func TestItemsInRecord(t *testing.T) {
 	tests := []struct {
 		name       string
 		total      int
-		recordSize int
+		itemsPerRecord int
 		recordIdx  int
 		want       int
 	}{
@@ -255,22 +254,22 @@ func TestItemsInRecord(t *testing.T) {
 		{"exact multiple", 256, 128, 1, 128},
 		{"single record", 50, 128, 0, 50},
 		{"totalItems zero", 0, 128, 0, 0},
-		{"small recordSize", 10, 3, 0, 3},
-		{"small recordSize last", 10, 3, 3, 1},
+		{"small itemsPerRecord", 10, 3, 0, 3},
+		{"small itemsPerRecord last", 10, 3, 3, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := itemsInRecord(tt.total, tt.recordSize, tt.recordIdx)
+			got := itemsInRecord(tt.total, tt.itemsPerRecord, tt.recordIdx)
 			if got != tt.want {
 				t.Errorf("itemsInRecord(%d, %d, %d) = %d, want %d",
-					tt.total, tt.recordSize, tt.recordIdx, got, tt.want)
+					tt.total, tt.itemsPerRecord, tt.recordIdx, got, tt.want)
 			}
 		})
 	}
 }
 
 func TestDecoderReuse(t *testing.T) {
-	// Decode a 5-entry record, then decode a 2-entry record on the same
+	// Decode a 5-item record, then decode a 2-item record on the same
 	// decoder. Verifies that stale state from the first decode (larger
 	// sizes/offsets slices) doesn't leak into the second.
 	entries1 := [][]byte{[]byte("a"), []byte("bb"), []byte("ccc"), []byte("dd"), []byte("e")}
@@ -290,12 +289,12 @@ func TestDecoderReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range entries1 {
-		if got := string(rd.Entry(i)); got != string(want) {
-			t.Errorf("first decode Entry(%d) = %q, want %q", i, got, want)
+		if got := string(rd.Item(i)); got != string(want) {
+			t.Errorf("first decode Item(%d) = %q, want %q", i, got, want)
 		}
 	}
 
-	// Second decode: fewer entries.
+	// Second decode: fewer items.
 	entries2 := [][]byte{[]byte("xx"), []byte("yy")}
 	payload2, sizes2 := buildPayload(entries2)
 	forIndex2 := buildForIndex(sizes2)
@@ -306,24 +305,24 @@ func TestDecoderReuse(t *testing.T) {
 	data2 := append(comp2, forIndex2...)
 
 	rd.totalItems = 2
-	rd.recordSize = 2
+	rd.itemsPerRecord = 2
 	if err := rd.Decode(data2, 0); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range entries2 {
-		if got := string(rd.Entry(i)); got != string(want) {
-			t.Errorf("second decode Entry(%d) = %q, want %q", i, got, want)
+		if got := string(rd.Item(i)); got != string(want) {
+			t.Errorf("second decode Item(%d) = %q, want %q", i, got, want)
 		}
 	}
 
-	// Bounds check: Entry(2) should panic after the second decode.
-	assertPanics(t, "Entry(2) after shrink", func() { rd.Entry(2) })
+	// Bounds check: Item(2) should panic after the second decode.
+	assertPanics(t, "Item(2) after shrink", func() { rd.Item(2) })
 }
 
 func TestItemsInRecordPanics(t *testing.T) {
-	// recordSize <= 0 should panic.
-	assertPanics(t, "recordSize=0", func() { itemsInRecord(10, 0, 0) })
-	assertPanics(t, "recordSize=-1", func() { itemsInRecord(10, -1, 0) })
+	// itemsPerRecord <= 0 should panic.
+	assertPanics(t, "itemsPerRecord=0", func() { itemsInRecord(10, 0, 0) })
+	assertPanics(t, "itemsPerRecord=-1", func() { itemsInRecord(10, -1, 0) })
 
 	// recordIdx out of range should panic.
 	assertPanics(t, "recordIdx=5", func() { itemsInRecord(300, 128, 5) })

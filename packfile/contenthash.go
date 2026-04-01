@@ -11,11 +11,11 @@ import (
 // the hash stored in the trailer.
 var ErrContentHashMismatch = errors.New("packfile: content hash mismatch")
 
-// contentHasher computes a chunked SHA-256 content hash over a stream of entries.
-// Entries are length-prefixed and grouped into fixed-size chunks; chunk digests
+// contentHasher computes a chunked SHA-256 content hash over a stream of items.
+// Items are length-prefixed and grouped into fixed-size chunks; chunk digests
 // are aggregated into a final hash. chunkSize is typically the record size.
 //
-//	chunkDigest_i = SHA-256([4B len][entry_{i*K}] ... [4B len][entry_{i*K+K-1}])
+//	chunkDigest_i = SHA-256([4B len][item_{i*K}] ... [4B len][item_{i*K+K-1}])
 //	finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
 type contentHasher struct {
 	digests   []byte // concatenated 32-byte chunk digests
@@ -36,7 +36,7 @@ func newContentHasher(chunkSize int) *contentHasher {
 	}
 }
 
-// Add appends one logical entry. Parts are concatenated under a single length prefix.
+// Add appends one logical item. Parts are concatenated under a single length prefix.
 func (h *contentHasher) Add(parts ...[]byte) {
 	total := 0
 	for _, p := range parts {

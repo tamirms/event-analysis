@@ -5,24 +5,23 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
 // decoder decodes packfile records. Handles compressed, uncompressed (CRC32C),
 // and raw record formats, with or without a trailing size table.
 //
-// Configure format, totalItems, and recordSize after obtaining a decoder
+// Configure format, totalItems, and itemsPerRecord after obtaining a decoder
 // from the pool (or after newDecoder) and before calling Decode.
 type decoder struct {
 	format     RecordFormat
 	totalItems int
-	recordSize int
+	itemsPerRecord int
 
 	scratch      []byte
 	decompressed []byte
 	sizes        []uint32
-	offsets      []int // prefix sum: offsets[i] = byte offset of entry i
+	offsets      []int // prefix sum: offsets[i] = byte offset of item i
 	dec          *zstd.Decompressor
 }
 
@@ -46,7 +45,7 @@ func getDecoder() *decoder { return decoderPool.Get().(*decoder) }
 func putDecoder(rd *decoder) {
 	rd.format = Compressed
 	rd.totalItems = 0
-	rd.recordSize = 0
+	rd.itemsPerRecord = 0
 	rd.scratch = rd.scratch[:0]
 	rd.decompressed = rd.decompressed[:0]
 	rd.sizes = rd.sizes[:0]
@@ -64,46 +63,46 @@ func (rd *decoder) Close() {
 
 // itemsInRecord returns the number of items in the given record index.
 // Handles the last record which may be partial, and totalItems == 0.
-// Panics if recordSize <= 0 or recordIdx is out of range.
-func itemsInRecord(totalItems, recordSize, recordIdx int) int {
+// Panics if itemsPerRecord <= 0 or recordIdx is out of range.
+func itemsInRecord(totalItems, itemsPerRecord, recordIdx int) int {
 	if totalItems == 0 {
 		return 0
 	}
-	if recordSize <= 0 {
-		panic(fmt.Sprintf("packfile: itemsInRecord recordSize must be > 0, got %d", recordSize))
+	if itemsPerRecord <= 0 {
+		panic(fmt.Sprintf("packfile: itemsInRecord itemsPerRecord must be > 0, got %d", itemsPerRecord))
 	}
-	recordCount := (totalItems + recordSize - 1) / recordSize
+	recordCount := (totalItems + itemsPerRecord - 1) / itemsPerRecord
 	if recordIdx < 0 || recordIdx >= recordCount {
 		panic(fmt.Sprintf("packfile: itemsInRecord recordIdx %d out of range [0, %d)", recordIdx, recordCount))
 	}
 	last := recordCount - 1
 	if recordIdx < last {
-		return recordSize
+		return itemsPerRecord
 	}
-	rem := totalItems % recordSize
+	rem := totalItems % itemsPerRecord
 	if rem == 0 {
-		return recordSize
+		return itemsPerRecord
 	}
 	return rem
 }
 
 // Decode decodes the record at recordIdx.
-// The number of entries is computed from totalItems and recordSize.
-// Behavior depends on format and recordSize:
+// The number of items is computed from totalItems and itemsPerRecord.
+// Behavior depends on format and itemsPerRecord:
 //   - Compressed: zstd-decompress (zstd provides integrity)
 //   - Uncompressed: verify trailing CRC32C, strip it
 //   - Raw: use data as-is (no integrity check)
-//   - recordSize>1: strip and verify the FOR index from the raw record tail first,
+//   - itemsPerRecord>1: strip and verify the FOR index from the raw record tail first,
 //     then apply format-specific payload processing
-//   - recordSize==1: entire payload is one item (no FOR index)
+//   - itemsPerRecord==1: entire payload is one item (no FOR index)
 func (rd *decoder) Decode(data []byte, recordIdx int) error {
-	n := itemsInRecord(rd.totalItems, rd.recordSize, recordIdx)
+	n := itemsInRecord(rd.totalItems, rd.itemsPerRecord, recordIdx)
 
 	// For multi-item records: the FOR index is always the last bytes of the raw
 	// record, uncompressed, with its own CRC32C. Strip and verify it before any
 	// format-specific processing. Last 9 bytes are always [1B width][4B min][4B CRC].
 	var forIndexBytes []byte
-	if rd.recordSize > 1 {
+	if rd.itemsPerRecord > 1 {
 		const forFooterSize = 5 // 1B width + 4B min
 		const crcSize = 4
 		const metaSize = forFooterSize + crcSize // fixed tail of every multi-item record
@@ -149,9 +148,9 @@ func (rd *decoder) Decode(data []byte, recordIdx int) error {
 		rd.decompressed = append(rd.decompressed[:0], data[:payloadEnd]...)
 	}
 
-	if rd.recordSize > 1 {
+	if rd.itemsPerRecord > 1 {
 		var err error
-		rd.sizes, _, err = intpack.DecodeGroup(forIndexBytes, n, rd.sizes)
+		rd.sizes, _, err = decodeGroup(forIndexBytes, n, rd.sizes)
 		if err != nil {
 			return err
 		}
@@ -185,20 +184,20 @@ func (rd *decoder) Decode(data []byte, recordIdx int) error {
 	return nil
 }
 
-// Entry returns the entry at index i within the decoded record.
+// Item returns the item at index i within the decoded record.
 // The returned slice is valid only until the next Decode call.
-// Panics if i is out of [0, n) where n is the number of entries.
-func (rd *decoder) Entry(i int) []byte {
+// Panics if i is out of [0, n) where n is the number of items.
+func (rd *decoder) Item(i int) []byte {
 	if i < 0 || i >= len(rd.sizes) {
-		panic(fmt.Sprintf("packfile: Entry(%d) out of range [0, %d)", i, len(rd.sizes)))
+		panic(fmt.Sprintf("packfile: Item(%d) out of range [0, %d)", i, len(rd.sizes)))
 	}
 	return rd.decompressed[rd.offsets[i]:rd.offsets[i+1]]
 }
 
-// EntryCopy returns an owned copy of the entry at index i.
-// Panics if i is out of [0, n) where n is the number of entries.
-func (rd *decoder) EntryCopy(i int) []byte {
-	e := rd.Entry(i)
+// ItemCopy returns an owned copy of the item at index i.
+// Panics if i is out of [0, n) where n is the number of items.
+func (rd *decoder) ItemCopy(i int) []byte {
+	e := rd.Item(i)
 	out := make([]byte, len(e))
 	copy(out, e)
 	return out

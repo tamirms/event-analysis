@@ -86,7 +86,7 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/ + intpack/) | ~1,770 | — |
+| Core format (packfile/) | ~1,770 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
 | Eventstore impl (thin facade) | ~170 | 401 |
@@ -97,7 +97,7 @@ RocksDB requires **~3x less code** because RocksDB handles block management, com
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these:
 
-- Frame-of-Reference encoding/decoding (intpack/: 125 lines)
+- Frame-of-Reference encoding/decoding (packfile/for.go: 125 lines)
 - Record decoding with zstd + CRC32C + FOR index (packfile/decoder.go)
 - Item accumulation, record building, and block-processing pipeline (packfile/writer.go)
 - Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)
@@ -257,7 +257,7 @@ cannot match this: each `Get` requires reading the block index *then* the data b
 (2 sequential round trips per lookup), and `BatchedMultiGetCF` doesn't expose byte-range
 targeting for remote I/O.
 
-**Estimated latency: ReadIndices (1000 scattered events) on S3/GCS**
+**Estimated latency: ReadPositions (1000 scattered events) on S3/GCS**
 
 Assumes packfile-based eventstore. The offset array (loaded at open) gives exact byte ranges
 for every block. 1000 events scattered across B distinct blocks → B parallel Range GETs.
@@ -494,17 +494,17 @@ Both eventstore and bitmapindex support opt-in SHA-256 content hashing, enabled 
 and stored in the packfile metadata (32 bytes after the standard 12-byte header).
 
 Both use a shared chunked hash scheme (packfile's internal `ContentHasher`). Entries are
-length-prefixed and grouped into chunks aligned with record boundaries (RecordSize for
+length-prefixed and grouped into chunks aligned with record boundaries (ItemsPerRecord for
 eventstore, BatchSize for bitmapindex). Each chunk produces a SHA-256 digest; the
 final hash is SHA-256 of the concatenated chunk digests:
 
 ```
 chunkDigest_i = SHA-256([4B len][entry_{i*K}] ... [4B len][entry_{i*K+K-1}])
 finalHash     = SHA-256(chunkDigest_0 || ... || chunkDigest_M)
-K = RecordSize (BatchSize for bitmapindex)
+K = ItemsPerRecord (BatchSize for bitmapindex)
 ```
 
-The hash depends on record size (chunk boundaries), entry order, and entry content.
+The hash depends on record size (chunk boundaries), item order, and item content.
 Same events with the same record size in the same order = same hash. The hash is
 independent of compression and format version. For concurrent writes, per-worker
 hash goroutines compute chunk digests in parallel with format processing (compression, CRC, or no-op).

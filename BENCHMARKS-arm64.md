@@ -81,7 +81,7 @@ Measured via `RssAnon` from `/proc/self/status` with `GOGC=1` (minimizes GC head
 | Benchmark | Peak Delta |
 |-----------|-----------|
 | PackfileSeqRead (full 8.7M events) | 3.6 MB |
-| PackfileReadIndices (1,000 scattered, c=8) | 2.4 MB |
+| PackfileReadPositions (1,000 scattered, c=8) | 2.4 MB |
 
 Read memory is minimal — just pooled `blockBuf` decoders from `sync.Pool`, scaling linearly with concurrency.
 
@@ -134,17 +134,17 @@ Packfile is 2.7x faster than RocksDB. Both use `ReadEvents` via the `StoreReader
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileReadIndices | 242,544 | 35KB / 76 |
-| RocksDBReadIndices | 339,913 | 20.5KB / 271 |
+| PackfileReadPositions | 242,544 | 35KB / 76 |
+| RocksDBReadPositions | 339,913 | 20.5KB / 271 |
 
-Both use 8 internal goroutines for parallel I/O via the `StoreReader` interface. Packfile `ReadIndices` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, and `SetFillCache(false)`. RocksDB's higher alloc count (271 vs 76) comes from copying each value into an owned `[]byte` slice (packfile returns slices from decompressed block buffers). Packfile is 1.40x faster.
+Both use 8 internal goroutines for parallel I/O via the `StoreReader` interface. Packfile `ReadPositions` uses work-stealing parallel pread. RocksDB splits keys across goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, and `SetFillCache(false)`. RocksDB's higher alloc count (271 vs 76) comes from copying each value into an owned `[]byte` slice (packfile returns slices from decompressed block buffers). Packfile is 1.40x faster.
 
 ## Parallel Scattered Read (50 indices, 32 cores)
 
 | Benchmark | ns/op | Allocs |
 |-----------|-------|--------|
-| PackfileParallelReadIndices | 41,041 | 29KB / 77 |
-| RocksDBParallelReadIndices | 57,747 | 20.5KB / 272 |
+| PackfileParallelReadPositions | 41,041 | 29KB / 77 |
+| RocksDBParallelReadPositions | 57,747 | 20.5KB / 272 |
 
 Under parallel scattered load packfile is 1.41x faster.
 
@@ -152,7 +152,7 @@ Under parallel scattered load packfile is 1.41x faster.
 
 Each iteration drops page cache (via `posix_fadvise FADV_DONTNEED`), then times open + 1,000 scattered reads + close. All 1,000 indices land on different blocks, forcing 1,000 separate disk I/Os.
 
-Both formats use the `StoreReader` interface (`ReadIndices` with `WithConcurrency(N)`). RocksDB internally uses optimized open (`SkipStatsUpdateOnDBOpen`, `SkipCheckingSSTFileSizesOnDBOpen`, single file-opening thread) and splits keys across N goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, no checksum verification.
+Both formats use the `StoreReader` interface (`ReadPositions` with `WithConcurrency(N)`). RocksDB internally uses optimized open (`SkipStatsUpdateOnDBOpen`, `SkipCheckingSSTFileSizesOnDBOpen`, single file-opening thread) and splits keys across N goroutines each calling `BatchedMultiGetCF` with sorted input, `SetAsyncIO(true)`, no checksum verification.
 
 | Benchmark | Goroutines | NVMe (ms) | EBS (ms) |
 |-----------|-----------|-----------|----------|

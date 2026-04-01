@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/tamir/events-analysis/intpack"
 )
 
 // decodeIndex decodes a FOR-128 encoded offset index with CRC32C integrity.
@@ -32,7 +31,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 	}
 
 	// Groups are stored forward on disk but decoded backward: each group's metadata
-	// (width, min) is at its tail, so DecodeGroup naturally reads from the end of
+	// (width, min) is at its tail, so decodeGroup naturally reads from the end of
 	// its window. Iterating backward lets us shrink the window after each group.
 	groupCount := (recordCount + groupSize - 1) / groupSize
 	deltas := make([]uint32, recordCount)
@@ -46,7 +45,7 @@ func decodeIndex(buf []byte, recordCount int, indexSize int, indexBase int64) ([
 		var consumed int
 		var err error
 		// deltas[base:base+limit] always has sufficient cap: cap = recordCount-base >= limit.
-		_, consumed, err = intpack.DecodeGroup(buf[:pos], limit, deltas[base:base+limit])
+		_, consumed, err = decodeGroup(buf[:pos], limit, deltas[base:base+limit])
 		if err != nil {
 			return nil, fmt.Errorf("%w: index group %d: %w", ErrCorrupt, g, err)
 		}
@@ -100,7 +99,7 @@ func encodeIndex(offsets []int64) ([]byte, error) {
 			deltas = append(deltas, uint32(d))
 		}
 
-		buf.Write(intpack.EncodeGroup(deltas))
+		buf.Write(encodeGroup(deltas))
 	}
 
 	// CRC32C over raw index bytes.

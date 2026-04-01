@@ -64,7 +64,7 @@ func Create(dbPath string, opts WriterOptions) (*Writer, error) {
 	}, nil
 }
 
-func (w *Writer) Append(event []byte) error {
+func (w *Writer) AppendEvent(event []byte) error {
 	if w.closed {
 		return errors.New("rocksdb eventstore: writer is closed")
 	}

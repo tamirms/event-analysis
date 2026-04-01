@@ -174,7 +174,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 		format = packfile.Uncompressed
 	}
 	pw, err := packfile.Create(dataPath, packfile.WriterOptions{
-		RecordSize:  w.batchSize,
+		ItemsPerRecord:  w.batchSize,
 		Format:      format,
 		ContentHash: w.contentHash,
 	})
@@ -183,7 +183,7 @@ func (w *Writer) Finish(ctx context.Context) (err error) {
 	}
 
 	for i := range totalKeys {
-		if err := pw.Append(prepared[i].fingerprint[:], prepared[i].data); err != nil {
+		if err := pw.AppendItem(prepared[i].fingerprint[:], prepared[i].data); err != nil {
 			return errors.Join(
 				fmt.Errorf("bitmapindex: append item %d: %w", i, err),
 				pw.Close(),

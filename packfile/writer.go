@@ -9,16 +9,15 @@ import (
 	"os"
 	"sync"
 
-	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
-const defaultRecordSize = 128
+const defaultItemsPerRecord = 128
 
 // WriterOptions configures how the packfile is written.
 type WriterOptions struct {
-	// RecordSize is the number of items per record. 0 defaults to 128.
-	RecordSize int
+	// ItemsPerRecord is the number of items per record. 0 defaults to 128.
+	ItemsPerRecord int
 
 	// Format controls record encoding. Default (zero value) is Compressed.
 	// Compressed: zstd with built-in integrity.
@@ -26,9 +25,8 @@ type WriterOptions struct {
 	// Raw: raw records with no integrity wrapper.
 	Format RecordFormat
 
-	// Concurrency sets the number of block-processing goroutines.
-	// 0 or 1 means serial. Ignored when Format is not Compressed
-	// and ContentHash is false (nothing to parallelize).
+	// Concurrency sets the number of parallel compression goroutines.
+	// 0 or 1 means serial.
 	Concurrency int
 
 	// ContentHash enables SHA-256 content hashing over the logical item stream.
@@ -50,8 +48,8 @@ type WriterOptions struct {
 type blockResult struct {
 	blockID   uint32
 	data      []byte   // payload → format-processed payload
-	forIndex  []byte   // FOR index: [packed][1B W][4B min][4B CRC32C]; nil when recordSize==1
-	hashSizes []uint32 // entry sizes for hash goroutine
+	forIndex  []byte   // FOR index: [packed][1B W][4B min][4B CRC32C]; nil when itemsPerRecord==1
+	hashSizes []uint32 // item sizes for hash goroutine
 	digest    [sha256.Size]byte
 	hasHash   bool
 	err       error
@@ -63,7 +61,7 @@ type hashWork struct {
 }
 
 // Writer creates a new packfile with item-level semantics.
-// Items are accumulated into records of recordSize items each,
+// Items are accumulated into records of itemsPerRecord items each,
 // format-processed (compressed/CRC/raw), and written with an offset index.
 type Writer struct {
 	// File I/O
@@ -78,13 +76,13 @@ type Writer struct {
 	buf        []byte
 	sizes      []uint32
 	total      int
-	recordSize int
+	itemsPerRecord int
 	format     RecordFormat
 	compressor *zstd.Compressor
 
 	// Content hash
 	contentHash  bool           // whether content hashing is enabled
-	serialHasher *contentHasher // serial path: streams entries through contentHasher
+	serialHasher *contentHasher // serial path: streams items through contentHasher
 	digests      []byte         // concurrent path: accumulated 32-byte chunk digests
 	sizesPool    sync.Pool      // concurrent path: pooled []uint32 for hash goroutines
 
@@ -102,22 +100,22 @@ type Writer struct {
 
 func (w *Writer) getSizes() []uint32 {
 	if p := w.sizesPool.Get(); p != nil {
-		return p.([]uint32)[:w.recordSize]
+		return p.([]uint32)[:w.itemsPerRecord]
 	}
-	return make([]uint32, w.recordSize)
+	return make([]uint32, w.itemsPerRecord)
 }
 
 func (w *Writer) putSizes(s []uint32) { w.sizesPool.Put(s) }
 
-// resolveRecordSize returns the effective record size from opts, defaulting
+// resolveItemsPerRecord returns the effective record size from opts, defaulting
 // to 128 if zero. Returns an error if negative.
-func resolveRecordSize(opts WriterOptions) (int, error) {
-	rs := opts.RecordSize
+func resolveItemsPerRecord(opts WriterOptions) (int, error) {
+	rs := opts.ItemsPerRecord
 	if rs == 0 {
-		return defaultRecordSize, nil
+		return defaultItemsPerRecord, nil
 	}
 	if rs < 0 {
-		return 0, errors.New("packfile: RecordSize must be > 0")
+		return 0, errors.New("packfile: ItemsPerRecord must be > 0")
 	}
 	return rs, nil
 }
@@ -125,7 +123,7 @@ func resolveRecordSize(opts WriterOptions) (int, error) {
 // Create starts writing a new packfile at path. By default, fails if the
 // file already exists. Set Overwrite to replace an existing file.
 func Create(path string, opts WriterOptions) (*Writer, error) {
-	recordSize, err := resolveRecordSize(opts)
+	itemsPerRecord, err := resolveItemsPerRecord(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +144,7 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	w := &Writer{
 		file:         f,
 		path:         path,
-		recordSize:   recordSize,
+		itemsPerRecord:   itemsPerRecord,
 		concurrency:  conc,
 		format:       opts.Format,
 		contentHash:  opts.ContentHash,
@@ -154,7 +152,7 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 	}
 
 	if opts.ContentHash && w.concurrency <= 1 {
-		w.serialHasher = newContentHasher(recordSize)
+		w.serialHasher = newContentHasher(itemsPerRecord)
 	}
 
 	if w.concurrency > 1 {
@@ -289,9 +287,10 @@ func (w *Writer) runWriter() {
 	}
 }
 
-// Append adds a single logical item. Parts are concatenated as one entry.
-// Flushes a record when recordSize items accumulate.
-func (w *Writer) Append(parts ...[]byte) error {
+// AppendItem adds a single item. If multiple byte slices are passed,
+// they are concatenated into one item.
+// Flushes a record when ItemsPerRecord items accumulate.
+func (w *Writer) AppendItem(parts ...[]byte) error {
 	if w.err != nil {
 		return w.err
 	}
@@ -316,7 +315,7 @@ func (w *Writer) Append(parts ...[]byte) error {
 	}
 	w.sizes = append(w.sizes, uint32(total))
 
-	if len(w.sizes) == w.recordSize {
+	if len(w.sizes) == w.itemsPerRecord {
 		if err := w.flush(); err != nil {
 			w.err = err
 			return err
@@ -351,13 +350,13 @@ func (w *Writer) closeCompressor() {
 	}
 }
 
-// buildBlock extracts the current payload buffer and (for recordSize>1) encodes
+// buildBlock extracts the current payload buffer and (for itemsPerRecord>1) encodes
 // the FOR index. Returns them separately: the FOR index is never compressed and
 // always carries its own CRC32C. Payload is allocated with spare capacity for
 // CRC (4B) + forIndex so callers can append without reallocation.
 func (w *Writer) buildBlock() (payload []byte, forIndex []byte) {
-	if w.recordSize > 1 {
-		encoded := intpack.EncodeGroup(w.sizes)
+	if w.itemsPerRecord > 1 {
+		encoded := encodeGroup(w.sizes)
 		forIndex = binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 	}
 	payload = make([]byte, len(w.buf), len(w.buf)+4+len(forIndex))
@@ -368,7 +367,7 @@ func (w *Writer) buildBlock() (payload []byte, forIndex []byte) {
 }
 
 func (w *Writer) flush() error {
-	// Serial path: format-process inline. Content hash is handled by serialHasher in Append.
+	// Serial path: format-process inline. Content hash is handled by serialHasher in AppendItem.
 	if w.concurrency <= 1 {
 		payload, forIndex := w.buildBlock()
 		var block []byte
@@ -498,11 +497,11 @@ func (w *Writer) Finish(appData []byte) error {
 	trailer[5] = flags
 	binary.LittleEndian.PutUint32(trailer[6:], uint32(len(w.offsets)-1))  // recordCount
 	binary.LittleEndian.PutUint32(trailer[10:], uint32(w.total))          // totalItems
-	binary.LittleEndian.PutUint32(trailer[14:], uint32(w.recordSize))     // recordSize
+	binary.LittleEndian.PutUint32(trailer[14:], uint32(w.itemsPerRecord))     // itemsPerRecord
 	binary.LittleEndian.PutUint32(trailer[18:], indexSize)                // indexSize
 	binary.LittleEndian.PutUint32(trailer[22:], appDataSize)              // appDataSize
 	copy(trailer[26:58], hash[:])                                         // contentHash (zeroed if unused)
-	// trailer[58:60] reserved (zero)
+	binary.LittleEndian.PutUint16(trailer[58:], uint16(groupSize))        // indexForGroupSize
 
 	// CRC32C over trailer[0:60] only. App data integrity is the caller's responsibility.
 	binary.LittleEndian.PutUint32(trailer[60:], CRC32C(trailer[:60]))
@@ -534,7 +533,7 @@ func (w *Writer) Finish(appData []byte) error {
 //
 //	w, _ := Create(path, opts)
 //	defer w.Close()
-//	// ... Append ...
+//	// ... AppendItem ...
 //	return w.Finish(nil)
 func (w *Writer) Close() error {
 	if w.closed {

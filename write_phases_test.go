@@ -70,7 +70,7 @@ func TestWritePhases(t *testing.T) {
 
 		appendStart := time.Now()
 		for _, ev := range allEvents {
-			if err := ew.Append(ev); err != nil {
+			if err := ew.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -122,7 +122,7 @@ func TestWritePhases(t *testing.T) {
 
 		appendStart := time.Now()
 		for _, ev := range allEvents {
-			if err := w.Append(ev); err != nil {
+			if err := w.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -64,10 +64,11 @@ type Trailer struct {
 	Version        uint8
 	RecordCount    uint32
 	TotalItems     uint32
-	RecordSize     uint32
+	ItemsPerRecord     uint32
 	IndexSize      uint32
 	AppDataSize    uint32
 	ContentHash    [32]byte
+	IndexForGroupSize uint16
 	Format         RecordFormat
 	HasContentHash bool
 	Checksum       uint32
@@ -80,7 +81,7 @@ var (
 	ErrVersion    = fmt.Errorf("%w: unsupported version", ErrCorrupt)
 	ErrChecksum   = fmt.Errorf("%w: checksum mismatch", ErrCorrupt)
 	ErrSize       = fmt.Errorf("%w: file size inconsistent with trailer", ErrCorrupt)
-	ErrIndexRange = errors.New("packfile: record index out of range")
+	ErrPositionOutOfRange = errors.New("packfile: position out of range")
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)

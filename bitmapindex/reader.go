@@ -220,14 +220,14 @@ func (r *Reader) LookupKeys(ctx context.Context, keys []FieldKey) ([]*roaring.Bi
 
 	// Process items via callback — avoids per-item copy.
 	// fn is called concurrently; each outIdx is unique, so writes to out[] are safe.
-	if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
-		start := groupStart[pos]
+	if err := r.pr.ReadItems(ctx, indices, func(idx int, data []byte) error {
+		start := groupStart[idx]
 		end := len(found)
-		if pos+1 < len(groupStart) {
-			end = groupStart[pos+1]
+		if idx+1 < len(groupStart) {
+			end = groupStart[idx+1]
 		}
 		for k := start; k < end; k++ {
-			bm, err := verifyAndDeserialize(entry, found[k].hk[:])
+			bm, err := verifyAndDeserialize(data, found[k].hk[:])
 			if err != nil {
 				if errors.Is(err, ErrKeyNotFound) {
 					continue

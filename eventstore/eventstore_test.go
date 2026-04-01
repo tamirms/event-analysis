@@ -31,14 +31,14 @@ func makeEvents(n int, rng *rand.Rand) [][]byte {
 	return events
 }
 
-func writeTestStore(t *testing.T, events [][]byte, recordSize int) string {
-	return writeTestStoreOpts(t, events, WriterOptions{RecordSize: recordSize})
+func writeTestStore(t *testing.T, events [][]byte, itemsPerRecord int) string {
+	return writeTestStoreOpts(t, events, WriterOptions{ItemsPerRecord: itemsPerRecord})
 }
 
 func TestRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	events := makeEvents(500, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -66,7 +66,7 @@ func TestPartialLastBatch(t *testing.T) {
 	rng := rand.New(rand.NewSource(43))
 	// 300 events = 2 full batches of 128 + 44 in partial
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -93,7 +93,7 @@ func TestPartialLastBatch(t *testing.T) {
 func TestReadEventsFullRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(44))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -116,7 +116,7 @@ func TestReadEventsFullRange(t *testing.T) {
 func TestReadEventsPartialRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(45))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -140,7 +140,7 @@ func TestReadEventsPartialRange(t *testing.T) {
 func TestReadEventsEarlyBreak(t *testing.T) {
 	rng := rand.New(rand.NewSource(46))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -164,7 +164,7 @@ func TestReadEventsEarlyBreak(t *testing.T) {
 func TestReadEventsEmpty(t *testing.T) {
 	rng := rand.New(rand.NewSource(47))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -181,69 +181,69 @@ func TestReadEventsEmpty(t *testing.T) {
 	}
 }
 
-func TestReadIndicesScattered(t *testing.T) {
+func TestReadPositionsScattered(t *testing.T) {
 	rng := rand.New(rand.NewSource(48))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
 
-	// Indices spanning multiple blocks
+	// Positions spanning multiple blocks
 	indices := []int{0, 1, 127, 128, 200, 299}
 	j := 0
-	for ev, err := range r.ReadIndices(context.Background(), indices) {
+	for ev, err := range r.ReadPositions(context.Background(), indices) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(ev, events[indices[j]]) {
-			t.Fatalf("ReadIndices[%d] (event %d): data mismatch", j, indices[j])
+			t.Fatalf("ReadPositions[%d] (event %d): data mismatch", j, indices[j])
 		}
 		j++
 	}
 	if j != len(indices) {
-		t.Fatalf("ReadIndices yielded %d, want %d", j, len(indices))
+		t.Fatalf("ReadPositions yielded %d, want %d", j, len(indices))
 	}
 }
 
-func TestReadIndicesDuplicatesPanic(t *testing.T) {
+func TestReadPositionsDuplicatesPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(49))
 	events := makeEvents(100, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for duplicate indices")
+			t.Fatal("expected panic for duplicate positions")
 		}
 	}()
-	for range r.ReadIndices(context.Background(), []int{5, 5, 10}) {
+	for range r.ReadPositions(context.Background(), []int{5, 5, 10}) {
 	}
 }
 
-func TestReadIndicesUnsortedPanic(t *testing.T) {
+func TestReadPositionsUnsortedPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(50))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for unsorted indices")
+			t.Fatal("expected panic for unsorted positions")
 		}
 	}()
-	for range r.ReadIndices(context.Background(), []int{10, 5, 20}) {
+	for range r.ReadPositions(context.Background(), []int{10, 5, 20}) {
 	}
 }
 
-func TestReadIndicesEarlyBreak(t *testing.T) {
+func TestReadPositionsEarlyBreak(t *testing.T) {
 	rng := rand.New(rand.NewSource(51))
 	events := makeEvents(300, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -252,7 +252,7 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 
 	indices := []int{0, 50, 100, 150, 200, 250}
 	j := 0
-	for _, err := range r.ReadIndices(context.Background(), indices) {
+	for _, err := range r.ReadPositions(context.Background(), indices) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +280,7 @@ func TestReadIndicesEarlyBreak(t *testing.T) {
 }
 
 func TestEmptyStore(t *testing.T) {
-	path := writeTestStore(t, nil, DefaultRecordSize)
+	path := writeTestStore(t, nil, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -294,39 +294,39 @@ func TestEmptyStore(t *testing.T) {
 	}
 
 	_, err = r.ReadEvent(0)
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadEvent(0) on empty: got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadEvent(0) on empty: got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
 func TestOutOfRange(t *testing.T) {
 	rng := rand.New(rand.NewSource(53))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
 
 	_, err := r.ReadEvent(-1)
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadEvent(-1): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadEvent(-1): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	_, err = r.ReadEvent(10)
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadEvent(10): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadEvent(10): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	_, err = r.ReadEvent(100)
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadEvent(100): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadEvent(100): got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
 func TestReadEventsPanic(t *testing.T) {
 	rng := rand.New(rand.NewSource(54))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -358,7 +358,7 @@ func TestReadEventsPanic(t *testing.T) {
 func TestSingleEvent(t *testing.T) {
 	rng := rand.New(rand.NewSource(55))
 	events := makeEvents(1, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -372,7 +372,7 @@ func TestSingleEvent(t *testing.T) {
 	}
 }
 
-func TestSmallRecordSize(t *testing.T) {
+func TestSmallItemsPerRecord(t *testing.T) {
 	rng := rand.New(rand.NewSource(56))
 	events := makeEvents(20, rng)
 	path := writeTestStore(t, events, 3) // 3 events per record
@@ -414,11 +414,11 @@ func TestSmallRecordSize(t *testing.T) {
 	}
 }
 
-func TestCreateInvalidRecordSize(t *testing.T) {
+func TestCreateInvalidItemsPerRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.events")
-	_, err := Create(path, WriterOptions{RecordSize: -1})
+	_, err := Create(path, WriterOptions{ItemsPerRecord: -1})
 	if err == nil {
-		t.Fatal("expected error for negative recordSize")
+		t.Fatal("expected error for negative itemsPerRecord")
 	}
 }
 
@@ -433,7 +433,7 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if err := sw.Append(ev); err != nil {
+		if err := sw.AppendEvent(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -448,7 +448,7 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if err := pw.Append(ev); err != nil {
+		if err := pw.AppendEvent(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -489,7 +489,7 @@ func TestUncompressedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if err := w.Append(ev); err != nil {
+		if err := w.AppendEvent(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -531,24 +531,24 @@ func TestUncompressedRoundTrip(t *testing.T) {
 		i++
 	}
 
-	// Verify via ReadIndices (scattered).
+	// Verify via ReadPositions (scattered).
 	indices := []int{0, 50, 127, 128, 250, 499}
 	j := 0
-	for got, err := range r.ReadIndices(context.Background(), indices) {
+	for got, err := range r.ReadPositions(context.Background(), indices) {
 		if err != nil {
-			t.Fatalf("ReadIndices at %d: %v", j, err)
+			t.Fatalf("ReadPositions at %d: %v", j, err)
 		}
 		if !bytes.Equal(got, events[indices[j]]) {
-			t.Fatalf("ReadIndices at %d (idx=%d): data mismatch", j, indices[j])
+			t.Fatalf("ReadPositions at %d (idx=%d): data mismatch", j, indices[j])
 		}
 		j++
 	}
 }
 
-func TestReadIndicesAllFromSingleBlock(t *testing.T) {
+func TestReadPositionsAllFromSingleBlock(t *testing.T) {
 	rng := rand.New(rand.NewSource(57))
 	events := makeEvents(200, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -559,45 +559,45 @@ func TestReadIndicesAllFromSingleBlock(t *testing.T) {
 		indices[i] = i
 	}
 	j := 0
-	for ev, err := range r.ReadIndices(context.Background(), indices) {
+	for ev, err := range r.ReadPositions(context.Background(), indices) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(ev, events[j]) {
-			t.Fatalf("ReadIndices[%d]: data mismatch", j)
+			t.Fatalf("ReadPositions[%d]: data mismatch", j)
 		}
 		j++
 	}
 	if j != 128 {
-		t.Fatalf("ReadIndices yielded %d, want 128", j)
+		t.Fatalf("ReadPositions yielded %d, want 128", j)
 	}
 }
 
-func TestReadIndicesEmpty(t *testing.T) {
+func TestReadPositionsEmpty(t *testing.T) {
 	rng := rand.New(rand.NewSource(58))
 	events := makeEvents(10, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
 
 	j := 0
-	for _, err := range r.ReadIndices(context.Background(), nil) {
+	for _, err := range r.ReadPositions(context.Background(), nil) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		j++
 	}
 	if j != 0 {
-		t.Fatalf("empty ReadIndices yielded %d, want 0", j)
+		t.Fatalf("empty ReadPositions yielded %d, want 0", j)
 	}
 }
 
 func TestExactBlockMultiple(t *testing.T) {
-	// 256 events with recordSize=128 = exactly 2 full records, no partial
+	// 256 events with itemsPerRecord=128 = exactly 2 full records, no partial
 	rng := rand.New(rand.NewSource(59))
 	events := makeEvents(256, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -635,10 +635,10 @@ func TestExactBlockMultiple(t *testing.T) {
 	}
 }
 
-func TestReadIndicesConcurrent(t *testing.T) {
+func TestReadPositionsConcurrent(t *testing.T) {
 	rng := rand.New(rand.NewSource(60))
 	events := makeEvents(500, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -663,7 +663,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 			slices.Sort(indices)
 
 			j := 0
-			for ev, err := range r.ReadIndices(context.Background(), indices) {
+			for ev, err := range r.ReadPositions(context.Background(), indices) {
 				if err != nil {
 					errs <- fmt.Errorf("goroutine %d: %w", seed, err)
 					return
@@ -687,10 +687,10 @@ func TestReadIndicesConcurrent(t *testing.T) {
 	}
 }
 
-func TestReadIndicesPreCanceled(t *testing.T) {
+func TestReadPositionsPreCanceled(t *testing.T) {
 	rng := rand.New(rand.NewSource(61))
 	events := makeEvents(100, rng)
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -700,7 +700,7 @@ func TestReadIndicesPreCanceled(t *testing.T) {
 
 	indices := []int{0, 10, 50, 99}
 	var gotErr error
-	for _, err := range r.ReadIndices(ctx, indices) {
+	for _, err := range r.ReadPositions(ctx, indices) {
 		if err != nil {
 			gotErr = err
 			break
@@ -720,7 +720,7 @@ func TestUniformSizeEvents(t *testing.T) {
 	for i := range events {
 		events[i] = fmt.Appendf(nil, "event-%04d-padding-data-here!", i)
 	}
-	path := writeTestStore(t, events, DefaultRecordSize)
+	path := writeTestStore(t, events, DefaultItemsPerRecord)
 
 	r := Open(path)
 	defer r.Close()
@@ -766,7 +766,7 @@ func writeTestStoreOpts(t *testing.T, events [][]byte, opts WriterOptions) strin
 		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if err := w.Append(ev); err != nil {
+		if err := w.AppendEvent(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -927,13 +927,13 @@ func TestContentHashOrderSensitive(t *testing.T) {
 	}
 }
 
-func TestContentHashNonDefaultRecordSize(t *testing.T) {
+func TestContentHashNonDefaultItemsPerRecord(t *testing.T) {
 	rng := rand.New(rand.NewSource(110))
 	events := makeEvents(500, rng)
 
-	for _, recordSize := range []int{64, 256, 500} {
-		t.Run(fmt.Sprintf("RecordSize=%d", recordSize), func(t *testing.T) {
-			path := writeTestStoreOpts(t, events, WriterOptions{RecordSize: recordSize, ContentHash: true})
+	for _, itemsPerRecord := range []int{64, 256, 500} {
+		t.Run(fmt.Sprintf("ItemsPerRecord=%d", itemsPerRecord), func(t *testing.T) {
+			path := writeTestStoreOpts(t, events, WriterOptions{ItemsPerRecord: itemsPerRecord, ContentHash: true})
 
 			r := Open(path)
 			defer r.Close()

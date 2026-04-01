@@ -15,8 +15,8 @@ import (
 
 func writeTestPackfile(t *testing.T, items [][]byte, opts WriterOptions) string {
 	t.Helper()
-	if opts.RecordSize == 0 {
-		opts.RecordSize = 1 // one item per record = raw record behavior
+	if opts.ItemsPerRecord == 0 {
+		opts.ItemsPerRecord = 1 // one item per record = raw record behavior
 	}
 	path := filepath.Join(t.TempDir(), "test.pack")
 	w, err := Create(path, opts)
@@ -24,7 +24,7 @@ func writeTestPackfile(t *testing.T, items [][]byte, opts WriterOptions) string 
 		t.Fatal(err)
 	}
 	for _, item := range items {
-		if err := w.Append(item); err != nil {
+		if err := w.AppendItem(item); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -44,14 +44,14 @@ func makeItems(n, size int) [][]byte {
 	return items
 }
 
-func readItemCopy(t *testing.T, r *Reader, index int) []byte {
+func readItemCopy(t *testing.T, r *Reader, position int) []byte {
 	t.Helper()
 	var got []byte
-	if err := r.ReadItem(index, func(entry []byte) error {
-		got = bytes.Clone(entry)
+	if err := r.ReadItem(position, func(data []byte) error {
+		got = bytes.Clone(data)
 		return nil
 	}); err != nil {
-		t.Fatalf("ReadItem(%d): %v", index, err)
+		t.Fatalf("ReadItem(%d): %v", position, err)
 	}
 	return got
 }
@@ -93,8 +93,8 @@ func TestEmptyFile(t *testing.T) {
 	}
 
 	err = r.ReadItem(0, func([]byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadItem(0) on empty: got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadItem(0) on empty: got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
@@ -118,14 +118,14 @@ func TestSingleItem(t *testing.T) {
 	}
 }
 
-func TestRecordSize1NoTrailingWaste(t *testing.T) {
-	// With RecordSize=1 and Uncompressed format, each record should be exactly
+func TestItemsPerRecord1NoTrailingWaste(t *testing.T) {
+	// With ItemsPerRecord=1 and Uncompressed format, each record should be exactly
 	// itemSize + 4 (CRC32C). With trailing FOR it would be itemSize + 6 + 4.
 	// Verify the on-disk record size to confirm the trailing group is skipped.
 	const itemSize = 256
 	items := makeItems(10, itemSize)
 
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 1, Format: Uncompressed})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 1, Format: Uncompressed})
 
 	r := Open(path)
 	defer r.Close()
@@ -166,7 +166,7 @@ func TestRawFormat(t *testing.T) {
 	items := makeItems(10, itemSize)
 
 	path := writeTestPackfile(t, items, WriterOptions{
-		RecordSize: 1,
+		ItemsPerRecord: 1,
 		Format:     Raw,
 	})
 
@@ -202,9 +202,9 @@ func TestRawFormat(t *testing.T) {
 }
 
 func TestMultiItemRecords(t *testing.T) {
-	// 300 items with recordSize=128 = 2 full records + 44 in partial.
+	// 300 items with itemsPerRecord=128 = 2 full records + 44 in partial.
 	items := makeItems(300, 512)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 128})
 
 	r := Open(path)
 	defer r.Close()
@@ -227,7 +227,7 @@ func TestMultiItemRecords(t *testing.T) {
 
 func TestReadRange(t *testing.T) {
 	items := makeItems(50, 2048)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 10})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 10})
 
 	r := Open(path)
 	defer r.Close()
@@ -292,16 +292,16 @@ func TestReadRange(t *testing.T) {
 
 func TestReadItems(t *testing.T) {
 	items := makeItems(300, 512)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 128})
 
 	r := Open(path)
 	defer r.Close()
 
-	// Indices spanning multiple records.
+	// Positions spanning multiple records.
 	indices := []int{0, 1, 127, 128, 200, 299}
 	got := make([][]byte, len(indices))
-	err := r.ReadItems(context.Background(), indices, func(pos int, entry []byte) error {
-		got[pos] = bytes.Clone(entry)
+	err := r.ReadItems(context.Background(), indices, func(idx int, data []byte) error {
+		got[idx] = bytes.Clone(data)
 		return nil
 	})
 	if err != nil {
@@ -316,14 +316,14 @@ func TestReadItems(t *testing.T) {
 
 func TestReadItemsDuplicatesPanic(t *testing.T) {
 	items := makeItems(100, 100)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 128})
 
 	r := Open(path)
 	defer r.Close()
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for duplicate indices")
+			t.Fatal("expected panic for duplicate positions")
 		}
 	}()
 	r.ReadItems(context.Background(), []int{5, 5, 10}, func(int, []byte) error { return nil })
@@ -331,14 +331,14 @@ func TestReadItemsDuplicatesPanic(t *testing.T) {
 
 func TestReadItemsUnsortedPanic(t *testing.T) {
 	items := makeItems(300, 100)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 128})
 
 	r := Open(path)
 	defer r.Close()
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for unsorted indices")
+			t.Fatal("expected panic for unsorted positions")
 		}
 	}()
 	r.ReadItems(context.Background(), []int{10, 5, 20}, func(int, []byte) error { return nil })
@@ -424,7 +424,7 @@ func TestTrailerIntegrity(t *testing.T) {
 
 func TestConcurrentReads(t *testing.T) {
 	items := makeItems(100, 512)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 128})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 128})
 
 	r := Open(path)
 	defer r.Close()
@@ -437,8 +437,8 @@ func TestConcurrentReads(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			var got []byte
-			if err := r.ReadItem(idx, func(entry []byte) error {
-				got = bytes.Clone(entry)
+			if err := r.ReadItem(idx, func(data []byte) error {
+				got = bytes.Clone(data)
 				return nil
 			}); err != nil {
 				errs <- err
@@ -466,7 +466,7 @@ func TestCreateExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Append([]byte("hello")); err != nil {
+	if err := w.AppendItem([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Finish(nil); err != nil {
@@ -484,7 +484,7 @@ func TestCreateExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create with Overwrite: %v", err)
 	}
-	if err := w2.Append([]byte("world")); err != nil {
+	if err := w2.AppendItem([]byte("world")); err != nil {
 		t.Fatal(err)
 	}
 	if err := w2.Finish(nil); err != nil {
@@ -501,7 +501,7 @@ func TestCloseWithoutFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := w.Append([]byte("hello")); err != nil {
+	if err := w.AppendItem([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -522,18 +522,18 @@ func TestReadItemOutOfRange(t *testing.T) {
 	defer r.Close()
 
 	err := r.ReadItem(-1, func([]byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadItem(-1): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadItem(-1): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	err = r.ReadItem(5, func([]byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadItem(5): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadItem(5): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	err = r.ReadItem(100, func([]byte) error { return nil })
-	if !errors.Is(err, ErrIndexRange) {
-		t.Fatalf("ReadItem(100): got %v, want ErrIndexRange", err)
+	if !errors.Is(err, ErrPositionOutOfRange) {
+		t.Fatalf("ReadItem(100): got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
@@ -785,9 +785,9 @@ func TestParallelCompressionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSmallRecordSize(t *testing.T) {
+func TestSmallItemsPerRecord(t *testing.T) {
 	items := makeItems(20, 200)
-	path := writeTestPackfile(t, items, WriterOptions{RecordSize: 3})
+	path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: 3})
 
 	r := Open(path)
 	defer r.Close()
@@ -807,12 +807,12 @@ func TestSmallRecordSize(t *testing.T) {
 	}
 }
 
-func TestContentHashNonDefaultRecordSize(t *testing.T) {
+func TestContentHashNonDefaultItemsPerRecord(t *testing.T) {
 	items := makeItems(500, 200)
 
-	for _, recordSize := range []int{64, 256, 500} {
-		t.Run(fmt.Sprintf("RecordSize=%d", recordSize), func(t *testing.T) {
-			path := writeTestPackfile(t, items, WriterOptions{RecordSize: recordSize, ContentHash: true})
+	for _, itemsPerRecord := range []int{64, 256, 500} {
+		t.Run(fmt.Sprintf("ItemsPerRecord=%d", itemsPerRecord), func(t *testing.T) {
+			path := writeTestPackfile(t, items, WriterOptions{ItemsPerRecord: itemsPerRecord, ContentHash: true})
 
 			r := Open(path)
 			defer r.Close()
@@ -864,15 +864,15 @@ func TestTrailer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// With RecordSize=1, each item = one record.
+	// With ItemsPerRecord=1, each item = one record.
 	if trailer.RecordCount != 5 {
 		t.Fatalf("RecordCount = %d, want 5", trailer.RecordCount)
 	}
 	if trailer.TotalItems != 5 {
 		t.Fatalf("TotalItems = %d, want 5", trailer.TotalItems)
 	}
-	if trailer.RecordSize != 1 {
-		t.Fatalf("RecordSize = %d, want 1", trailer.RecordSize)
+	if trailer.ItemsPerRecord != 1 {
+		t.Fatalf("ItemsPerRecord = %d, want 1", trailer.ItemsPerRecord)
 	}
 	if trailer.AppDataSize != 0 {
 		t.Fatalf("AppDataSize = %d, want 0", trailer.AppDataSize)
@@ -891,13 +891,13 @@ func TestAppDataRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "appdata.pack")
 
-	w, err := Create(path, WriterOptions{RecordSize: 1})
+	w, err := Create(path, WriterOptions{ItemsPerRecord: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	items := makeItems(5, 100)
 	for _, item := range items {
-		if err := w.Append(item); err != nil {
+		if err := w.AppendItem(item); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -941,11 +941,11 @@ func TestAppDataCorruption(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "appdata.pack")
 
-	w, err := Create(path, WriterOptions{RecordSize: 1})
+	w, err := Create(path, WriterOptions{ItemsPerRecord: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Append([]byte("item")); err != nil {
+	if err := w.AppendItem([]byte("item")); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Finish(appData); err != nil {
@@ -999,7 +999,7 @@ func TestAppDataEmpty(t *testing.T) {
 	}
 }
 
-// TestWriterMatrix exercises all 24 Format × Concurrency × Hash × RecordSize combinations.
+// TestWriterMatrix exercises all 24 Format × Concurrency × Hash × ItemsPerRecord combinations.
 func TestWriterMatrix(t *testing.T) {
 	items := makeItems(300, 200)
 	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
@@ -1007,7 +1007,7 @@ func TestWriterMatrix(t *testing.T) {
 			for _, hash := range []bool{false, true} {
 				for _, rs := range []int{1, 128} {
 					t.Run(fmt.Sprintf("%s/c%d/hash=%v/rs=%d", format, conc, hash, rs), func(t *testing.T) {
-						opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: hash, RecordSize: rs}
+						opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: hash, ItemsPerRecord: rs}
 						path := writeTestPackfile(t, items, opts)
 
 						r := Open(path)
@@ -1062,7 +1062,7 @@ func TestContentHashCrossFormat(t *testing.T) {
 
 	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
 		for _, conc := range []int{0, 4} {
-			opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: true, RecordSize: 128}
+			opts := WriterOptions{Format: format, Concurrency: conc, ContentHash: true, ItemsPerRecord: 128}
 			path := writeTestPackfile(t, items, opts)
 			r := Open(path)
 			h, ok, err := r.ContentHash()
@@ -1092,7 +1092,7 @@ func TestBlockWorkerRaceStress(t *testing.T) {
 	for _, format := range []RecordFormat{Compressed, Uncompressed, Raw} {
 		for _, rs := range []int{1, 2, 3} {
 			t.Run(fmt.Sprintf("%s/rs=%d", format, rs), func(t *testing.T) {
-				opts := WriterOptions{Format: format, Concurrency: 8, ContentHash: true, RecordSize: rs}
+				opts := WriterOptions{Format: format, Concurrency: 8, ContentHash: true, ItemsPerRecord: rs}
 				path := writeTestPackfile(t, items, opts)
 
 				r := Open(path)

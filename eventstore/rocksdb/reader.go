@@ -36,7 +36,7 @@ type Reader struct {
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*Reader)
 
-// WithConcurrency sets the max parallel goroutines for ReadIndices.
+// WithConcurrency sets the max parallel goroutines for ReadPositions.
 // Values less than 1 are clamped to 1. Default 8.
 func WithConcurrency(n int) ReaderOption {
 	return func(r *Reader) { r.concurrency = n }
@@ -93,7 +93,7 @@ func (r *Reader) EventCount() (int, error) {
 	return r.nEvents, r.countErr
 }
 
-func (r *Reader) ReadEvent(index int) ([]byte, error) {
+func (r *Reader) ReadEvent(position int) ([]byte, error) {
 	if err := r.waitOpen(); err != nil {
 		return nil, err
 	}
@@ -101,18 +101,18 @@ func (r *Reader) ReadEvent(index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if index < 0 || index >= n {
-		return nil, eventstore.ErrIndexRange
+	if position < 0 || position >= n {
+		return nil, eventstore.ErrPositionOutOfRange
 	}
 	var key [4]byte
-	binary.BigEndian.PutUint32(key[:], uint32(index))
+	binary.BigEndian.PutUint32(key[:], uint32(position))
 	val, err := r.db.GetPinned(r.ro, key[:])
 	if err != nil {
 		return nil, fmt.Errorf("rocksdb eventstore: get: %w", err)
 	}
 	defer val.Destroy()
 	if !val.Exists() {
-		return nil, eventstore.ErrIndexRange
+		return nil, eventstore.ErrPositionOutOfRange
 	}
 	result := make([]byte, len(val.Data()))
 	copy(result, val.Data())
@@ -158,9 +158,9 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 	}
 }
 
-func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
+func (r *Reader) ReadPositions(ctx context.Context, positions []int) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
-		if len(indices) == 0 {
+		if len(positions) == 0 {
 			return
 		}
 		if err := r.waitOpen(); err != nil {
@@ -173,22 +173,22 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 			return
 		}
 		// Validate bounds and sorted+unique invariant.
-		for i, idx := range indices {
-			if idx < 0 || idx >= n {
-				panic(fmt.Sprintf("rocksdb eventstore: ReadIndices index %d out of range [0, %d)",
-					idx, n))
+		for i, pos := range positions {
+			if pos < 0 || pos >= n {
+				panic(fmt.Sprintf("rocksdb eventstore: ReadPositions position %d out of range [0, %d)",
+					pos, n))
 			}
-			if i > 0 && indices[i] <= indices[i-1] {
-				panic(fmt.Sprintf("rocksdb eventstore: ReadIndices indices not sorted/unique at position %d: %d <= %d",
-					i, indices[i], indices[i-1]))
+			if i > 0 && positions[i] <= positions[i-1] {
+				panic(fmt.Sprintf("rocksdb eventstore: ReadPositions positions not sorted/unique at %d: %d <= %d",
+					i, positions[i], positions[i-1]))
 			}
 		}
 
-		keys := make([][]byte, len(indices))
-		keyBuf := make([]byte, len(indices)*4)
-		for i, idx := range indices {
+		keys := make([][]byte, len(positions))
+		keyBuf := make([]byte, len(positions)*4)
+		for i, pos := range positions {
 			keys[i] = keyBuf[i*4 : i*4+4]
-			binary.BigEndian.PutUint32(keys[i], uint32(idx))
+			binary.BigEndian.PutUint32(keys[i], uint32(pos))
 		}
 
 		// Use a separate ReadOptions with async I/O for scattered reads.
@@ -256,7 +256,7 @@ func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byt
 				return
 			}
 			if data == nil {
-				if !yield(nil, fmt.Errorf("rocksdb eventstore: key %d not found (possible DB corruption)", indices[i])) {
+				if !yield(nil, fmt.Errorf("rocksdb eventstore: key %d not found (possible DB corruption)", positions[i])) {
 					return
 				}
 				continue

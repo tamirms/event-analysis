@@ -10,9 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"math/bits"
+
 	"github.com/linxGnu/grocksdb"
 	"github.com/tamir/events-analysis/eventstore"
-	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/packfile"
 )
 
@@ -69,12 +70,12 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 
 	for _, n := range blockSizes {
 		esPath := filepath.Join(dir, fmt.Sprintf("batch_%d.events", n))
-		ew, err := eventstore.Create(esPath, eventstore.WriterOptions{RecordSize: n})
+		ew, err := eventstore.Create(esPath, eventstore.WriterOptions{ItemsPerRecord: n})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, ev := range allEvents {
-			if err := ew.Append(ev); err != nil {
+			if err := ew.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -96,7 +97,7 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Compute intra-batch FOR-N overhead by manually encoding.
+		// Compute intra-batch FOR-N overhead by calculating the encoded size.
 		var totalFOR int64
 		for start := 0; start < numEvents; start += n {
 			end := min(start+n, numEvents)
@@ -104,8 +105,15 @@ func TestBatchVsSSTAnalysis(t *testing.T) {
 			for j := start; j < end; j++ {
 				sizes[j-start] = uint32(len(allEvents[j]))
 			}
-			encoded := intpack.EncodeGroup(sizes)
-			totalFOR += int64(len(encoded))
+			// Compute FOR-encoded size: ceil(W*n/8) + 5 bytes (1B width + 4B min).
+			var minS, maxS uint32 = sizes[0], sizes[0]
+			for _, s := range sizes[1:] {
+				if s < minS { minS = s }
+				if s > maxS { maxS = s }
+			}
+			w := bits.Len32(maxS - minS)
+			if w == 0 { w = 1 }
+			totalFOR += int64((w*len(sizes)+7)/8 + 5)
 		}
 
 		compData := fi.Size() - int64(trailer.IndexSize) - int64(trailer.AppDataSize) - 64 // 64 = trailerSize

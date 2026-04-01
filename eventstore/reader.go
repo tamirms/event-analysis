@@ -8,8 +8,8 @@ import (
 	"github.com/tamir/events-analysis/packfile"
 )
 
-// ErrIndexRange is returned when an index is out of bounds.
-var ErrIndexRange = packfile.ErrIndexRange
+// ErrPositionOutOfRange is returned when a position is out of bounds.
+var ErrPositionOutOfRange = packfile.ErrPositionOutOfRange
 
 // ReaderOption configures Reader behavior.
 type ReaderOption func(*readerConfig)
@@ -18,7 +18,7 @@ type readerConfig struct {
 	concurrency int
 }
 
-// WithConcurrency sets the max parallel goroutines for ReadIndices.
+// WithConcurrency sets the max parallel goroutines for ReadPositions.
 // Values less than 1 are clamped to 1. Default 8.
 func WithConcurrency(n int) ReaderOption {
 	return func(cfg *readerConfig) { cfg.concurrency = n }
@@ -51,17 +51,17 @@ func (r *Reader) EventCount() (int, error) {
 	return r.pr.TotalItems()
 }
 
-// ReadEvent reads a single event by global index.
+// ReadEvent reads a single event by position.
 // The caller owns the returned slice.
-func (r *Reader) ReadEvent(index int) ([]byte, error) {
-	var data []byte
-	if err := r.pr.ReadItem(index, func(entry []byte) error {
-		data = bytes.Clone(entry)
+func (r *Reader) ReadEvent(position int) ([]byte, error) {
+	var result []byte
+	if err := r.pr.ReadItem(position, func(data []byte) error {
+		result = bytes.Clone(data)
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return data, nil
+	return result, nil
 }
 
 // ReadEvents returns an iterator over count contiguous events starting at start.
@@ -70,17 +70,17 @@ func (r *Reader) ReadEvents(start, count int) iter.Seq2[[]byte, error] {
 	return r.pr.ReadRange(start, count)
 }
 
-// ReadIndices reads events at scattered indices with parallel I/O.
-// indices must be sorted ascending with no duplicates.
+// ReadPositions reads events at scattered positions with parallel I/O.
+// positions must be sorted ascending with no duplicates.
 // Each yielded []byte is owned by the caller.
-func (r *Reader) ReadIndices(ctx context.Context, indices []int) iter.Seq2[[]byte, error] {
+func (r *Reader) ReadPositions(ctx context.Context, positions []int) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
-		if len(indices) == 0 {
+		if len(positions) == 0 {
 			return
 		}
-		results := make([][]byte, len(indices))
-		if err := r.pr.ReadItems(ctx, indices, func(pos int, entry []byte) error {
-			results[pos] = bytes.Clone(entry)
+		results := make([][]byte, len(positions))
+		if err := r.pr.ReadItems(ctx, positions, func(idx int, data []byte) error {
+			results[idx] = bytes.Clone(data)
 			return nil
 		}); err != nil {
 			yield(nil, err)

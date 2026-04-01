@@ -22,7 +22,7 @@ func writeTestStore(t *testing.T, dir string, events [][]byte, opts WriterOption
 		t.Fatal(err)
 	}
 	for _, ev := range events {
-		if err := w.Append(ev); err != nil {
+		if err := w.AppendEvent(ev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -106,7 +106,7 @@ func TestReadEventsRange(t *testing.T) {
 	}
 }
 
-func TestReadIndicesScattered(t *testing.T) {
+func TestReadPositionsScattered(t *testing.T) {
 	events := makeEvents(1000)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -115,7 +115,7 @@ func TestReadIndicesScattered(t *testing.T) {
 
 	indices := []int{0, 50, 100, 500, 999}
 	i := 0
-	for ev, err := range r.ReadIndices(context.Background(), indices) {
+	for ev, err := range r.ReadPositions(context.Background(), indices) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,8 +145,8 @@ func TestEmptyStore(t *testing.T) {
 	}
 
 	_, err = r.ReadEvent(0)
-	if err != eventstore.ErrIndexRange {
-		t.Fatalf("ReadEvent(0) on empty: got %v, want ErrIndexRange", err)
+	if err != eventstore.ErrPositionOutOfRange {
+		t.Fatalf("ReadEvent(0) on empty: got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
@@ -158,18 +158,18 @@ func TestReadEventOutOfRange(t *testing.T) {
 	defer r.Close()
 
 	_, err := r.ReadEvent(-1)
-	if err != eventstore.ErrIndexRange {
-		t.Fatalf("ReadEvent(-1): got %v, want ErrIndexRange", err)
+	if err != eventstore.ErrPositionOutOfRange {
+		t.Fatalf("ReadEvent(-1): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	_, err = r.ReadEvent(10)
-	if err != eventstore.ErrIndexRange {
-		t.Fatalf("ReadEvent(10): got %v, want ErrIndexRange", err)
+	if err != eventstore.ErrPositionOutOfRange {
+		t.Fatalf("ReadEvent(10): got %v, want ErrPositionOutOfRange", err)
 	}
 
 	_, err = r.ReadEvent(100)
-	if err != eventstore.ErrIndexRange {
-		t.Fatalf("ReadEvent(100): got %v, want ErrIndexRange", err)
+	if err != eventstore.ErrPositionOutOfRange {
+		t.Fatalf("ReadEvent(100): got %v, want ErrPositionOutOfRange", err)
 	}
 }
 
@@ -240,7 +240,7 @@ func TestCloseWithoutFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Append([]byte("hello")); err != nil {
+	if err := w.AppendEvent([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -294,7 +294,7 @@ func TestReadEventsEmpty(t *testing.T) {
 	}
 }
 
-func TestReadIndicesEmpty(t *testing.T) {
+func TestReadPositionsEmpty(t *testing.T) {
 	events := makeEvents(10)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -302,18 +302,18 @@ func TestReadIndicesEmpty(t *testing.T) {
 	defer r.Close()
 
 	j := 0
-	for _, err := range r.ReadIndices(context.Background(), nil) {
+	for _, err := range r.ReadPositions(context.Background(), nil) {
 		if err != nil {
 			t.Fatal(err)
 		}
 		j++
 	}
 	if j != 0 {
-		t.Fatalf("empty ReadIndices yielded %d, want 0", j)
+		t.Fatalf("empty ReadPositions yielded %d, want 0", j)
 	}
 }
 
-func TestReadIndicesDuplicatesPanic(t *testing.T) {
+func TestReadPositionsDuplicatesPanic(t *testing.T) {
 	events := makeEvents(100)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -322,14 +322,14 @@ func TestReadIndicesDuplicatesPanic(t *testing.T) {
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for duplicate indices")
+			t.Fatal("expected panic for duplicate positions")
 		}
 	}()
-	for range r.ReadIndices(context.Background(), []int{5, 5, 10}) {
+	for range r.ReadPositions(context.Background(), []int{5, 5, 10}) {
 	}
 }
 
-func TestReadIndicesUnsortedPanic(t *testing.T) {
+func TestReadPositionsUnsortedPanic(t *testing.T) {
 	events := makeEvents(100)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -338,14 +338,14 @@ func TestReadIndicesUnsortedPanic(t *testing.T) {
 
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic for unsorted indices")
+			t.Fatal("expected panic for unsorted positions")
 		}
 	}()
-	for range r.ReadIndices(context.Background(), []int{10, 5, 20}) {
+	for range r.ReadPositions(context.Background(), []int{10, 5, 20}) {
 	}
 }
 
-func TestReadIndicesConcurrent(t *testing.T) {
+func TestReadPositionsConcurrent(t *testing.T) {
 	events := makeEvents(500)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -370,7 +370,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 			slices.Sort(indices)
 
 			j := 0
-			for ev, err := range r.ReadIndices(context.Background(), indices) {
+			for ev, err := range r.ReadPositions(context.Background(), indices) {
 				if err != nil {
 					errs <- fmt.Errorf("goroutine %d: %w", g, err)
 					return
@@ -394,7 +394,7 @@ func TestReadIndicesConcurrent(t *testing.T) {
 	}
 }
 
-func TestReadIndicesPreCanceled(t *testing.T) {
+func TestReadPositionsPreCanceled(t *testing.T) {
 	events := makeEvents(100)
 	dbPath := writeTestStore(t, t.TempDir(), events, WriterOptions{})
 
@@ -406,7 +406,7 @@ func TestReadIndicesPreCanceled(t *testing.T) {
 
 	indices := []int{0, 10, 50, 99}
 	var gotErr error
-	for _, err := range r.ReadIndices(ctx, indices) {
+	for _, err := range r.ReadPositions(ctx, indices) {
 		if err != nil {
 			gotErr = err
 			break

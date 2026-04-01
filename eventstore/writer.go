@@ -2,11 +2,11 @@ package eventstore
 
 import "github.com/tamir/events-analysis/packfile"
 
-const DefaultRecordSize = 128
+const DefaultItemsPerRecord = 128
 
 // WriterOptions configures how the eventstore is written.
 type WriterOptions struct {
-	RecordSize  int                  // events per record; 0 defaults to DefaultRecordSize (128)
+	ItemsPerRecord  int                  // events per record; 0 defaults to DefaultItemsPerRecord (128)
 	Concurrency int                  // compression goroutines; 0 or 1 = serial
 	Format      packfile.RecordFormat // Compressed (default), Uncompressed, or Raw
 	ContentHash bool                 // compute SHA-256 content hash over logical event stream
@@ -28,7 +28,7 @@ func Create(path string, opts WriterOptions) (*Writer, error) {
 
 func packfileOpts(opts WriterOptions) packfile.WriterOptions {
 	return packfile.WriterOptions{
-		RecordSize:   opts.RecordSize, // 0 defaults to 128 inside packfile.Create
+		ItemsPerRecord:   opts.ItemsPerRecord, // 0 defaults to 128 inside packfile.Create
 		Concurrency:  opts.Concurrency,
 		Format:       opts.Format,
 		ContentHash:  opts.ContentHash,
@@ -36,9 +36,9 @@ func packfileOpts(opts WriterOptions) packfile.WriterOptions {
 	}
 }
 
-// Append adds a single event.
-func (w *Writer) Append(event []byte) error {
-	return w.pw.Append(event)
+// AppendEvent adds a single event.
+func (w *Writer) AppendEvent(event []byte) error {
+	return w.pw.AppendItem(event)
 }
 
 // Finish finalizes the eventstore.

@@ -67,7 +67,7 @@ func coldFixtureDir() string {
 	return fixtureDir
 }
 
-func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
+func benchColdPackfileReadPositions(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	const numReads = 1000
@@ -89,7 +89,7 @@ func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
 		b.StartTimer()
 
 		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
-		for ev, err := range er.ReadIndices(context.Background(), indices) {
+		for ev, err := range er.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -99,15 +99,15 @@ func benchColdPackfileReadIndices(b *testing.B, concurrency int) {
 	}
 }
 
-func BenchmarkColdPackfileReadIndices1(b *testing.B)   { benchColdPackfileReadIndices(b, 1) }
-func BenchmarkColdPackfileReadIndices4(b *testing.B)   { benchColdPackfileReadIndices(b, 4) }
-func BenchmarkColdPackfileReadIndices8(b *testing.B)   { benchColdPackfileReadIndices(b, 8) }
-func BenchmarkColdPackfileReadIndices16(b *testing.B)  { benchColdPackfileReadIndices(b, 16) }
-func BenchmarkColdPackfileReadIndices32(b *testing.B)  { benchColdPackfileReadIndices(b, 32) }
-func BenchmarkColdPackfileReadIndices64(b *testing.B)  { benchColdPackfileReadIndices(b, 64) }
-func BenchmarkColdPackfileReadIndices128(b *testing.B) { benchColdPackfileReadIndices(b, 128) }
+func BenchmarkColdPackfileReadPositions1(b *testing.B)   { benchColdPackfileReadPositions(b, 1) }
+func BenchmarkColdPackfileReadPositions4(b *testing.B)   { benchColdPackfileReadPositions(b, 4) }
+func BenchmarkColdPackfileReadPositions8(b *testing.B)   { benchColdPackfileReadPositions(b, 8) }
+func BenchmarkColdPackfileReadPositions16(b *testing.B)  { benchColdPackfileReadPositions(b, 16) }
+func BenchmarkColdPackfileReadPositions32(b *testing.B)  { benchColdPackfileReadPositions(b, 32) }
+func BenchmarkColdPackfileReadPositions64(b *testing.B)  { benchColdPackfileReadPositions(b, 64) }
+func BenchmarkColdPackfileReadPositions128(b *testing.B) { benchColdPackfileReadPositions(b, 128) }
 
-func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
+func benchColdRocksDBReadPositions(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	const numReads = 1000
@@ -129,7 +129,7 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 		b.StartTimer()
 
 		r := rocksdbES.Open(rdbPath, rocksdbES.WithConcurrency(concurrency))
-		for ev, err := range r.ReadIndices(context.Background(), indices) {
+		for ev, err := range r.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -139,10 +139,10 @@ func benchColdRocksDBReadIndices(b *testing.B, concurrency int) {
 	}
 }
 
-func BenchmarkColdRocksDBReadIndices1(b *testing.B)  { benchColdRocksDBReadIndices(b, 1) }
-func BenchmarkColdRocksDBReadIndices8(b *testing.B)  { benchColdRocksDBReadIndices(b, 8) }
-func BenchmarkColdRocksDBReadIndices32(b *testing.B) { benchColdRocksDBReadIndices(b, 32) }
-func BenchmarkColdRocksDBReadIndices64(b *testing.B) { benchColdRocksDBReadIndices(b, 64) }
+func BenchmarkColdRocksDBReadPositions1(b *testing.B)  { benchColdRocksDBReadPositions(b, 1) }
+func BenchmarkColdRocksDBReadPositions8(b *testing.B)  { benchColdRocksDBReadPositions(b, 8) }
+func BenchmarkColdRocksDBReadPositions32(b *testing.B) { benchColdRocksDBReadPositions(b, 32) }
+func BenchmarkColdRocksDBReadPositions64(b *testing.B) { benchColdRocksDBReadPositions(b, 64) }
 
 // coldConsecutiveIndices generates indices that span numBlocks consecutive blocks,
 // each picking one event per block starting from startBlock.
@@ -187,7 +187,7 @@ func coldMixedIndices(rng *rand.Rand, n, totalEvents, blockSize int) []int {
 	return indices
 }
 
-func benchColdPackfileReadIndicesConsecutive(b *testing.B, concurrency int) {
+func benchColdPackfileReadPositionsConsecutive(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	const numBlocks = 1000
@@ -209,7 +209,7 @@ func benchColdPackfileReadIndicesConsecutive(b *testing.B, concurrency int) {
 		b.StartTimer()
 
 		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
-		for ev, err := range er.ReadIndices(context.Background(), indices) {
+		for ev, err := range er.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -219,11 +219,11 @@ func benchColdPackfileReadIndicesConsecutive(b *testing.B, concurrency int) {
 	}
 }
 
-func BenchmarkColdPackfileReadIndicesConsec1(b *testing.B)  { benchColdPackfileReadIndicesConsecutive(b, 1) }
-func BenchmarkColdPackfileReadIndicesConsec8(b *testing.B)  { benchColdPackfileReadIndicesConsecutive(b, 8) }
-func BenchmarkColdPackfileReadIndicesConsec32(b *testing.B) { benchColdPackfileReadIndicesConsecutive(b, 32) }
+func BenchmarkColdPackfileReadPositionsConsec1(b *testing.B)  { benchColdPackfileReadPositionsConsecutive(b, 1) }
+func BenchmarkColdPackfileReadPositionsConsec8(b *testing.B)  { benchColdPackfileReadPositionsConsecutive(b, 8) }
+func BenchmarkColdPackfileReadPositionsConsec32(b *testing.B) { benchColdPackfileReadPositionsConsecutive(b, 32) }
 
-func benchColdPackfileReadIndicesMixed(b *testing.B, concurrency int) {
+func benchColdPackfileReadPositionsMixed(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	const numReads = 1000
@@ -245,7 +245,7 @@ func benchColdPackfileReadIndicesMixed(b *testing.B, concurrency int) {
 		b.StartTimer()
 
 		er := eventstore.Open(esPath, eventstore.WithConcurrency(concurrency))
-		for ev, err := range er.ReadIndices(context.Background(), indices) {
+		for ev, err := range er.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -255,4 +255,4 @@ func benchColdPackfileReadIndicesMixed(b *testing.B, concurrency int) {
 	}
 }
 
-func BenchmarkColdPackfileReadIndicesMixed8(b *testing.B) { benchColdPackfileReadIndicesMixed(b, 8) }
+func BenchmarkColdPackfileReadPositionsMixed8(b *testing.B) { benchColdPackfileReadPositionsMixed(b, 8) }

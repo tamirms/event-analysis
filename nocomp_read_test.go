@@ -48,7 +48,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, ev := range allEvents {
-			if err := ew.Append(ev); err != nil {
+			if err := ew.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -79,7 +79,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, ev := range allEvents {
-			if err := w.Append(ev); err != nil {
+			if err := w.AppendEvent(ev); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -219,7 +219,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 	}
 
 	// ======================================================================
-	// Scattered read benchmark (50 sorted indices, like ReadIndices)
+	// Scattered read benchmark (50 sorted indices, like ReadPositions)
 	// ======================================================================
 	fmt.Println("\n--- Scattered Reads (50 sorted indices x 100 iterations) ---")
 
@@ -227,7 +227,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 	const scatteredN = 50
 	const scatteredRuns = 3
 
-	// Packfile scattered reads via ReadIndices
+	// Packfile scattered reads via ReadPositions
 	{
 		er := eventstore.Open(packPath)
 		n, err := er.EventCount()
@@ -241,7 +241,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			start := time.Now()
 			for range scatteredIter {
 				indices := generateScatteredIndices(rng, scatteredN, n)
-				for ev, err := range er.ReadIndices(context.Background(), indices) {
+				for ev, err := range er.ReadPositions(context.Background(), indices) {
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -259,7 +259,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			median, usPerCall, scatteredIter, scatteredN, scatteredRuns)
 	}
 
-	// RocksDB scattered reads via ReadIndices
+	// RocksDB scattered reads via ReadPositions
 	{
 		rr := rocksdbES.Open(dbPath)
 
@@ -269,7 +269,7 @@ func TestReadThroughputNoCompression(t *testing.T) {
 			start := time.Now()
 			for range scatteredIter {
 				indices := generateScatteredIndices(rng, scatteredN, numEvents)
-				for ev, err := range rr.ReadIndices(context.Background(), indices) {
+				for ev, err := range rr.ReadPositions(context.Background(), indices) {
 					if err != nil {
 						t.Fatal(err)
 					}

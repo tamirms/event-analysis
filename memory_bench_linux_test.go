@@ -100,7 +100,7 @@ func benchPackfileWriteMemory(b *testing.B, concurrency int) {
 				b.Fatal(err)
 			}
 			for _, ev := range allEvents {
-				if err := ew.Append(ev); err != nil {
+				if err := ew.AppendEvent(ev); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -151,7 +151,7 @@ func BenchmarkPackfileSeqReadMemory(b *testing.B) {
 	b.ReportMetric(float64(peakDelta)/(1<<20), "peak-delta-MB")
 }
 
-func benchPackfileReadIndicesMemory(b *testing.B, concurrency int) {
+func benchPackfileReadPositionsMemory(b *testing.B, concurrency int) {
 	setupBenchData(b)
 
 	er := eventstore.Open(eventstorePath, eventstore.WithConcurrency(concurrency))
@@ -165,7 +165,7 @@ func benchPackfileReadIndicesMemory(b *testing.B, concurrency int) {
 	var peakDelta int64
 	for b.Loop() {
 		peakDelta = peakRssAnonDelta(func() {
-			for ev, err := range er.ReadIndices(context.Background(), indices) {
+			for ev, err := range er.ReadPositions(context.Background(), indices) {
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -176,6 +176,6 @@ func benchPackfileReadIndicesMemory(b *testing.B, concurrency int) {
 	b.ReportMetric(float64(peakDelta)/(1<<20), "peak-delta-MB")
 }
 
-func BenchmarkPackfileReadIndicesMemory(b *testing.B)   { benchPackfileReadIndicesMemory(b, 8) }
-func BenchmarkPackfileReadIndicesMemory1(b *testing.B)  { benchPackfileReadIndicesMemory(b, 1) }
-func BenchmarkPackfileReadIndicesMemory32(b *testing.B) { benchPackfileReadIndicesMemory(b, 32) }
+func BenchmarkPackfileReadPositionsMemory(b *testing.B)   { benchPackfileReadPositionsMemory(b, 8) }
+func BenchmarkPackfileReadPositionsMemory1(b *testing.B)  { benchPackfileReadPositionsMemory(b, 1) }
+func BenchmarkPackfileReadPositionsMemory32(b *testing.B) { benchPackfileReadPositionsMemory(b, 32) }

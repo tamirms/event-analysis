@@ -764,11 +764,11 @@ func TestMetadataValidation(t *testing.T) {
 	// When the bitmapindex reader does Lookup, the fingerprint check should fail
 	// and return ErrKeyNotFound.
 	plainPath := filepath.Join(dir, "plain.bitmaps")
-	pw, err := packfile.Create(plainPath, packfile.WriterOptions{RecordSize: 1})
+	pw, err := packfile.Create(plainPath, packfile.WriterOptions{ItemsPerRecord: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = pw.Append([]byte{0x01, 0x00}); err != nil {
+	if err = pw.AppendItem([]byte{0x01, 0x00}); err != nil {
 		t.Fatal(err)
 	}
 	if err = pw.Finish(nil); err != nil {

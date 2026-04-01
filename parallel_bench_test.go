@@ -92,7 +92,7 @@ func doSetup() error {
 		return err
 	}
 	for _, ev := range allEvents {
-		if err := ew.Append(ev); err != nil {
+		if err := ew.AppendEvent(ev); err != nil {
 			return err
 		}
 	}
@@ -108,7 +108,7 @@ func doSetup() error {
 		return fmt.Errorf("rocksdb create: %w", err)
 	}
 	for _, ev := range allEvents {
-		if err := rw.Append(ev); err != nil {
+		if err := rw.AppendEvent(ev); err != nil {
 			return fmt.Errorf("rocksdb append: %w", err)
 		}
 	}
@@ -200,7 +200,7 @@ func benchRandomRead(b *testing.B, r eventstore.StoreReader, n int) {
 	}
 }
 
-func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
+func benchReadPositions(b *testing.B, r eventstore.StoreReader, n int) {
 	b.Helper()
 	const numIndices = 50
 	rng := rand.New(rand.NewSource(42))
@@ -209,7 +209,7 @@ func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 	for b.Loop() {
 		indices := generateScatteredIndices(rng, numIndices, n)
 		count := 0
-		for ev, err := range r.ReadIndices(context.Background(), indices) {
+		for ev, err := range r.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -217,14 +217,14 @@ func benchReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 			count++
 		}
 		if count != numIndices {
-			b.Fatalf("ReadIndices yielded %d items, want %d", count, numIndices)
+			b.Fatalf("ReadPositions yielded %d items, want %d", count, numIndices)
 		}
 	}
 }
 
-// benchReadIndicesConsecutive reads indices that span consecutive records,
+// benchReadPositionsConsecutive reads indices that span consecutive records,
 // exercising the batch I/O path in ReadItems.
-func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) {
+func benchReadPositionsConsecutive(b *testing.B, r eventstore.StoreReader, n int) {
 	b.Helper()
 	const blockSize = 128
 	const numBlocks = 1000
@@ -247,7 +247,7 @@ func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) 
 
 	for b.Loop() {
 		count := 0
-		for ev, err := range r.ReadIndices(context.Background(), indices) {
+		for ev, err := range r.ReadPositions(context.Background(), indices) {
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -255,7 +255,7 @@ func benchReadIndicesConsecutive(b *testing.B, r eventstore.StoreReader, n int) 
 			count++
 		}
 		if count != len(indices) {
-			b.Fatalf("ReadIndices yielded %d items, want %d", count, len(indices))
+			b.Fatalf("ReadPositions yielded %d items, want %d", count, len(indices))
 		}
 	}
 }
@@ -278,7 +278,7 @@ func benchParallelRead(b *testing.B, r eventstore.StoreReader, n int) {
 	})
 }
 
-func benchParallelReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
+func benchParallelReadPositions(b *testing.B, r eventstore.StoreReader, n int) {
 	b.Helper()
 	const numIndices = 50
 	b.ResetTimer()
@@ -288,7 +288,7 @@ func benchParallelReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 		for pb.Next() {
 			indices := generateScatteredIndices(rng, numIndices, n)
 			count := 0
-			for ev, err := range r.ReadIndices(context.Background(), indices) {
+			for ev, err := range r.ReadPositions(context.Background(), indices) {
 				if err != nil {
 					b.Error(err)
 					return
@@ -297,7 +297,7 @@ func benchParallelReadIndices(b *testing.B, r eventstore.StoreReader, n int) {
 				count++
 			}
 			if count != numIndices {
-				b.Errorf("ReadIndices yielded %d items, want %d", count, numIndices)
+				b.Errorf("ReadPositions yielded %d items, want %d", count, numIndices)
 				return
 			}
 		}
@@ -416,7 +416,7 @@ func BenchmarkRocksDBRangeScan128(b *testing.B) {
 	benchRangeScan128(b, r, n)
 }
 
-// --- Scattered read benchmarks (ReadIndices) ---
+// --- Scattered read benchmarks (ReadPositions) ---
 
 // generateScatteredIndices returns n sorted unique random indices in [0, total).
 func generateScatteredIndices(rng *rand.Rand, n, total int) []int {
@@ -432,52 +432,52 @@ func generateScatteredIndices(rng *rand.Rand, n, total int) []int {
 	return indices
 }
 
-func BenchmarkPackfileReadIndices(b *testing.B) {
+func BenchmarkPackfileReadPositions(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 	n := mustEventCount(b, er)
-	benchReadIndices(b, er, n)
+	benchReadPositions(b, er, n)
 }
 
-func BenchmarkRocksDBReadIndices(b *testing.B) {
+func BenchmarkRocksDBReadPositions(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
 	n := mustEventCount(b, r)
-	benchReadIndices(b, r, n)
+	benchReadPositions(b, r, n)
 }
 
-func BenchmarkPackfileReadIndicesConsecutive(b *testing.B) {
+func BenchmarkPackfileReadPositionsConsecutive(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 	n := mustEventCount(b, er)
-	benchReadIndicesConsecutive(b, er, n)
+	benchReadPositionsConsecutive(b, er, n)
 }
 
-func BenchmarkRocksDBReadIndicesConsecutive(b *testing.B) {
+func BenchmarkRocksDBReadPositionsConsecutive(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
 	n := mustEventCount(b, r)
-	benchReadIndicesConsecutive(b, r, n)
+	benchReadPositionsConsecutive(b, r, n)
 }
 
-func BenchmarkPackfileParallelReadIndices(b *testing.B) {
+func BenchmarkPackfileParallelReadPositions(b *testing.B) {
 	setupBenchData(b)
 	er := eventstore.Open(eventstorePath)
 	defer er.Close()
 	n := mustEventCount(b, er)
-	benchParallelReadIndices(b, er, n)
+	benchParallelReadPositions(b, er, n)
 }
 
-func BenchmarkRocksDBParallelReadIndices(b *testing.B) {
+func BenchmarkRocksDBParallelReadPositions(b *testing.B) {
 	setupBenchData(b)
 	r := rocksdbES.Open(rocksDBPath)
 	defer r.Close()
 	n := mustEventCount(b, r)
-	benchParallelReadIndices(b, r, n)
+	benchParallelReadPositions(b, r, n)
 }
 
 // --- Open latency benchmarks (backend-specific) ---
@@ -525,7 +525,7 @@ func benchPackfileWrite(b *testing.B, concurrency int) {
 			b.Fatal(err)
 		}
 		for _, ev := range allEvents {
-			if err := ew.Append(ev); err != nil {
+			if err := ew.AppendEvent(ev); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -573,7 +573,7 @@ func rocksDBWriteCore(b *testing.B, parallelComp int) {
 		b.Fatal(err)
 	}
 	for _, ev := range allEvents {
-		if err := w.Append(ev); err != nil {
+		if err := w.AppendEvent(ev); err != nil {
 			b.Fatal(err)
 		}
 	}
