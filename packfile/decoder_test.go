@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
@@ -20,7 +21,7 @@ func buildPayload(items [][]byte) (payload []byte, sizes []uint32) {
 
 // buildForIndex encodes sizes as a FOR index: [packed][1B W][4B min][4B CRC32C].
 func buildForIndex(sizes []uint32) []byte {
-	encoded := encodeGroup(sizes)
+	encoded := intpack.EncodeGroup(sizes)
 	return binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 }
 

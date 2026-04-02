@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
@@ -150,7 +151,7 @@ func (rd *decoder) Decode(data []byte, recordIdx int) error {
 
 	if rd.itemsPerRecord > 1 {
 		var err error
-		rd.sizes, _, err = decodeGroup(forIndexBytes, n, rd.sizes)
+		rd.sizes, _, err = intpack.DecodeGroup(forIndexBytes, n, rd.sizes)
 		if err != nil {
 			return err
 		}

@@ -86,7 +86,7 @@ The performance gap is structural, not tunable:
 
 | Component | Packfile Stack | RocksDB Stack |
 |-----------|---------------|---------------|
-| Core format (packfile/) | ~1,770 | — |
+| Core format (packfile/ + intpack/) | ~1,770 | — |
 | Compression (zstd/) | 219 | — |
 | Shared helpers (rocksdbutil/) | — | 156 |
 | Eventstore impl (thin facade) | ~170 | 401 |
@@ -97,7 +97,7 @@ RocksDB requires **~3x less code** because RocksDB handles block management, com
 checksums, index construction, and file format details internally. The packfile stack implements
 all of these:
 
-- Frame-of-Reference encoding/decoding (packfile/for.go: 125 lines)
+- Frame-of-Reference encoding/decoding (intpack/: 143 lines)
 - Record decoding with zstd + CRC32C + FOR index (packfile/decoder.go)
 - Item accumulation, record building, and block-processing pipeline (packfile/writer.go)
 - Item-level access with pooled decoders (packfile/reader.go — ReadItem, ReadRange, ReadItems)

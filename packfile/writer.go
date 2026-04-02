@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/tamir/events-analysis/intpack"
 	"github.com/tamir/events-analysis/zstd"
 )
 
@@ -356,7 +357,7 @@ func (w *Writer) closeCompressor() {
 // CRC (4B) + forIndex so callers can append without reallocation.
 func (w *Writer) buildBlock() (payload []byte, forIndex []byte) {
 	if w.itemsPerRecord > 1 {
-		encoded := encodeGroup(w.sizes)
+		encoded := intpack.EncodeGroup(w.sizes)
 		forIndex = binary.LittleEndian.AppendUint32(encoded, CRC32C(encoded))
 	}
 	payload = make([]byte, len(w.buf), len(w.buf)+4+len(forIndex))
